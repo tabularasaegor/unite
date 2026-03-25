@@ -81,13 +81,20 @@ function App() {
 
   const handleLogout = () => {
     logout();
+    queryClient.clear();
     setAuthed(false);
+  };
+
+  const handleLogin = () => {
+    // Clear any stale cached queries from before auth
+    queryClient.clear();
+    setAuthed(true);
   };
 
   if (!authed) {
     return (
       <ErrorBoundary>
-        <LoginPage onLogin={() => setAuthed(true)} />
+        <LoginPage onLogin={handleLogin} />
       </ErrorBoundary>
     );
   }
