@@ -1,4 +1,4 @@
-import { Component, type ReactNode } from "react";
+import { Component, useState, type ReactNode } from "react";
 import { Switch, Route, Router } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
 import { queryClient } from "./lib/queryClient";
@@ -22,7 +22,9 @@ import MicroPositions from "@/pages/micro-positions";
 import MicroTrades from "@/pages/micro-trades";
 import MicroSettlements from "@/pages/micro-settlements";
 import AppSidebar from "@/components/AppSidebar";
+import LoginPage from "@/pages/login";
 import { useTheme } from "@/hooks/use-theme";
+import { isAuthenticated } from "@/lib/auth";
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: string }> {
   constructor(props: { children: ReactNode }) {
@@ -75,6 +77,16 @@ function AppLayout() {
 }
 
 function App() {
+  const [authed, setAuthed] = useState(isAuthenticated());
+
+  if (!authed) {
+    return (
+      <ErrorBoundary>
+        <LoginPage onLogin={() => setAuthed(true)} />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>

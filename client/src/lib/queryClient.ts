@@ -14,9 +14,13 @@ export async function apiRequest(
   url: string,
   data?: unknown | undefined,
 ): Promise<Response> {
+  const headers: Record<string, string> = {};
+  if (data) headers["Content-Type"] = "application/json";
+  const token = (window as any).__AUTH_TOKEN__;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${url}`, {
     method,
-    headers: data ? { "Content-Type": "application/json" } : {},
+    headers,
     body: data ? JSON.stringify(data) : undefined,
   });
 
@@ -32,7 +36,10 @@ export const getQueryFn: <T>(options: {
   async ({ queryKey }) => {
     // Only join string parts of queryKey for URL, skip objects
     const urlParts = queryKey.filter((k): k is string => typeof k === "string");
-    const res = await fetch(`${API_BASE}${urlParts.join("/")}`);
+    const headers: Record<string, string> = {};
+    const token = (window as any).__AUTH_TOKEN__;
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(`${API_BASE}${urlParts.join("/")}`, { headers });
 
     if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;

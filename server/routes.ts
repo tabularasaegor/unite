@@ -6,12 +6,53 @@ import { runMarketScan, getLastScanResult, isScanRunning } from "./services/mark
 import { researchOpportunity } from "./services/researchSwarm";
 import { estimateProbability } from "./services/probabilityEngine";
 import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
-import { startMicroScheduler, stopMicroScheduler, getMicroStatus } from "./services/cryptoMicroScheduler";
+import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog } from "./services/cryptoMicroScheduler";
 import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 
+// --- Authentication ---
+const USERS: Record<string, string> = {
+  "animusvox": "Rodman91!",
+};
+const sessions = new Set<string>();
+
+function generateToken(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+
+  // --- Auth routes (no auth required) ---
+  app.post("/api/auth/login", (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: "Логин и пароль обязательны" });
+    if (USERS[username] !== password) return res.status(401).json({ error: "Неверный логин или пароль" });
+    const token = generateToken();
+    sessions.add(token);
+    res.json({ token, username });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (token) sessions.delete(token);
+    res.json({ ok: true });
+  });
+
+  app.get("/api/auth/check", (req, res) => {
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    res.json({ authenticated: !!token && sessions.has(token) });
+  });
+
+  // --- Auth middleware for all /api/* routes except /api/auth/* ---
+  app.use("/api", (req, res, next) => {
+    if (req.path.startsWith("/auth")) return next();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token || !sessions.has(token)) {
+      return res.status(401).json({ error: "Требуется авторизация" });
+    }
+    next();
+  });
 
   // ============================================================================
   // PREDICTION MARKET PLATFORM — API Routes
@@ -291,6 +332,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (maxBet) storage.setConfig("micro_max_bet", String(maxBet));
     startMicroScheduler();
     res.json({ started: true, ...getMicroStatus() });
+  });
+
+  app.get("/api/micro/model-log", (_req, res) => {
+    res.json(getModelLog());
   });
 
   app.post("/api/micro/stop", (_req, res) => {

@@ -54,25 +54,49 @@ const calibration: Record<string, AssetCalibration> = {};
 // --- Adaptive regime tracking ---
 interface WindowResult { ts: number; wins: number; losses: number; totalPnl: number; }
 const windowHistory: WindowResult[] = [];
-const assetCooldown: Record<string, number> = {}; // asset → skip until timestamp
+const assetCooldown: Record<string, number> = {};
 let lastWindowPnl = 0;
 let consecutiveLossWindows = 0;
-let betSizeMultiplier = 1.0; // Dynamic: 0.5x after losses, 1.5x after wins
+let betSizeMultiplier = 1.0;
+let sessionPeakPnl = 0;
+let sessionPnl = 0;
+const modelLog: Array<{ ts: string; event: string; detail: string }> = [];
+
+function logModelChange(event: string, detail: string) {
+  const entry = { ts: new Date().toISOString(), event, detail };
+  modelLog.push(entry);
+  if (modelLog.length > 100) modelLog.shift();
+  log(`MODEL: ${event} — ${detail}`, "micro");
+}
 
 function recordWindowResult(wins: number, losses: number, pnl: number) {
   windowHistory.push({ ts: Date.now(), wins, losses, totalPnl: pnl });
   if (windowHistory.length > 20) windowHistory.shift();
   lastWindowPnl = pnl;
+  sessionPnl += pnl;
+  if (sessionPnl > sessionPeakPnl) sessionPeakPnl = sessionPnl;
+
+  const prevMult = betSizeMultiplier;
 
   if (losses > wins) {
     consecutiveLossWindows++;
-    // Progressive reduction: each loss window cuts bet size more
-    betSizeMultiplier = Math.max(0.3, 1.0 - consecutiveLossWindows * 0.2);
-    log(`Regime: loss window (${wins}W/${losses}L), consecutive=${consecutiveLossWindows}, multiplier=${betSizeMultiplier.toFixed(1)}x`, "micro");
+    // AGGRESSIVE decay: drop to base 1.0 immediately, then reduce further
+    betSizeMultiplier = Math.max(0.25, 1.0 - consecutiveLossWindows * 0.25);
+    logModelChange("LOSS_WINDOW", `${wins}W/${losses}L, consec=${consecutiveLossWindows}, mult: ${prevMult.toFixed(2)}→${betSizeMultiplier.toFixed(2)}`);
   } else {
+    if (consecutiveLossWindows > 0) {
+      logModelChange("WIN_RECOVERY", `Breaking ${consecutiveLossWindows} loss streak`);
+    }
     consecutiveLossWindows = 0;
-    // Recover gradually
-    betSizeMultiplier = Math.min(1.5, betSizeMultiplier + 0.2);
+    // SLOW recovery: only +0.1 per win window, capped at 1.0 (no over-leveraging)
+    betSizeMultiplier = Math.min(1.0, betSizeMultiplier + 0.1);
+  }
+
+  // Drawdown brake: if we've lost >30% from session peak, hard cap at 0.5x
+  const drawdown = sessionPeakPnl - sessionPnl;
+  if (sessionPeakPnl > 20 && drawdown > sessionPeakPnl * 0.3) {
+    betSizeMultiplier = Math.min(betSizeMultiplier, 0.5);
+    logModelChange("DRAWDOWN_BRAKE", `Peak=$${sessionPeakPnl.toFixed(0)} Current=$${sessionPnl.toFixed(0)} DD=$${drawdown.toFixed(0)} → mult capped at 0.5x`);
   }
 }
 
@@ -81,18 +105,20 @@ function shouldSkipAsset(asset: string): boolean {
   if (Date.now() < cooldownUntil) return true;
   
   const cal = getCalibration(asset);
-  const recent = cal.lastResults.slice(-5);
-  if (recent.length >= 5) {
+  // Use last 3 results (faster reaction) instead of 5
+  const recent = cal.lastResults.slice(-3);
+  if (recent.length >= 3) {
     const recentWR = recent.filter(r => r.won).length / recent.length;
-    if (recentWR < 0.3) {
-      // Skip 2 windows (10 min) after very bad streak
-      assetCooldown[asset] = Date.now() + 600000;
-      log(`Regime: ${asset.toUpperCase()} cooldown (recent WR ${(recentWR*100).toFixed(0)}%), skipping 10 min`, "micro");
+    if (recentWR < 0.34) { // 0 or 1 win out of 3
+      assetCooldown[asset] = Date.now() + 600000; // 10 min cooldown
+      logModelChange("ASSET_COOLDOWN", `${asset.toUpperCase()} WR=${(recentWR*100).toFixed(0)}% last 3 → skip 10min`);
       return true;
     }
   }
   return false;
 }
+
+export function getModelLog() { return modelLog.slice(-50); }
 
 function getCalibration(asset: string): AssetCalibration {
   if (!calibration[asset]) {

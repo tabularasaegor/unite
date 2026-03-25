@@ -102,6 +102,11 @@ export default function MicroDashboard() {
     refetchInterval: 30000,
   });
 
+  const { data: modelLog } = useQuery({
+    queryKey: ["/api/micro/model-log"],
+    refetchInterval: 10000,
+  });
+
   const isFetching = fetchingStats || fetchingExec || fetchingPos;
   const refreshAll = () => { refetchStats(); refetchExec(); refetchPos(); };
 
@@ -195,6 +200,34 @@ export default function MicroDashboard() {
 
       {/* Row 2: Scheduler Controls */}
       <MicroSchedulerControls />
+
+      {/* Model Log */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium">Лог модели</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="max-h-48 overflow-y-auto space-y-1">
+            {(modelLog as any[] || []).slice().reverse().map((entry: any, i: number) => {
+              const color = entry.event.includes("LOSS") ? "text-red-500"
+                : entry.event.includes("RECOVERY") ? "text-green-500"
+                : entry.event.includes("DRAWDOWN") ? "text-orange-500"
+                : entry.event.includes("COOLDOWN") ? "text-yellow-500"
+                : "text-muted-foreground";
+              return (
+                <div key={i} className="flex items-start gap-2 text-xs py-1 border-b border-border/20">
+                  <span className="text-muted-foreground shrink-0">{new Date(entry.ts).toLocaleTimeString("ru-RU")}</span>
+                  <span className={`font-mono font-semibold shrink-0 ${color}`}>{entry.event}</span>
+                  <span className="text-muted-foreground truncate">{entry.detail}</span>
+                </div>
+              );
+            })}
+            {(!modelLog || (modelLog as any[]).length === 0) && (
+              <p className="text-sm text-muted-foreground text-center py-2">Нет событий модели</p>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Row 3: Per-asset stats table */}
       <Card>
