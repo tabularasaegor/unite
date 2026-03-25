@@ -15,10 +15,23 @@ import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 const USERS: Record<string, string> = {
   "animusvox": "Rodman91!",
 };
-const sessions = new Set<string>();
+const TOKEN_TTL_MS = 60 * 60 * 1000; // 60 minutes
+const sessions = new Map<string, number>(); // token → expiry timestamp
 
 function generateToken(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function isTokenValid(token: string): boolean {
+  const expiry = sessions.get(token);
+  if (!expiry) return false;
+  if (Date.now() > expiry) {
+    sessions.delete(token);
+    return false;
+  }
+  // Extend on activity (sliding window)
+  sessions.set(token, Date.now() + TOKEN_TTL_MS);
+  return true;
 }
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
@@ -29,7 +42,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (!username || !password) return res.status(400).json({ error: "Логин и пароль обязательны" });
     if (USERS[username] !== password) return res.status(401).json({ error: "Неверный логин или пароль" });
     const token = generateToken();
-    sessions.add(token);
+    sessions.set(token, Date.now() + TOKEN_TTL_MS);
     res.json({ token, username });
   });
 
@@ -41,14 +54,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/auth/check", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "");
-    res.json({ authenticated: !!token && sessions.has(token) });
+    res.json({ authenticated: !!token && isTokenValid(token) });
   });
 
-  // --- Auth middleware for all /api/* routes except /api/auth/* ---
+  // --- Auth middleware (60-min sliding window) ---
   app.use("/api", (req, res, next) => {
     if (req.path.startsWith("/auth")) return next();
     const token = req.headers.authorization?.replace("Bearer ", "");
-    if (!token || !sessions.has(token)) {
+    if (!token || !isTokenValid(token)) {
       return res.status(401).json({ error: "Требуется авторизация" });
     }
     next();

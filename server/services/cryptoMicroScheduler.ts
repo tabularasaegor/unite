@@ -88,8 +88,9 @@ function recordWindowResult(wins: number, losses: number, pnl: number) {
       logModelChange("WIN_RECOVERY", `Breaking ${consecutiveLossWindows} loss streak`);
     }
     consecutiveLossWindows = 0;
-    // SLOW recovery: only +0.1 per win window, capped at 1.0 (no over-leveraging)
+    // SLOW recovery: only +0.1 per win window, HARD CAP at 1.0 (never over-leverage)
     betSizeMultiplier = Math.min(1.0, betSizeMultiplier + 0.1);
+    logModelChange("WIN_WINDOW", `${wins}W/${losses}L, mult=${betSizeMultiplier.toFixed(2)}x`);
   }
 
   // Drawdown brake: if we've lost >30% from session peak, hard cap at 0.5x
@@ -552,8 +553,10 @@ async function runMicroCycle(): Promise<void> {
     // Get enabled assets
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
 
+    // Collect all analyses first, then diversify
+    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string }> = [];
+
     for (const asset of enabledAssets) {
-      // Adaptive: skip assets on cooldown (bad recent performance)
       if (shouldSkipAsset(asset)) {
         log(`Micro: ${asset.toUpperCase()} on cooldown, skipping`, "micro");
         continue;
@@ -562,7 +565,6 @@ async function runMicroCycle(): Promise<void> {
       const market = await fetchMicroMarket(asset);
       if (!market) continue;
 
-      // Check if already traded this window
       if (storage.getOpportunityByExternalId(`micro-${market.slug}-Up`) || 
           storage.getOpportunityByExternalId(`micro-${market.slug}-Down`)) continue;
 
@@ -571,9 +573,27 @@ async function runMicroCycle(): Promise<void> {
 
       // AI analysis with calibration context
       const analysis = await analyzeWithCalibration(asset, market);
+      analyses.push({ asset, market, ...analysis });
+    }
+
+    // --- Diversification: prevent all-same-direction ---
+    if (analyses.length >= 3) {
+      const upCount = analyses.filter(a => a.direction === "Up").length;
+      const downCount = analyses.filter(a => a.direction === "Down").length;
       
-      // Execute with dynamic bet size multiplier
-      executeMicroTrade(market, analysis.direction, analysis.confidence, analysis.reasoning);
+      if (upCount === analyses.length || downCount === analyses.length) {
+        // All same direction — flip the weakest signal to diversify
+        const sorted = [...analyses].sort((a, b) => a.confidence - b.confidence);
+        const weakest = sorted[0];
+        weakest.direction = weakest.direction === "Up" ? "Down" : "Up";
+        weakest.reasoning += " [DIVERSIFIED: flipped weakest]";
+        logModelChange("DIVERSIFY", `All ${upCount > 0 ? "Up" : "Down"} → flipped ${weakest.asset.toUpperCase()} to ${weakest.direction}`);
+      }
+    }
+
+    // Execute all trades
+    for (const a of analyses) {
+      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning);
     }
 
     lastCycleAt = new Date().toISOString();
