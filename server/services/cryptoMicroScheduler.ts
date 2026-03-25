@@ -67,6 +67,16 @@ function logModelChange(event: string, detail: string) {
   modelLog.push(entry);
   if (modelLog.length > 100) modelLog.shift();
   log(`MODEL: ${event} — ${detail}`, "micro");
+  // Persist model log to DB
+  try {
+    storage.upsertMemory({
+      category: "micro_model_log",
+      key: "log",
+      value: JSON.stringify(modelLog.slice(-100)),
+      confidence: 1,
+      createdAt: new Date().toISOString(),
+    });
+  } catch {}
 }
 
 function recordWindowResult(wins: number, losses: number, pnl: number) {
@@ -119,7 +129,19 @@ function shouldSkipAsset(asset: string): boolean {
   return false;
 }
 
-export function getModelLog() { return modelLog.slice(-50); }
+export function getModelLog() {
+  // Restore from DB if empty (e.g. after server restart)
+  if (modelLog.length === 0) {
+    try {
+      const logMem = storage.getMemory("micro_model_log", "log");
+      if (logMem.length > 0) {
+        const saved = JSON.parse(logMem[0].value);
+        if (Array.isArray(saved)) modelLog.push(...saved.slice(-100));
+      }
+    } catch {}
+  }
+  return modelLog.slice(-50);
+}
 
 function getCalibration(asset: string): AssetCalibration {
   if (!calibration[asset]) {
@@ -157,7 +179,10 @@ function updateCalibration(asset: string, direction: string, won: boolean, pnl: 
   });
 }
 
+let calibrationLoaded = false;
 function loadCalibrationFromMemory() {
+  if (calibrationLoaded) return;
+  calibrationLoaded = true;
   for (const asset of ALL_ASSETS) {
     const mem = storage.getMemory("micro_calibration", asset);
     if (mem.length > 0) {
@@ -175,6 +200,58 @@ let lastCycleAt: string | null = null;
 let totalCycles = 0;
 let totalTrades = 0;
 let totalPnl = 0;
+let stateInitialized = false;
+
+/**
+ * Reconstruct cumulative counters from DB on startup.
+ * This ensures totalTrades, totalPnl, sessionPnl, sessionPeakPnl
+ * survive server restarts / scheduler stop-start cycles.
+ */
+function initStateFromDB(): void {
+  if (stateInitialized) return;
+  stateInitialized = true;
+
+  try {
+    const allPositions = storage.getActivePositions();
+    const microClosed = allPositions.filter(p => p.title?.startsWith("[5m]") && p.status === "closed");
+
+    if (microClosed.length === 0) return;
+
+    // Reconstruct cumulative stats
+    let dbTrades = 0;
+    let dbPnl = 0;
+    for (const pos of microClosed) {
+      dbTrades++;
+      dbPnl += pos.unrealizedPnl || 0;
+    }
+
+    // Only bump counters if DB has more trades than memory (avoid double counting)
+    if (dbTrades > totalTrades) {
+      totalTrades = dbTrades;
+      totalPnl = Math.round(dbPnl * 100) / 100;
+    }
+
+    // Reconstruct session P&L tracking
+    sessionPnl = Math.round(dbPnl * 100) / 100;
+    sessionPeakPnl = sessionPnl; // Conservative: set peak to current
+
+    // Restore model log from memory
+    const logMem = storage.getMemory("micro_model_log", "log");
+    if (logMem.length > 0) {
+      try {
+        const saved = JSON.parse(logMem[0].value);
+        if (Array.isArray(saved)) {
+          modelLog.length = 0;
+          modelLog.push(...saved.slice(-100));
+        }
+      } catch {}
+    }
+
+    log(`Micro: Restored state from DB — ${dbTrades} trades, P&L: $${totalPnl.toFixed(2)}`, "micro");
+  } catch (err) {
+    log(`Micro: initStateFromDB error: ${err}`, "micro");
+  }
+}
 
 // --- Fetch current 5-min market ---
 async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
@@ -541,9 +618,6 @@ async function runMicroCycle(): Promise<void> {
     totalCycles++;
     if (storage.getConfig("micro_scheduler_enabled") !== "true") { isRunning = false; return; }
 
-    // Load calibration from memory on first cycle
-    if (totalCycles === 1) loadCalibrationFromMemory();
-
     // Settle expired trades
     const settled = await settleMicroTrades();
     if (settled > 0) {
@@ -608,6 +682,8 @@ async function runMicroCycle(): Promise<void> {
 export function startMicroScheduler(): void {
   if (schedulerInterval) clearInterval(schedulerInterval);
   storage.setConfig("micro_scheduler_enabled", "true");
+  initStateFromDB();
+  loadCalibrationFromMemory();
   runMicroCycle();
   schedulerInterval = setInterval(() => runMicroCycle(), 60 * 1000);
   log("⚡ Micro-scheduler started (BTC/ETH/SOL/XRP 5-min markets)", "micro");
@@ -620,6 +696,10 @@ export function stopMicroScheduler(): void {
 }
 
 export function getMicroStatus() {
+  // Ensure historical state is loaded from DB even if scheduler never started
+  initStateFromDB();
+  loadCalibrationFromMemory();
+
   const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim());
   
   // Build calibration summary
