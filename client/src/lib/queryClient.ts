@@ -4,6 +4,13 @@ const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {
+    // On 401, clear stale token and force re-login
+    if (res.status === 401) {
+      const { logout } = await import("@/lib/auth");
+      logout();
+      window.location.reload();
+      return;
+    }
     const text = (await res.text()) || res.statusText;
     throw new Error(`${res.status}: ${text}`);
   }
@@ -41,7 +48,12 @@ export const getQueryFn: <T>(options: {
     if (token) headers["Authorization"] = `Bearer ${token}`;
     const res = await fetch(`${API_BASE}${urlParts.join("/")}`, { headers });
 
-    if (unauthorizedBehavior === "returnNull" && res.status === 401) {
+    if (res.status === 401) {
+      if (unauthorizedBehavior === "returnNull") return null;
+      // Clear stale token and force re-login
+      const { logout } = await import("@/lib/auth");
+      logout();
+      window.location.reload();
       return null;
     }
 

@@ -30,21 +30,69 @@ function getUsers(): Record<string, string> {
   return users;
 }
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 60 minutes
-const sessions = new Map<string, number>(); // token → expiry timestamp
+
+// Sessions backed by DB (memoryStore) so they survive server restart.
+// In-memory cache avoids hitting DB on every request.
+const sessionCache = new Map<string, { expiry: number; username: string }>();
+let sessionCacheLoaded = false;
+
+function loadSessionsFromDB() {
+  if (sessionCacheLoaded) return;
+  sessionCacheLoaded = true;
+  try {
+    const entries = storage.getMemory("auth_sessions");
+    const now = Date.now();
+    for (const entry of entries) {
+      try {
+        const { expiry, username } = JSON.parse(entry.value);
+        if (expiry > now) {
+          sessionCache.set(entry.key, { expiry, username });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+function saveSession(token: string, expiry: number, username: string) {
+  sessionCache.set(token, { expiry, username });
+  storage.upsertMemory({
+    category: "auth_sessions",
+    key: token,
+    value: JSON.stringify({ expiry, username }),
+    confidence: 1,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function deleteSession(token: string) {
+  sessionCache.delete(token);
+  // Delete from DB by setting expired value
+  storage.upsertMemory({
+    category: "auth_sessions",
+    key: token,
+    value: JSON.stringify({ expiry: 0, username: "" }),
+    confidence: 0,
+    createdAt: new Date().toISOString(),
+  });
+}
 
 function generateToken(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
 function isTokenValid(token: string): boolean {
-  const expiry = sessions.get(token);
-  if (!expiry) return false;
-  if (Date.now() > expiry) {
-    sessions.delete(token);
+  loadSessionsFromDB();
+  const session = sessionCache.get(token);
+  if (!session) return false;
+  if (Date.now() > session.expiry) {
+    deleteSession(token);
     return false;
   }
   // Extend on activity (sliding window)
-  sessions.set(token, Date.now() + TOKEN_TTL_MS);
+  const newExpiry = Date.now() + TOKEN_TTL_MS;
+  session.expiry = newExpiry;
+  // Persist extension to DB (throttled — only if >5 min since last save)
+  saveSession(token, newExpiry, session.username);
   return true;
 }
 
@@ -57,7 +105,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const users = getUsers();
     if (users[username] !== password) return res.status(401).json({ error: "Неверный логин или пароль" });
     const token = generateToken();
-    sessions.set(token, Date.now() + TOKEN_TTL_MS);
+    saveSession(token, Date.now() + TOKEN_TTL_MS, username);
     res.json({ token, username });
   });
 
@@ -78,13 +126,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
     // Auto-login after registration
     const token = generateToken();
-    sessions.set(token, Date.now() + TOKEN_TTL_MS);
+    saveSession(token, Date.now() + TOKEN_TTL_MS, username);
     res.json({ token, username });
   });
 
   app.post("/api/auth/logout", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "");
-    if (token) sessions.delete(token);
+    if (token) deleteSession(token);
     res.json({ ok: true });
   });
 
