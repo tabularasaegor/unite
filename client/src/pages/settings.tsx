@@ -161,6 +161,11 @@ export default function SettingsPage() {
               <Label>Интервал пайплайна (мин)</Label>
               <Input type="number" value={form.pipeline_interval || ""} onChange={e => update("pipeline_interval", e.target.value)} />
             </div>
+            <div>
+              <Label>Макс. событий за цикл</Label>
+              <Input type="number" value={form.pipeline_max_per_run || ""} onChange={e => update("pipeline_max_per_run", e.target.value)} />
+              <p className="text-[10px] text-muted-foreground mt-1">Сколько событий исследовать за 1 запуск</p>
+            </div>
           </div>
         </CardContent>
       </Card>

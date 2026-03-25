@@ -676,7 +676,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       "min_edge_threshold", "pipeline_interval", "require_human_approval",
       "auto_approve_threshold", "kill_switch", "max_trade_size",
       "micro_scheduler_enabled", "micro_assets", "micro_bankroll", "micro_max_bet",
-      "pipeline_min_days", "pipeline_max_days", "pipeline_sectors",
+      "pipeline_min_days", "pipeline_max_days", "pipeline_sectors", "pipeline_max_per_run",
     ];
     const config: Record<string, string> = {};
     for (const key of keys) {
@@ -719,6 +719,7 @@ function getDefaultConfigValue(key: string): string {
     pipeline_min_days: "0",
     pipeline_max_days: "30",
     pipeline_sectors: "sports,crypto,politics,tech,other",
+    pipeline_max_per_run: "30",
   };
   return defaults[key] || "";
 }
