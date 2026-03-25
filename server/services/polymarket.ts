@@ -93,6 +93,19 @@ export async function fetchActiveEvents(
   }
 }
 
+export async function fetchEventBySlug(slug: string): Promise<GammaEvent | null> {
+  try {
+    const url = `${GAMMA_API}/events?slug=${slug}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data: GammaEvent[] = await res.json();
+    return data.length > 0 ? data[0] : null;
+  } catch (err) {
+    log(`Polymarket fetchEventBySlug(${slug}) error: ${err}`, "polymarket");
+    return null;
+  }
+}
+
 export async function fetchMarkets(
   limit = 100,
   offset = 0,

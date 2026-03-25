@@ -630,7 +630,7 @@ function getDefaultConfigValue(key: string): string {
     micro_assets: "btc,eth,sol,xrp",
     micro_bankroll: "200",
     micro_max_bet: "20",
-    pipeline_min_days: "1",
+    pipeline_min_days: "0",
     pipeline_max_days: "30",
     pipeline_sectors: "sports,crypto,politics,tech,other",
   };

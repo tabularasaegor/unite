@@ -38,9 +38,19 @@ export interface PipelineStatus {
   };
 }
 
+// --- Check if opportunity is a daily crypto event (above/up-or-down) ---
+function isDailyCryptoEvent(opp: any): boolean {
+  const title = (opp.title || "").toLowerCase();
+  const slug = (opp.slug || "").toLowerCase();
+  return (
+    (slug.includes("-above-on-") || slug.includes("-up-or-down-on-")) &&
+    (title.includes("bitcoin") || title.includes("ethereum") || title.includes("solana") || title.includes("xrp"))
+  );
+}
+
 // --- Date filter check for individual opportunity ---
 function isOpportunityWithinDateRange(opp: any): boolean {
-  const minDays = parseInt(storage.getConfig("pipeline_min_days") || "1");
+  const minDays = parseInt(storage.getConfig("pipeline_min_days") || "0");
   const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "365");
   
   if (!opp.endDate) return true; // No date = allow
@@ -49,7 +59,9 @@ function isOpportunityWithinDateRange(opp: any): boolean {
     const end = new Date(opp.endDate);
     const days = Math.ceil((end.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
     if (days < 0) return false; // Expired
-    if (days < minDays || days > maxDays) return false;
+    // Daily crypto events (above/up-or-down) allow same-day (days=0)
+    const effectiveMinDays = isDailyCryptoEvent(opp) ? 0 : minDays;
+    if (days < effectiveMinDays || days > maxDays) return false;
   } catch {
     return true; // Invalid date = allow
   }

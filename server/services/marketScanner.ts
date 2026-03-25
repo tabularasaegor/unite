@@ -8,7 +8,7 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import type { InsertOpportunity } from "@shared/schema";
-import { fetchMarkets as fetchGammaMarkets, fetchActiveEvents, type GammaMarket, type GammaEvent } from "./polymarket";
+import { fetchMarkets as fetchGammaMarkets, fetchActiveEvents, fetchEventBySlug, type GammaMarket, type GammaEvent } from "./polymarket";
 
 function classifyCategory(question: string, gammaCategory: string): string {
   const q = question.toLowerCase();
@@ -100,8 +100,8 @@ async function scanPolymarket(): Promise<number> {
       if (days !== null && days < 0) continue;
 
       // Apply min/max days filters from config
-      const minDays = parseInt(storage.getConfig("pipeline_min_days") || "1");
-      const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "90");
+      const minDays = parseInt(storage.getConfig("pipeline_min_days") || "0");
+      const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "30");
       if (days !== null) {
         if (days < minDays || days > maxDays) continue;
       }
@@ -176,8 +176,8 @@ async function scanPolymarketEvents(): Promise<number> {
     log(`Fetched ${allEvents.length} events from Gamma Events API`, "scanner");
 
     const enabledSectors = (storage.getConfig("pipeline_sectors") || "sports,crypto,politics,tech,other").split(",").map(s => s.trim().toLowerCase());
-    const minDays = parseInt(storage.getConfig("pipeline_min_days") || "1");
-    const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "90");
+    const minDays = parseInt(storage.getConfig("pipeline_min_days") || "0");
+    const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "30");
 
     for (const event of allEvents) {
       if (!event.markets || event.markets.length === 0) continue;
@@ -235,6 +235,129 @@ async function scanPolymarketEvents(): Promise<number> {
   return discovered;
 }
 
+// --- Daily Crypto Events Scanner (restricted events not in general listing) ---
+
+const DAILY_CRYPTO_ASSETS = ["bitcoin", "ethereum", "solana", "xrp"];
+const MONTH_NAMES = ["january","february","march","april","may","june","july","august","september","october","november","december"];
+
+function getDailyCryptoSlugs(): string[] {
+  const slugs: string[] = [];
+  const now = new Date();
+  // Scan today + next 7 days to catch upcoming events
+  for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+    const date = new Date(now);
+    date.setDate(date.getDate() + dayOffset);
+    const month = MONTH_NAMES[date.getMonth()];
+    const day = date.getDate();
+    const year = date.getFullYear();
+
+    for (const asset of DAILY_CRYPTO_ASSETS) {
+      // "Bitcoin above ___ on March 26?" pattern
+      slugs.push(`${asset}-above-on-${month}-${day}`);
+      // "Bitcoin Up or Down on March 26?" pattern (includes year)
+      slugs.push(`${asset}-up-or-down-on-${month}-${day}-${year}`);
+    }
+  }
+  return slugs;
+}
+
+async function scanDailyCryptoEvents(): Promise<number> {
+  log("Scanning daily crypto events (above/up-down)...", "scanner");
+  let discovered = 0;
+
+  try {
+    const enabledSectors = (storage.getConfig("pipeline_sectors") || "sports,crypto,politics,tech,other").split(",").map(s => s.trim().toLowerCase());
+    if (!enabledSectors.includes("crypto")) {
+      log("Crypto sector disabled — skipping daily crypto scan", "scanner");
+      return 0;
+    }
+
+    const maxDays = parseInt(storage.getConfig("pipeline_max_days") || "90");
+    const slugs = getDailyCryptoSlugs();
+
+    // Fetch events in parallel batches of 8
+    for (let i = 0; i < slugs.length; i += 8) {
+      const batch = slugs.slice(i, i + 8);
+      const events = await Promise.all(batch.map(slug => fetchEventBySlug(slug)));
+
+      for (const event of events) {
+        if (!event || !event.markets || event.markets.length === 0) continue;
+
+        // Check event end date — allow same-day (days >= 0)
+        const eventEndDate = (event as any).endDate || null;
+        if (eventEndDate) {
+          const days = daysUntil(eventEndDate);
+          if (days !== null && (days < 0 || days > maxDays)) continue;
+        }
+
+        for (const gm of event.markets) {
+          const parsed = parseGammaMarketFull(gm);
+          if (!parsed.active || parsed.currentPrice === 0) continue;
+          // Wider price range: allow 0.02-0.98 for daily crypto
+          if (parsed.currentPrice < 0.02 || parsed.currentPrice > 0.98) continue;
+          // Lower volume threshold for daily crypto events
+          if (parsed.volume24h < 10) continue;
+
+          const marketEndDate = parsed.endDate || eventEndDate;
+
+          const existing = storage.getOpportunityByExternalId(parsed.externalId);
+          if (existing) {
+            // Update prices
+            storage.updateOpportunity(existing.id, {
+              currentPrice: parsed.currentPrice,
+              volume24h: parsed.volume24h,
+              totalLiquidity: parsed.liquidityNum,
+              marketProbability: parsed.currentPrice,
+              conditionId: parsed.conditionId,
+              clobTokenIds: parsed.clobTokenIds,
+              tickSize: parsed.tickSize,
+              negRisk: parsed.negRisk,
+              endDate: marketEndDate,
+              slug: parsed.slug,
+            });
+            continue;
+          }
+
+          // Determine sub-type for the title prefix
+          const eventSlug = event.slug || "";
+          const isAbove = eventSlug.includes("-above-");
+          const isUpDown = eventSlug.includes("-up-or-down-");
+          const prefix = isAbove ? "[Дневн.Крипто]" : isUpDown ? "[Дневн.Крипто]" : "[Дневн.Крипто]";
+
+          storage.createOpportunity({
+            externalId: parsed.externalId,
+            platform: "polymarket",
+            title: parsed.name,
+            description: parsed.description,
+            category: "crypto",
+            marketUrl: parsed.slug ? `https://polymarket.com/event/${parsed.slug}` : `https://polymarket.com`,
+            currentPrice: parsed.currentPrice,
+            volume24h: parsed.volume24h,
+            totalLiquidity: parsed.liquidityNum,
+            marketProbability: parsed.currentPrice,
+            conditionId: parsed.conditionId,
+            clobTokenIds: parsed.clobTokenIds,
+            tickSize: parsed.tickSize,
+            negRisk: parsed.negRisk,
+            endDate: marketEndDate,
+            slug: parsed.slug,
+            status: "discovered",
+            pipelineStage: "scan",
+            discoveredAt: new Date().toISOString(),
+          });
+          discovered++;
+        }
+      }
+    }
+
+    log(`Daily crypto scan complete: ${discovered} new markets`, "scanner");
+  } catch (err) {
+    log(`Daily crypto scan error: ${err}`, "scanner");
+  }
+
+  return discovered;
+}
+
 // --- Main Scanner ---
 
 export interface ScanResult {
@@ -264,7 +387,10 @@ export async function runMarketScan(): Promise<ScanResult> {
     const eventsCount = await scanPolymarketEvents().catch(err => { errors.push(`Polymarket Events: ${err}`); return 0; });
     byPlatform.polymarket_events = eventsCount;
 
-    const totalDiscovered = polyCount + eventsCount;
+    const dailyCryptoCount = await scanDailyCryptoEvents().catch(err => { errors.push(`Daily Crypto: ${err}`); return 0; });
+    byPlatform.daily_crypto = dailyCryptoCount;
+
+    const totalDiscovered = polyCount + eventsCount + dailyCryptoCount;
     log(`Market scan complete: ${totalDiscovered} new opportunities`, "scanner");
 
     storage.createAuditEntry({
