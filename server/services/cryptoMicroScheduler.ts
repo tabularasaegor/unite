@@ -12,6 +12,7 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
+import { computeMLSignal, rebuildCalibrationFromDB } from "./mlCalibration";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
@@ -249,8 +250,8 @@ function initStateFromDB(): void {
 
     log(`Micro: Restored state from DB — ${dbTrades} trades, P&L: $${totalPnl.toFixed(2)}`, "micro");
 
-    // Load calibration BEFORE audit (loadCalibrationFromMemory is idempotent)
-    loadCalibrationFromMemory();
+    // --- ML Calibration: rebuild from FULL DB history ---
+    rebuildCalibrationFromHistory();
 
     // --- Calibration quality audit on startup ---
     auditCalibrationOnStartup();
@@ -337,6 +338,58 @@ function auditCalibrationOnStartup(): void {
   logModelChange("CALIBRATION_AUDIT", `${totalWins}W/${totalLosses}L (${(overallWR*100).toFixed(0)}%) | ${assetReports.join(" | ")} | mult=${betSizeMultiplier.toFixed(2)}x`);
 }
 
+/**
+ * Rebuild calibration from full DB trade history using ML module.
+ * This replaces loadCalibrationFromMemory() with actual DB data,
+ * ensuring calibration always matches reality.
+ */
+function rebuildCalibrationFromHistory(): void {
+  try {
+    const allPositions = storage.getActivePositions("closed");
+    const microClosed = allPositions.filter(p => p.title?.startsWith("[5m]"));
+    
+    if (microClosed.length === 0) {
+      // Fall back to stored calibration if no DB history
+      loadCalibrationFromMemory();
+      return;
+    }
+
+    const result = rebuildCalibrationFromDB(microClosed.map(p => ({
+      title: p.title,
+      side: p.side,
+      unrealizedPnl: p.unrealizedPnl || 0,
+      closedAt: p.closedAt || "",
+      entryPrice: p.entryPrice,
+      size: p.size,
+    })));
+
+    // Update calibration map with rebuilt data
+    for (const [asset, cal] of Object.entries(result.perAsset)) {
+      calibration[asset] = cal;
+      // Also persist to memory for backup
+      storage.upsertMemory({
+        category: "micro_calibration",
+        key: asset,
+        value: JSON.stringify(cal),
+        confidence: cal.totalTrades > 0 ? cal.wins / cal.totalTrades : 0.5,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    calibrationLoaded = true;
+
+    logModelChange("ML_CALIBRATION", 
+      `Rebuilt from ${result.overall.trades} trades: ${result.overall.wins}W/${result.overall.losses}L ` +
+      `(${result.overall.winRate}%) P&L=$${result.overall.pnl} | ` +
+      Object.entries(result.perAsset).map(([a, c]) => 
+        `${a.toUpperCase()}: ${c.wins}W/${c.losses}L (${c.totalTrades > 0 ? Math.round(c.wins/c.totalTrades*100) : 0}%)`
+      ).join(", ")
+    );
+  } catch (err) {
+    log(`ML calibration rebuild error: ${err}`, "micro");
+    loadCalibrationFromMemory(); // fallback
+  }
+}
+
 // --- Fetch current 5-min market ---
 async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
   const now = Math.floor(Date.now() / 1000);
@@ -373,7 +426,7 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
   } catch { return null; }
 }
 
-// --- Hybrid analysis: market microstructure + calibration + AI reasoning ---
+// --- ML-Powered Analysis: combines trained weights with calibration and AI ---
 async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
   direction: "Up" | "Down";
   confidence: number;
@@ -381,60 +434,18 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
 }> {
   const cal = getCalibration(asset);
   
-  // === STEP 1: Market microstructure signal ===
-  // Core insight: 5-min markets are near-random. The best edge comes from:
-  // 1) Contrarian when market deviates from 50/50
-  // 2) Following calibration data (what actually worked)
-  
-  let direction: "Up" | "Down";
-  let confidence: number;
-  let reasoning: string;
+  // === STEP 1: ML Signal from trained weights ===
+  const mlSignal = computeMLSignal(
+    asset, market.upPrice,
+    cal.lastResults, cal.totalTrades, cal.wins,
+    cal.upWins, cal.upLosses, cal.downWins, cal.downLosses
+  );
 
-  const upPrice = market.upPrice;
-  const deviation = Math.abs(upPrice - 0.5);
+  let direction = mlSignal.direction;
+  let confidence = Math.min(0.65, Math.max(0.51, mlSignal.mlScore));
+  let reasoning = mlSignal.reasoning;
 
-  // Strategy 1: Strong contrarian when market deviates >3%
-  if (deviation > 0.03) {
-    direction = upPrice > 0.53 ? "Down" : "Up";
-    confidence = 0.50 + deviation * 0.3; // Higher deviation = higher confidence
-    reasoning = `Contrarian: market prices ${direction === "Up" ? "Down" : "Up"} at ${(upPrice > 0.5 ? upPrice : 1-upPrice)*100}%, reverting`;
-  }
-  // Strategy 2: Use calibration bias when available (>5 trades)
-  else if (cal.totalTrades >= 5) {
-    const upWR = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : 0.5;
-    const downWR = (cal.downWins + cal.downLosses) > 0 ? cal.downWins / (cal.downWins + cal.downLosses) : 0.5;
-    
-    if (upWR > downWR + 0.05) {
-      direction = "Up";
-      confidence = 0.50 + (upWR - 0.5) * 0.2;
-      reasoning = `Calibration bias: Up wins ${(upWR*100).toFixed(0)}% vs Down ${(downWR*100).toFixed(0)}%`;
-    } else if (downWR > upWR + 0.05) {
-      direction = "Down";
-      confidence = 0.50 + (downWR - 0.5) * 0.2;
-      reasoning = `Calibration bias: Down wins ${(downWR*100).toFixed(0)}% vs Up ${(upWR*100).toFixed(0)}%`;
-    } else {
-      // No clear bias — use recent streak
-      const recent = cal.lastResults.slice(-3);
-      const recentUpWins = recent.filter(r => r.direction === "Up" && r.won).length;
-      const recentDownWins = recent.filter(r => r.direction === "Down" && r.won).length;
-      direction = recentUpWins >= recentDownWins ? "Up" : "Down";
-      confidence = 0.52;
-      reasoning = `Recent momentum: last 3 trades favor ${direction}`;
-    }
-  }
-  // Strategy 3: Alternating when no data (avoid always-Up bias)
-  else {
-    // Alternate based on window timestamp to avoid directional bias
-    const windowParity = (market.windowStart / 300) % 2 === 0;
-    direction = windowParity ? "Up" : "Down";
-    confidence = 0.52;
-    reasoning = `No calibration data yet, alternating direction`;
-  }
-
-  // Clamp confidence
-  confidence = Math.min(0.62, Math.max(0.51, confidence));
-
-  // === STEP 2: Quick AI validation (optional, non-blocking) ===
+  // === STEP 2: Quick AI validation (non-blocking, can override weak signals) ===
   try {
     const { default: OpenAI } = await import("openai");
     const client = new OpenAI();
@@ -443,33 +454,35 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
       `${r.direction} ${r.won ? "W" : "L"}`
     ).join(", ");
 
-    const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%.
-My signal: ${direction} (${(confidence*100).toFixed(0)}%). Track: ${cal.totalTrades}trades, ${cal.wins}W/${cal.losses}L. Recent: ${recentStr || "none"}
-Do you AGREE or DISAGREE? Reply JSON: {"agree": true/false, "direction": "Up"/"Down", "confidence_adj": -0.02 to +0.05}`;
+    const prompt = `5-min ${asset.toUpperCase()} crypto market. Up=${(market.upPrice*100).toFixed(1)}%, Down=${((1-market.upPrice)*100).toFixed(1)}%.
+ML signal: ${direction} (score ${(mlSignal.mlScore*100).toFixed(1)}%, edge ${(mlSignal.edgeEstimate*100).toFixed(1)}%).
+Calibration: ${cal.totalTrades} trades, ${cal.wins}W/${cal.losses}L. Recent: ${recentStr || "none"}.
+Key data: YES side WR=66%, ${asset.toUpperCase()} overall WR=${cal.totalTrades > 0 ? Math.round(cal.wins/cal.totalTrades*100) : '?'}%.
+Do you AGREE or DISAGREE with ${direction}? Reply JSON: {"agree": true/false, "direction": "Up"/"Down", "confidence_adj": -0.03 to +0.05}`;
 
     const response = await client.responses.create({ model: "gpt-5", input: prompt });
     const text = response.output_text || "";
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      if (!parsed.agree && parsed.direction) {
-        // AI disagrees — if strong disagreement, flip
+      // Only allow AI to override if ML edge is weak (<3%)
+      if (!parsed.agree && parsed.direction && mlSignal.edgeEstimate < 0.03) {
         direction = parsed.direction === "Down" ? "Down" : "Up";
-        reasoning += ` [AI override: ${parsed.direction}]`;
+        reasoning += ` [AI: ${parsed.direction}]`;
       }
       if (parsed.confidence_adj) {
-        confidence = Math.min(0.62, Math.max(0.51, confidence + parsed.confidence_adj));
+        confidence = Math.min(0.65, Math.max(0.51, confidence + parsed.confidence_adj));
       }
     }
   } catch {
-    // AI unavailable — use microstructure signal as-is
+    // AI unavailable — ML signal is the primary decision maker
   }
 
-  return { direction, confidence, reasoning };
+  return { direction, confidence, reasoning, mlBetMult: mlSignal.betMultiplier };
 }
 
 // --- Execute micro-trade ---
-function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string): boolean {
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, mlBetMult?: number): boolean {
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
@@ -497,7 +510,9 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   else if (impliedEdge >= 0.02) betFraction = 0.50;
   else betFraction = 0.25;
   
-  const rawSize = microMaxBet * betFraction * betSizeMultiplier;
+  // Apply ML asset-specific multiplier (reduces BTC, boosts SOL)
+  const mlMult = mlBetMult ?? 0.7;
+  const rawSize = microMaxBet * betFraction * betSizeMultiplier * mlMult;
   const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
   
   log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: edge=${(impliedEdge*100).toFixed(1)}% frac=${betFraction} mult=${betSizeMultiplier.toFixed(1)}x → $${size.toFixed(2)}`, "micro");
@@ -749,9 +764,9 @@ async function runMicroCycle(): Promise<void> {
       }
     }
 
-    // Execute all trades
+    // Execute all trades with ML bet multiplier
     for (const a of analyses) {
-      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning);
+      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, (a as any).mlBetMult);
     }
 
     lastCycleAt = new Date().toISOString();
