@@ -120,15 +120,25 @@ export default function Dashboard() {
       {/* Wallet Info */}
       {polyStatus?.address && (
         <Card className="bg-muted/30">
-          <CardContent className="py-2 px-4 flex items-center justify-between">
-            <div className="flex items-center gap-4 text-xs">
-              <span className="text-muted-foreground">Polymarket:</span>
-              <span className="font-mono">{polyStatus.address.slice(0, 6)}...{polyStatus.address.slice(-4)}</span>
-              {polyStatus.balance != null && <span className="font-mono font-semibold">${parseFloat(polyStatus.balance).toFixed(2)}</span>}
-              <Badge variant={polyStatus.tradingEnabled ? "default" : "secondary"} className="text-[10px] h-4">
-                {polyStatus.tradingEnabled ? "Trading активен" : "Только чтение"}
-              </Badge>
+          <CardContent className="py-3 px-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4 text-xs">
+                <span className="text-muted-foreground">Кошелёк:</span>
+                <span className="font-mono">{polyStatus.address.slice(0, 6)}...{polyStatus.address.slice(-4)}</span>
+                <Badge variant={polyStatus.tradingEnabled ? "default" : "secondary"} className="text-[10px] h-4">
+                  {polyStatus.tradingEnabled ? "Торговля активна" : "Paper Mode"}
+                </Badge>
+              </div>
+              <div className="flex items-center gap-4 text-xs">
+                <div className="text-right">
+                  <span className="text-muted-foreground">Баланс Polymarket: </span>
+                  <span className="font-mono font-semibold">${polyStatus.balance != null ? parseFloat(polyStatus.balance).toFixed(2) : "0.00"}</span>
+                </div>
+              </div>
             </div>
+            {!polyStatus.tradingEnabled && polyStatus.hasPrivateKey && (
+              <p className="text-[10px] text-muted-foreground mt-1">Ключ настроен, но CLOB API не авторизован. Сделки исполняются в режиме paper trading.</p>
+            )}
           </CardContent>
         </Card>
       )}

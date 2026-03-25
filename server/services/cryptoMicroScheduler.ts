@@ -248,9 +248,93 @@ function initStateFromDB(): void {
     }
 
     log(`Micro: Restored state from DB — ${dbTrades} trades, P&L: $${totalPnl.toFixed(2)}`, "micro");
+
+    // Load calibration BEFORE audit (loadCalibrationFromMemory is idempotent)
+    loadCalibrationFromMemory();
+
+    // --- Calibration quality audit on startup ---
+    auditCalibrationOnStartup();
+
   } catch (err) {
     log(`Micro: initStateFromDB error: ${err}`, "micro");
   }
+}
+
+/**
+ * Audits loaded calibration data and sets regime variables
+ * (betSizeMultiplier, consecutiveLossWindows, cooldowns) from history.
+ * Logs model events so the UI shows calibration state immediately.
+ */
+function auditCalibrationOnStartup(): void {
+  let totalWins = 0, totalLosses = 0;
+  const assetReports: string[] = [];
+
+  for (const asset of ALL_ASSETS) {
+    const cal = getCalibration(asset);
+    if (cal.totalTrades === 0) continue;
+
+    const wr = cal.totalTrades > 0 ? (cal.wins / cal.totalTrades * 100) : 0;
+    totalWins += cal.wins;
+    totalLosses += cal.losses;
+
+    // Check last 5 results for recent performance
+    const recent5 = cal.lastResults.slice(-5);
+    const recent5WR = recent5.length > 0 ? recent5.filter(r => r.won).length / recent5.length : 0.5;
+    const recent3 = cal.lastResults.slice(-3);
+    const recent3WR = recent3.length > 0 ? recent3.filter(r => r.won).length / recent3.length : 0.5;
+
+    // Log per-asset calibration summary
+    const recentStr = recent5.map(r => r.won ? "✓" : "✗").join("");
+    assetReports.push(`${asset.toUpperCase()}: ${cal.wins}W/${cal.losses}L (${wr.toFixed(0)}%) last5=[${recentStr}] (${(recent5WR*100).toFixed(0)}%)`);
+
+    // If last 3 results are bad, set cooldown
+    if (recent3.length >= 3 && recent3WR < 0.34) {
+      assetCooldown[asset] = Date.now() + 600000; // 10 min cooldown
+      logModelChange("STARTUP_COOLDOWN", `${asset.toUpperCase()} poor recent WR: ${(recent3WR*100).toFixed(0)}% last 3 → 10min cooldown`);
+    }
+
+    // Count trailing losses for regime calculation
+    let trailingLosses = 0;
+    for (let i = recent5.length - 1; i >= 0; i--) {
+      if (!recent5[i].won) trailingLosses++;
+      else break;
+    }
+    if (trailingLosses >= 3) {
+      logModelChange("STARTUP_LOSS_STREAK", `${asset.toUpperCase()} has ${trailingLosses} trailing losses`);
+    }
+  }
+
+  // Set regime from overall recent performance
+  const overallWR = (totalWins + totalLosses) > 0 ? totalWins / (totalWins + totalLosses) : 0.5;
+
+  // Count consecutive loss windows from last results across all assets
+  // Merge all recent results, sort by timestamp, check trailing pattern
+  const allRecent: Array<{ won: boolean; ts: number }> = [];
+  for (const asset of ALL_ASSETS) {
+    const cal = getCalibration(asset);
+    allRecent.push(...cal.lastResults.slice(-10));
+  }
+  allRecent.sort((a, b) => a.ts - b.ts);
+
+  // Count trailing global losses
+  let globalTrailingLosses = 0;
+  for (let i = allRecent.length - 1; i >= 0; i--) {
+    if (!allRecent[i].won) globalTrailingLosses++;
+    else break;
+  }
+
+  // Set consecutiveLossWindows based on trailing losses
+  if (globalTrailingLosses >= 4) {
+    consecutiveLossWindows = Math.floor(globalTrailingLosses / 2);
+    betSizeMultiplier = Math.max(0.25, 1.0 - consecutiveLossWindows * 0.25);
+    logModelChange("STARTUP_REGIME", `${globalTrailingLosses} trailing losses → mult=${betSizeMultiplier.toFixed(2)}x, consec=${consecutiveLossWindows}`);
+  } else {
+    betSizeMultiplier = 1.0;
+    consecutiveLossWindows = 0;
+  }
+
+  // Log overall summary
+  logModelChange("CALIBRATION_AUDIT", `${totalWins}W/${totalLosses}L (${(overallWR*100).toFixed(0)}%) | ${assetReports.join(" | ")} | mult=${betSizeMultiplier.toFixed(2)}x`);
 }
 
 // --- Fetch current 5-min market ---

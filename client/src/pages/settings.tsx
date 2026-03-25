@@ -107,6 +107,31 @@ export default function SettingsPage() {
           <CardTitle className="text-sm font-medium">Управление рисками</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          {/* Real balance display */}
+          {(polyStatus as any)?.address && (
+            <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50 mb-2">
+              <div className="text-xs">
+                <span className="text-muted-foreground">Баланс Polymarket: </span>
+                <span className="font-mono font-semibold">${(polyStatus as any)?.balance != null ? parseFloat((polyStatus as any).balance).toFixed(2) : "0.00"}</span>
+              </div>
+              {form.paper_trading === "false" && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 text-[10px] px-2"
+                  onClick={() => {
+                    const bal = (polyStatus as any)?.balance;
+                    if (bal != null) {
+                      update("bankroll", String(parseFloat(bal).toFixed(2)));
+                      update("micro_bankroll", String(Math.min(parseFloat(bal) * 0.1, 200).toFixed(2)));
+                    }
+                  }}
+                >
+                  Синхр. банкролл
+                </Button>
+              )}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label>Банкролл ($)</Label>

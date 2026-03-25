@@ -623,7 +623,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const resp = await fetch(`https://data-api.polymarket.com/value?user=${funderAddress}`);
         if (resp.ok) {
           const data = await resp.json();
-          balance = data?.value != null ? String(data.value) : null;
+          // API returns array: [{user: "0x...", value: 0}]
+          const entry = Array.isArray(data) ? data[0] : data;
+          balance = entry?.value != null ? String(entry.value) : "0";
         }
       } catch {}
     }
