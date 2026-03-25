@@ -92,14 +92,37 @@ app.use((req, res, next) => {
     }, PRICE_UPDATE_INTERVAL);
     log("Background price ticker started (every 60s)");
 
-    // Push DB tables
-    log("Pushing database schema...");
+    // Ensure DB tables exist (safe check — never drops data)
+    log("Verifying database schema...");
     import("child_process").then(({ execSync }) => {
       try {
-        execSync("npx drizzle-kit push", { cwd: process.cwd(), stdio: "pipe" });
-        log("Database schema pushed successfully");
+        const BetterSqlite3 = require("better-sqlite3");
+        const pathMod = require("path");
+        const dbPath = pathMod.resolve(process.cwd(), "data.db");
+        const testDb = new BetterSqlite3(dbPath, { readonly: true });
+        const tables = testDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[];
+        const tableNames = tables.map((t: any) => t.name);
+        testDb.close();
+
+        const requiredTables = ["opportunities", "active_positions", "executions", "settlements", "audit_log"];
+        const missing = requiredTables.filter(t => !tableNames.includes(t));
+
+        if (missing.length > 0) {
+          log(`Missing tables: ${missing.join(", ")} — running schema migration...`);
+          execSync("npx drizzle-kit push", { cwd: process.cwd(), stdio: "pipe" });
+          log("Database schema created");
+        } else {
+          const checkDb = new BetterSqlite3(dbPath, { readonly: true });
+          const rowCount = checkDb.prepare("SELECT COUNT(*) as c FROM opportunities").get() as any;
+          checkDb.close();
+          log(`Database schema OK (${tableNames.length} tables, ${rowCount?.c || 0} opportunities)`);
+        }
       } catch (err) {
-        log(`DB push warning: ${err}`);
+        log(`DB schema check failed: ${err} — running migration...`);
+        try {
+          execSync("npx drizzle-kit push", { cwd: process.cwd(), stdio: "pipe" });
+          log("Database schema pushed (fallback)");
+        } catch {}
       }
     });
   });

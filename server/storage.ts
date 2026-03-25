@@ -18,7 +18,11 @@ import {
   type PerformanceSnapshot, type InsertPerformanceSnapshot,
 } from "@shared/schema";
 
-const sqlite = new Database("data.db");
+import path from "path";
+
+// Use absolute path to ensure data.db is always found regardless of CWD
+const DB_PATH = path.resolve(process.cwd(), "data.db");
+const sqlite = new Database(DB_PATH);
 sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
 
