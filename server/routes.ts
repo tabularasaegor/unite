@@ -12,9 +12,23 @@ import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from 
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 
 // --- Authentication ---
-const USERS: Record<string, string> = {
+// Built-in users + registered users stored in DB via memoryStore
+const BUILTIN_USERS: Record<string, string> = {
   "animusvox": "Rodman91!",
 };
+
+function getUsers(): Record<string, string> {
+  const users = { ...BUILTIN_USERS };
+  // Load registered users from DB
+  const registered = storage.getMemory("registered_users");
+  for (const entry of registered) {
+    try {
+      const { username, password } = JSON.parse(entry.value);
+      if (username && password) users[username] = password;
+    } catch {}
+  }
+  return users;
+}
 const TOKEN_TTL_MS = 60 * 60 * 1000; // 60 minutes
 const sessions = new Map<string, number>(); // token → expiry timestamp
 
@@ -40,7 +54,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/auth/login", (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: "Логин и пароль обязательны" });
-    if (USERS[username] !== password) return res.status(401).json({ error: "Неверный логин или пароль" });
+    const users = getUsers();
+    if (users[username] !== password) return res.status(401).json({ error: "Неверный логин или пароль" });
+    const token = generateToken();
+    sessions.set(token, Date.now() + TOKEN_TTL_MS);
+    res.json({ token, username });
+  });
+
+  app.post("/api/auth/register", (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: "Логин и пароль обязательны" });
+    if (username.length < 3) return res.status(400).json({ error: "Логин минимум 3 символа" });
+    if (password.length < 6) return res.status(400).json({ error: "Пароль минимум 6 символов" });
+    const users = getUsers();
+    if (users[username]) return res.status(409).json({ error: "Пользователь уже существует" });
+    // Save to DB
+    storage.upsertMemory({
+      category: "registered_users",
+      key: username,
+      value: JSON.stringify({ username, password }),
+      confidence: 1,
+      createdAt: new Date().toISOString(),
+    });
+    // Auto-login after registration
     const token = generateToken();
     sessions.set(token, Date.now() + TOKEN_TTL_MS);
     res.json({ token, username });

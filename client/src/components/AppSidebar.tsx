@@ -15,6 +15,7 @@ import {
   FileBarChart,
   Zap,
   Gauge,
+  LogOut,
 } from "lucide-react";
 
 const pipelineItems = [
@@ -43,14 +44,15 @@ const bottomItems = [
 interface AppSidebarProps {
   theme: "light" | "dark";
   toggleTheme: () => void;
+  onLogout: () => void;
 }
 
 function NavItem({ item, location }: { item: { href: string; label: string; icon: any }; location: string }) {
-  const isActive = location === item.href || (item.href !== "/" && location.startsWith(item.href) && (item.href.length > 1 ? !location.replace(item.href, "").startsWith("/") || location === item.href : false));
-  // More precise: exact match or starts with href and next char is end or nothing extra beyond the path
-  const exactActive = location === item.href;
-  const prefixActive = item.href !== "/" && location.startsWith(item.href + "/");
-  const active = exactActive || prefixActive;
+  // Exact match for most items. Only /opportunities allows prefix matching
+  // for its detail pages (/opportunities/123). This prevents /micro from
+  // lighting up when on /micro/positions, etc.
+  const active = location === item.href ||
+    (item.href === "/opportunities" && location.startsWith("/opportunities/"));
   const Icon = item.icon;
   return (
     <Link href={item.href}>
@@ -69,7 +71,7 @@ function NavItem({ item, location }: { item: { href: string; label: string; icon
   );
 }
 
-export default function AppSidebar({ theme, toggleTheme }: AppSidebarProps) {
+export default function AppSidebar({ theme, toggleTheme, onLogout }: AppSidebarProps) {
   const [location] = useLocation();
 
   return (
@@ -120,8 +122,8 @@ export default function AppSidebar({ theme, toggleTheme }: AppSidebarProps) {
         </div>
       </nav>
 
-      {/* Theme toggle */}
-      <div className="px-3 py-3 border-t border-border">
+      {/* Bottom controls */}
+      <div className="px-3 py-3 border-t border-border space-y-1">
         <button
           onClick={toggleTheme}
           className="flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors w-full"
@@ -129,6 +131,14 @@ export default function AppSidebar({ theme, toggleTheme }: AppSidebarProps) {
         >
           {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           {theme === "dark" ? "Светлая тема" : "Тёмная тема"}
+        </button>
+        <button
+          onClick={onLogout}
+          className="flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors w-full"
+          data-testid="button-logout"
+        >
+          <LogOut className="w-4 h-4" />
+          Выйти
         </button>
       </div>
     </aside>

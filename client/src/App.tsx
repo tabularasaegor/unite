@@ -24,7 +24,7 @@ import MicroSettlements from "@/pages/micro-settlements";
 import AppSidebar from "@/components/AppSidebar";
 import LoginPage from "@/pages/login";
 import { useTheme } from "@/hooks/use-theme";
-import { isAuthenticated } from "@/lib/auth";
+import { isAuthenticated, logout } from "@/lib/auth";
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: string }> {
   constructor(props: { children: ReactNode }) {
@@ -48,12 +48,12 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-function AppLayout() {
+function AppLayout({ onLogout }: { onLogout: () => void }) {
   const { theme, toggleTheme } = useTheme();
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
-      <AppSidebar theme={theme} toggleTheme={toggleTheme} />
+      <AppSidebar theme={theme} toggleTheme={toggleTheme} onLogout={onLogout} />
       <Switch>
         <Route path="/" component={Dashboard} />
         <Route path="/scanner" component={Scanner} />
@@ -79,6 +79,11 @@ function AppLayout() {
 function App() {
   const [authed, setAuthed] = useState(isAuthenticated());
 
+  const handleLogout = () => {
+    logout();
+    setAuthed(false);
+  };
+
   if (!authed) {
     return (
       <ErrorBoundary>
@@ -93,7 +98,7 @@ function App() {
         <TooltipProvider>
           <Toaster />
           <Router hook={useHashLocation}>
-            <AppLayout />
+            <AppLayout onLogout={handleLogout} />
           </Router>
         </TooltipProvider>
       </QueryClientProvider>
