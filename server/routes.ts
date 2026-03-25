@@ -1,190 +1,580 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
+import { runFullPipeline, runStage, startPipelineScheduler, stopPipelineScheduler, getPipelineStatus } from "./services/pipelineOrchestrator";
+import { runMarketScan, getLastScanResult, isScanRunning } from "./services/marketScanner";
+import { researchOpportunity } from "./services/researchSwarm";
+import { estimateProbability } from "./services/probabilityEngine";
+import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
+import { startMicroScheduler, stopMicroScheduler, getMicroStatus } from "./services/cryptoMicroScheduler";
+import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
+import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
+import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 
-export async function registerRoutes(
-  httpServer: Server,
-  app: Express
-): Promise<Server> {
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
 
-  // Dashboard stats
-  app.get("/api/stats", async (_req, res) => {
-    const stats = await storage.getDashboardStats();
-    res.json(stats);
+  // ============================================================================
+  // PREDICTION MARKET PLATFORM — API Routes
+  // ============================================================================
+
+  // --- Pipeline ---
+
+  app.get("/api/pipeline/status", (_req, res) => {
+    res.json(getPipelineStatus());
   });
 
-  // Markets
-  app.get("/api/markets", async (_req, res) => {
-    const markets = await storage.getMarkets();
-    res.json(markets);
+  app.post("/api/pipeline/run", async (_req, res) => {
+    try {
+      const result = await runFullPipeline();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.post("/api/markets", async (req, res) => {
-    const market = await storage.createMarket(req.body);
-    res.json(market);
+  app.post("/api/pipeline/stage/:stage", async (req, res) => {
+    try {
+      const { stage } = req.params;
+      const opportunityId = req.body?.opportunityId;
+      const result = await runStage(stage, opportunityId);
+      res.json(result);
+    } catch (err: any) {
+      res.status(422).json({ error: err.message });
+    }
   });
 
-  app.patch("/api/markets/:id", async (req, res) => {
-    const market = await storage.updateMarket(parseInt(req.params.id), req.body);
-    if (!market) return res.status(404).json({ error: "Market not found" });
-    res.json(market);
+  app.post("/api/pipeline/scheduler/start", (req, res) => {
+    // Read interval from request body OR from saved config
+    const interval = parseInt(req.body?.intervalMinutes as string) || parseInt(storage.getConfig("pipeline_interval") || "30");
+    storage.setConfig("pipeline_interval", String(interval));
+    startPipelineScheduler(interval);
+    res.json({ status: "started", intervalMinutes: interval });
   });
 
-  // Positions
-  app.get("/api/positions", async (req, res) => {
-    const status = req.query.status as string | undefined;
-    const positions = await storage.getPositions(status);
-    res.json(positions);
+  app.post("/api/pipeline/scheduler/stop", (_req, res) => {
+    stopPipelineScheduler();
+    res.json({ status: "stopped" });
   });
 
-  app.post("/api/positions", async (req, res) => {
-    const position = await storage.createPosition(req.body);
-    res.json(position);
+  // --- Scanner ---
+
+  app.post("/api/scanner/scan", async (_req, res) => {
+    try {
+      const result = await runMarketScan();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.patch("/api/positions/:id", async (req, res) => {
-    const position = await storage.updatePosition(parseInt(req.params.id), req.body);
-    if (!position) return res.status(404).json({ error: "Position not found" });
-    res.json(position);
+  app.get("/api/scanner/markets", async (_req, res) => {
+    try {
+      const markets = await fetchMarkets(100);
+      res.json(markets);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  // Trades
-  app.get("/api/trades", async (req, res) => {
-    const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
-    const trades = await storage.getTrades(limit);
-    res.json(trades);
+  app.get("/api/scanner/status", (_req, res) => {
+    res.json({
+      scanning: isScanRunning(),
+      lastResult: getLastScanResult(),
+    });
   });
 
-  app.post("/api/trades", async (req, res) => {
-    const trade = await storage.createTrade(req.body);
-    res.json(trade);
+  // --- Opportunities ---
+
+  app.get("/api/opportunities", (req, res) => {
+    const { status, platform, stage, limit } = req.query;
+    const opportunities = storage.getOpportunities({
+      status: status as string,
+      platform: platform as string,
+      stage: stage as string,
+      limit: limit ? parseInt(limit as string) : undefined,
+    });
+    res.json(opportunities);
   });
 
-  // Predictions
-  app.get("/api/predictions", async (req, res) => {
-    const limit = req.query.limit ? parseInt(req.query.limit as string) : 20;
-    const predictions = await storage.getPredictions(limit);
-    res.json(predictions);
+  app.get("/api/opportunities/:id", (req, res) => {
+    const opp = storage.getOpportunity(parseInt(req.params.id));
+    if (!opp) return res.status(404).json({ error: "Not found" });
+    res.json(opp);
   });
 
-  app.post("/api/predictions", async (req, res) => {
-    const prediction = await storage.createPrediction(req.body);
-    res.json(prediction);
+  app.get("/api/opportunities/:id/research", (req, res) => {
+    const reports = storage.getResearchReports(parseInt(req.params.id));
+    res.json(reports);
   });
 
-  // Config
-  app.get("/api/config", async (_req, res) => {
-    const config = await storage.getAllConfig();
-    const obj: Record<string, string> = {};
-    config.forEach(c => { obj[c.key] = c.value; });
-    res.json(obj);
+  app.get("/api/opportunities/:id/estimates", (req, res) => {
+    const estimates = storage.getProbabilityEstimates(parseInt(req.params.id));
+    res.json(estimates);
   });
 
-  app.post("/api/config", async (req, res) => {
-    const { key, value } = req.body;
-    await storage.setConfig(key, value);
-    res.json({ ok: true });
+  app.get("/api/opportunities/:id/risk", (req, res) => {
+    const risk = storage.getRiskAssessment(parseInt(req.params.id));
+    res.json(risk || null);
   });
 
-  // Performance snapshots
-  app.get("/api/performance", async (req, res) => {
-    const limit = req.query.limit ? parseInt(req.query.limit as string) : 30;
-    const snapshots = await storage.getPerformanceSnapshots(limit);
-    res.json(snapshots);
+  // --- Manual Pipeline Actions on Opportunity ---
+
+  app.post("/api/opportunities/:id/research", async (req, res) => {
+    try {
+      const result = await researchOpportunity(parseInt(req.params.id));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  // Seed demo data
-  app.post("/api/seed", async (_req, res) => {
-    await seedDemoData();
-    res.json({ ok: true });
+  app.post("/api/opportunities/:id/estimate", async (req, res) => {
+    try {
+      const result = await estimateProbability(parseInt(req.params.id));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/opportunities/:id/risk", async (req, res) => {
+    try {
+      const result = await assessRisk(parseInt(req.params.id));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/opportunities/:id/execute", async (req, res) => {
+    try {
+      const result = await executeOpportunity(parseInt(req.params.id));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Risk Approval ---
+
+  app.post("/api/risk/:id/approve", (req, res) => {
+    try {
+      approveRiskAssessment(parseInt(req.params.id));
+      res.json({ approved: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/risk/:id/reject", (req, res) => {
+    try {
+      const { reason } = req.body;
+      rejectRiskAssessment(parseInt(req.params.id), reason || "Rejected by user");
+      res.json({ rejected: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Positions ---
+
+  app.get("/api/positions", (req, res) => {
+    const status = (req.query.status as string) || undefined;
+    const type = req.query.type as string; // "micro" | "regular" | undefined
+    const positions = storage.getActivePositions(status);
+    const enriched = positions.map(p => {
+      const opp = storage.getOpportunity(p.opportunityId);
+      return {
+        ...p,
+        marketUrl: opp?.marketUrl || null,
+        slug: opp?.slug || null,
+        endDate: opp?.endDate || null,
+      };
+    });
+    if (type === "micro") return res.json(enriched.filter(p => p.title.startsWith("[5m]")));
+    if (type === "regular") return res.json(enriched.filter(p => !p.title.startsWith("[5m]")));
+    res.json(enriched);
+  });
+
+  app.post("/api/positions/:id/close", async (req, res) => {
+    try {
+      await closePosition(parseInt(req.params.id));
+      res.json({ closed: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Executions ---
+
+  app.get("/api/executions", (req, res) => {
+    const { status, opportunityId, type } = req.query;
+    const execs = storage.getExecutions({
+      status: status as string,
+      opportunityId: opportunityId ? parseInt(opportunityId as string) : undefined,
+    });
+    const positions = storage.getActivePositions();
+    const enriched = execs.map(e => {
+      const opp = storage.getOpportunity(e.opportunityId);
+      const position = positions.find(p => p.executionId === e.id);
+      return {
+        ...e,
+        title: opp?.title || `Opportunity #${e.opportunityId}`,
+        marketUrl: opp?.marketUrl || null,
+        slug: opp?.slug || null,
+        endDate: opp?.endDate || null,
+        category: opp?.category || null,
+        positionId: position?.id || null,
+        positionStatus: position?.status || null,
+      };
+    });
+    if (type === "micro") return res.json(enriched.filter(e => (e.title || "").startsWith("[5m]")));
+    if (type === "regular") return res.json(enriched.filter(e => !(e.title || "").startsWith("[5m]")));
+    res.json(enriched);
+  });
+
+  // --- Settlements ---
+
+  app.get("/api/settlements", (req, res) => {
+    const { status, type } = req.query;
+    const raw = storage.getSettlements({ status: status as string });
+    const enriched = raw.map(s => {
+      const opp = storage.getOpportunity(s.opportunityId);
+      const position = s.positionId ? storage.getActivePosition(s.positionId) : undefined;
+      const execution = position ? storage.getExecution(position.executionId) : undefined;
+      return {
+        ...s,
+        title: opp?.title || `Opportunity #${s.opportunityId}`,
+        marketUrl: opp?.marketUrl || null,
+        slug: opp?.slug || null,
+        endDate: opp?.endDate || null,
+        category: opp?.category || null,
+        positionSide: position?.side || null,
+        positionEntryPrice: position?.entryPrice || null,
+        positionSize: position?.size || null,
+        executionId: execution?.id || null,
+      };
+    });
+    if (type === "micro") return res.json(enriched.filter(s => (s.title || "").startsWith("[5m]")));
+    if (type === "regular") return res.json(enriched.filter(s => !(s.title || "").startsWith("[5m]")));
+    res.json(enriched);
+  });
+
+  // --- Post-Mortems ---
+
+  app.get("/api/post-mortems", (req, res) => {
+    const limit = parseInt(req.query.limit as string) || 50;
+    res.json(storage.getPostMortems(limit));
+  });
+
+  app.post("/api/post-mortems/:opportunityId", async (req, res) => {
+    try {
+      const result = await generatePostMortem(parseInt(req.params.opportunityId));
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // --- Micro-Scheduler (5-min crypto) ---
+
+  app.get("/api/micro/status", (_req, res) => {
+    res.json(getMicroStatus());
+  });
+
+  app.post("/api/micro/start", (req, res) => {
+    const assets = req.body?.assets; // e.g. "btc,eth,sol"
+    const bankroll = req.body?.bankroll;
+    const maxBet = req.body?.maxBet;
+    if (assets) storage.setConfig("micro_assets", assets);
+    if (bankroll) storage.setConfig("micro_bankroll", String(bankroll));
+    if (maxBet) storage.setConfig("micro_max_bet", String(maxBet));
+    startMicroScheduler();
+    res.json({ started: true, ...getMicroStatus() });
+  });
+
+  app.post("/api/micro/stop", (_req, res) => {
+    stopMicroScheduler();
+    res.json({ stopped: true, ...getMicroStatus() });
+  });
+
+  // Detailed micro stats with per-asset breakdown, time series, averages
+  app.get("/api/micro/stats", (_req, res) => {
+    try {
+      const allPositions = storage.getActivePositions();
+      const microPositions = allPositions.filter(p => p.title?.startsWith("[5m]"));
+      const closedMicro = microPositions.filter(p => p.status === "closed");
+      const openMicro = microPositions.filter(p => p.status === "open");
+
+      const allExec = storage.getExecutions();
+      const microExec = allExec.filter(e => {
+        const opp = storage.getOpportunity(e.opportunityId);
+        return opp?.title?.startsWith("[5m]");
+      });
+
+      // Per-asset stats
+      const assetMap: Record<string, string> = { bitcoin: "BTC", ethereum: "ETH", solana: "SOL", xrp: "XRP" };
+      const perAsset: Record<string, { trades: number; wins: number; losses: number; pnl: number; totalSize: number; totalConfidence: number }> = {};
+
+      // Time series of results
+      const timeSeries: Array<{ time: string; asset: string; direction: string; pnl: number; won: boolean; size: number; confidence: number }> = [];
+
+      for (const pos of closedMicro) {
+        const opp = storage.getOpportunity(pos.opportunityId);
+        if (!opp) continue;
+
+        // Detect asset
+        const titleLower = (pos.title || "").toLowerCase();
+        let assetCode = "BTC";
+        for (const [name, code] of Object.entries(assetMap)) {
+          if (titleLower.includes(name)) { assetCode = code; break; }
+        }
+
+        if (!perAsset[assetCode]) perAsset[assetCode] = { trades: 0, wins: 0, losses: 0, pnl: 0, totalSize: 0, totalConfidence: 0 };
+        const a = perAsset[assetCode];
+        const pnl = pos.unrealizedPnl || 0;
+        const won = pnl > 0;
+        a.trades++;
+        if (won) a.wins++; else a.losses++;
+        a.pnl += pnl;
+        a.totalSize += pos.size;
+        a.totalConfidence += opp.aiProbability || 0.5;
+
+        timeSeries.push({
+          time: pos.closedAt || pos.openedAt || "",
+          asset: assetCode,
+          direction: pos.side === "YES" ? "Up" : "Down",
+          pnl: Math.round(pnl * 100) / 100,
+          won,
+          size: pos.size,
+          confidence: opp.aiProbability || 0.5,
+        });
+      }
+
+      // Sort time series by time
+      timeSeries.sort((a, b) => a.time.localeCompare(b.time));
+
+      // Totals
+      const totalTrades = closedMicro.length;
+      const totalWins = closedMicro.filter(p => (p.unrealizedPnl || 0) > 0).length;
+      const totalPnl = closedMicro.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
+      const avgSize = totalTrades > 0 ? microExec.reduce((s, e) => s + (e.size || 0), 0) / microExec.length : 0;
+      const avgConfidence = totalTrades > 0 ? Object.values(perAsset).reduce((s, a) => s + a.totalConfidence, 0) / totalTrades : 0;
+      const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100) : 0;
+
+      // Streaks
+      let currentStreak = 0;
+      let maxWinStreak = 0;
+      let maxLossStreak = 0;
+      let tmpWin = 0, tmpLoss = 0;
+      for (const t of timeSeries) {
+        if (t.won) { tmpWin++; tmpLoss = 0; maxWinStreak = Math.max(maxWinStreak, tmpWin); }
+        else { tmpLoss++; tmpWin = 0; maxLossStreak = Math.max(maxLossStreak, tmpLoss); }
+      }
+      if (timeSeries.length > 0) {
+        const last = timeSeries[timeSeries.length - 1];
+        currentStreak = last.won ? tmpWin : -tmpLoss;
+      }
+
+      // Per-asset formatted
+      const assetStats = Object.entries(perAsset).map(([code, a]) => ({
+        asset: code,
+        trades: a.trades,
+        wins: a.wins,
+        losses: a.losses,
+        winRate: a.trades > 0 ? Math.round(a.wins / a.trades * 100) : 0,
+        pnl: Math.round(a.pnl * 100) / 100,
+        avgSize: a.trades > 0 ? Math.round(a.totalSize / a.trades * 100) / 100 : 0,
+        avgConfidence: a.trades > 0 ? Math.round(a.totalConfidence / a.trades * 100) : 0,
+      }));
+
+      res.json({
+        totalTrades,
+        totalWins,
+        totalLosses: totalTrades - totalWins,
+        winRate: Math.round(winRate * 10) / 10,
+        totalPnl: Math.round(totalPnl * 100) / 100,
+        avgSize: Math.round(avgSize * 100) / 100,
+        avgConfidence: Math.round(avgConfidence * 100),
+        openPositions: openMicro.length,
+        maxWinStreak,
+        maxLossStreak,
+        currentStreak,
+        assetStats,
+        timeSeries: timeSeries.slice(-100), // Last 100
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/micro/dashboard", (_req, res) => {
+    const allPositions = storage.getActivePositions();
+    const microPositions = allPositions.filter(p => p.title.startsWith("[5m]"));
+    const openMicro = microPositions.filter(p => p.status === "open");
+    const closedMicro = microPositions.filter(p => p.status === "closed");
+    const totalPnl = closedMicro.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
+    const wins = closedMicro.filter(p => (p.unrealizedPnl || 0) > 0).length;
+    const winRate = closedMicro.length > 0 ? (wins / closedMicro.length * 100) : 0;
+
+    const allExec = storage.getExecutions();
+    const microExec = allExec.filter(e => {
+      const opp = storage.getOpportunity(e.opportunityId);
+      return opp?.title?.startsWith("[5m]");
+    });
+
+    res.json({
+      openPositions: openMicro.length,
+      closedPositions: closedMicro.length,
+      totalTrades: microExec.length,
+      totalPnl: Math.round(totalPnl * 100) / 100,
+      winRate: Math.round(winRate * 10) / 10,
+      totalVolume: Math.round(microExec.reduce((s, e) => s + (e.size || 0), 0) * 100) / 100,
+    });
+  });
+
+  // --- Memory Store ---
+
+  app.get("/api/memory", (req, res) => {
+    const { category, key } = req.query;
+    if (!category) return res.status(400).json({ error: "category required" });
+    res.json(storage.getMemory(category as string, key as string));
+  });
+
+  // --- Audit Log ---
+
+  app.get("/api/audit-log", (req, res) => {
+    const limit = parseInt(req.query.limit as string) || 100;
+    const entityType = req.query.entityType as string;
+    res.json(storage.getAuditLog(limit, entityType));
+  });
+
+  // --- Dashboard ---
+
+  app.get("/api/dashboard/stats", (_req, res) => {
+    const stats = storage.getDashboardStats();
+    // Exclude micro ([5m]) positions from main dashboard stats
+    const allPositions = storage.getActivePositions();
+    const regularOpen = allPositions.filter(p => p.status === "open" && !p.title.startsWith("[5m]"));
+    const microOpenCount = allPositions.filter(p => p.status === "open" && p.title.startsWith("[5m]")).length;
+    res.json({
+      ...stats,
+      activePositions: stats.activePositions - microOpenCount,
+      totalTrades: stats.totalTrades - allPositions.filter(p => p.title.startsWith("[5m]")).length,
+    });
+  });
+
+  app.get("/api/dashboard/performance", (req, res) => {
+    const limit = parseInt(req.query.limit as string) || 100;
+    res.json(storage.getPerformanceSnapshots(limit));
+  });
+
+  // --- Polymarket Info ---
+
+  app.get("/api/polymarket/status", async (_req, res) => {
+    const funderAddress = process.env.POLY_FUNDER_ADDRESS || storage.getConfig("poly_funder_address") || null;
+    let balance: string | null = null;
+    
+    // Try to fetch USDC balance from Data API
+    if (funderAddress) {
+      try {
+        const resp = await fetch(`https://data-api.polymarket.com/value?user=${funderAddress}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          balance = data?.value != null ? String(data.value) : null;
+        }
+      } catch {}
+    }
+
+    res.json({
+      tradingEnabled: isTradeEnabled(),
+      address: funderAddress,
+      balance,
+      signatureType: process.env.POLY_SIGNATURE_TYPE || storage.getConfig("poly_signature_type") || "0",
+      hasPrivateKey: !!(process.env.POLY_PRIVATE_KEY || storage.getConfig("poly_private_key")),
+      hasOpenaiKey: !!(process.env.OPENAI_API_KEY || storage.getConfig("openai_api_key")),
+      hasAnthropicKey: !!(process.env.ANTHROPIC_API_KEY || storage.getConfig("anthropic_api_key")),
+    });
+  });
+
+  // Save keys from UI
+  app.post("/api/config/keys", (req, res) => {
+    const { poly_private_key, poly_funder_address, poly_signature_type, openai_api_key, anthropic_api_key } = req.body;
+    if (poly_private_key) storage.setConfig("poly_private_key", poly_private_key);
+    if (poly_funder_address) storage.setConfig("poly_funder_address", poly_funder_address);
+    if (poly_signature_type) storage.setConfig("poly_signature_type", poly_signature_type);
+    if (openai_api_key) storage.setConfig("openai_api_key", openai_api_key);
+    if (anthropic_api_key) storage.setConfig("anthropic_api_key", anthropic_api_key);
+    res.json({ saved: true });
+  });
+
+  // --- Kill Switch ---
+
+  app.post("/api/config/kill-switch", (req, res) => {
+    const { enabled } = req.body;
+    storage.setConfig("kill_switch", enabled ? "true" : "false");
+    storage.createAuditEntry({
+      action: "config",
+      entityType: "config",
+      actor: "human",
+      details: JSON.stringify({ kill_switch: enabled }),
+      timestamp: new Date().toISOString(),
+    });
+    res.json({ kill_switch: enabled });
+  });
+
+  // --- Config ---
+
+  app.get("/api/config", (_req, res) => {
+    const keys = [
+      "paper_trading", "auto_execute", "bankroll", "max_position_pct",
+      "max_drawdown", "gpt_weight", "claude_weight", "gemini_weight",
+      "min_edge_threshold", "pipeline_interval", "require_human_approval",
+      "auto_approve_threshold", "kill_switch", "max_trade_size",
+      "micro_scheduler_enabled", "micro_assets", "micro_bankroll", "micro_max_bet",
+      "pipeline_min_days", "pipeline_max_days", "pipeline_sectors",
+    ];
+    const config: Record<string, string> = {};
+    for (const key of keys) {
+      config[key] = storage.getConfig(key) || getDefaultConfigValue(key);
+    }
+    res.json(config);
+  });
+
+  app.post("/api/config", (req, res) => {
+    const updates = req.body;
+    for (const [key, value] of Object.entries(updates)) {
+      storage.setConfig(key, String(value));
+    }
+    res.json({ updated: Object.keys(updates).length });
   });
 
   return httpServer;
 }
 
-async function seedDemoData() {
-  // Seed markets
-  const marketData = [
-    { externalId: "pm-btc-100k", platform: "polymarket", name: "BTC above $100k by June 2026", category: "crypto", currentPrice: 0.72, volume24h: 2450000, aiProbability: 0.78, marketProbability: 0.72, edge: 0.06, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "pm-eth-merge", platform: "polymarket", name: "ETH Pectra upgrade live by Q2 2026", category: "crypto", currentPrice: 0.85, volume24h: 1230000, aiProbability: 0.91, marketProbability: 0.85, edge: 0.06, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "pm-fed-rate", platform: "polymarket", name: "Fed cuts rates in April 2026", category: "politics", currentPrice: 0.34, volume24h: 5670000, aiProbability: 0.28, marketProbability: 0.34, edge: -0.06, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "pm-sol-200", platform: "polymarket", name: "SOL above $200 by April 2026", category: "crypto", currentPrice: 0.55, volume24h: 890000, aiProbability: 0.62, marketProbability: 0.55, edge: 0.07, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "bn-btcusdt", platform: "binance", name: "BTC/USDT Spot", category: "crypto", currentPrice: 87420, volume24h: 32000000000, aiProbability: null, marketProbability: null, edge: null, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "bn-ethusdt", platform: "binance", name: "ETH/USDT Spot", category: "crypto", currentPrice: 2045, volume24h: 14500000000, aiProbability: null, marketProbability: null, edge: null, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "pm-trump-trial", platform: "polymarket", name: "Trump trial verdict before July 2026", category: "politics", currentPrice: 0.42, volume24h: 8900000, aiProbability: 0.38, marketProbability: 0.42, edge: -0.04, status: "active", updatedAt: new Date().toISOString() },
-    { externalId: "bb-solusdt", platform: "bybit", name: "SOL/USDT Perpetual", category: "crypto", currentPrice: 142.5, volume24h: 2800000000, aiProbability: null, marketProbability: null, edge: null, status: "active", updatedAt: new Date().toISOString() },
-  ];
-
-  for (const m of marketData) {
-    await storage.createMarket(m);
-  }
-
-  // Seed positions
-  const now = new Date();
-  const posData = [
-    { marketId: 1, platform: "polymarket", marketName: "BTC above $100k by June 2026", side: "YES", entryPrice: 0.68, currentPrice: 0.72, size: 150, pnl: 6.0, pnlPercent: 5.88, status: "open", strategy: "ai_ensemble", openedAt: new Date(now.getTime() - 86400000 * 2).toISOString() },
-    { marketId: 4, platform: "polymarket", marketName: "SOL above $200 by April 2026", side: "YES", entryPrice: 0.48, currentPrice: 0.55, size: 80, pnl: 5.6, pnlPercent: 14.58, status: "open", strategy: "ai_ensemble", openedAt: new Date(now.getTime() - 86400000).toISOString() },
-    { marketId: 3, platform: "polymarket", marketName: "Fed cuts rates in April 2026", side: "NO", entryPrice: 0.62, currentPrice: 0.66, size: 100, pnl: 4.0, pnlPercent: 6.45, status: "open", strategy: "ai_ensemble", openedAt: new Date(now.getTime() - 43200000).toISOString() },
-    { marketId: 2, platform: "polymarket", marketName: "ETH Pectra upgrade live by Q2 2026", side: "YES", entryPrice: 0.80, currentPrice: 0.85, size: 120, pnl: 6.0, pnlPercent: 6.25, status: "closed", strategy: "ai_ensemble", openedAt: new Date(now.getTime() - 86400000 * 5).toISOString(), closedAt: new Date(now.getTime() - 86400000).toISOString() },
-  ];
-
-  for (const p of posData) {
-    await storage.createPosition(p);
-  }
-
-  // Seed trades
-  const tradeData = [
-    { positionId: 1, marketName: "BTC above $100k by June 2026", platform: "polymarket", side: "BUY_YES", price: 0.68, size: 150, pnl: 0, strategy: "ai_ensemble", executedAt: new Date(now.getTime() - 86400000 * 2).toISOString() },
-    { positionId: 2, marketName: "SOL above $200 by April 2026", platform: "polymarket", side: "BUY_YES", price: 0.48, size: 80, pnl: 0, strategy: "ai_ensemble", executedAt: new Date(now.getTime() - 86400000).toISOString() },
-    { positionId: 3, marketName: "Fed cuts rates in April 2026", platform: "polymarket", side: "BUY_NO", price: 0.62, size: 100, pnl: 0, strategy: "ai_ensemble", executedAt: new Date(now.getTime() - 43200000).toISOString() },
-    { positionId: 4, marketName: "ETH Pectra upgrade live by Q2 2026", platform: "polymarket", side: "BUY_YES", price: 0.80, size: 120, pnl: 0, strategy: "ai_ensemble", executedAt: new Date(now.getTime() - 86400000 * 5).toISOString() },
-    { positionId: 4, marketName: "ETH Pectra upgrade live by Q2 2026", platform: "polymarket", side: "SELL_YES", price: 0.85, size: 120, pnl: 6.0, strategy: "ai_ensemble", executedAt: new Date(now.getTime() - 86400000).toISOString() },
-  ];
-
-  for (const t of tradeData) {
-    await storage.createTrade(t);
-  }
-
-  // Seed predictions
-  const predData = [
-    { marketId: 1, marketName: "BTC above $100k by June 2026", gptProbability: 0.76, claudeProbability: 0.81, geminiProbability: 0.74, ensembleProbability: 0.78, marketPrice: 0.72, edge: 0.06, confidence: "high", action: "buy_yes", reasoning: "Strong on-chain metrics, ETF inflows increasing, halving effect still playing out. All three models agree on bullish outlook above market price.", createdAt: new Date(now.getTime() - 3600000).toISOString() },
-    { marketId: 4, marketName: "SOL above $200 by April 2026", gptProbability: 0.58, claudeProbability: 0.65, geminiProbability: 0.60, ensembleProbability: 0.62, marketPrice: 0.55, edge: 0.07, confidence: "medium", action: "buy_yes", reasoning: "Solana ecosystem growth strong but timeline is tight. Claude most bullish due to DeFi TVL analysis. GPT more cautious on macro headwinds.", createdAt: new Date(now.getTime() - 7200000).toISOString() },
-    { marketId: 3, marketName: "Fed cuts rates in April 2026", gptProbability: 0.25, claudeProbability: 0.30, geminiProbability: 0.28, ensembleProbability: 0.28, marketPrice: 0.34, edge: -0.06, confidence: "medium", action: "buy_no", reasoning: "Inflation data still sticky. Market overpricing cut probability. Ensemble suggests selling YES / buying NO for edge.", createdAt: new Date(now.getTime() - 10800000).toISOString() },
-  ];
-
-  for (const p of predData) {
-    await storage.createPrediction(p);
-  }
-
-  // Seed performance snapshots
-  for (let i = 29; i >= 0; i--) {
-    const d = new Date(now.getTime() - 86400000 * i);
-    const basePnl = (30 - i) * 2.5 + Math.sin(i * 0.5) * 15;
-    await storage.createPerformanceSnapshot({
-      totalPnl: Math.round(basePnl * 100) / 100,
-      portfolioValue: Math.round((1000 + basePnl) * 100) / 100,
-      winRate: 60 + Math.random() * 15,
-      totalTrades: Math.floor(i * 1.5) + 5,
-      timestamp: d.toISOString(),
-    });
-  }
-
-  // Seed config
-  const configData = [
-    { key: "bot_status", value: "running" },
-    { key: "max_position_size", value: "200" },
-    { key: "daily_loss_limit", value: "50" },
-    { key: "max_exposure", value: "500" },
-    { key: "min_edge_threshold", value: "0.05" },
-    { key: "strategy", value: "ai_ensemble" },
-    { key: "gpt_weight", value: "0.40" },
-    { key: "claude_weight", value: "0.35" },
-    { key: "gemini_weight", value: "0.25" },
-    { key: "platforms", value: "polymarket,binance,bybit" },
-    { key: "paper_trading", value: "true" },
-  ];
-
-  for (const c of configData) {
-    await storage.setConfig(c.key, c.value);
-  }
+function getDefaultConfigValue(key: string): string {
+  const defaults: Record<string, string> = {
+    paper_trading: "true",
+    auto_execute: "false",
+    bankroll: "5000",
+    max_position_pct: "0.10",
+    max_drawdown: "0.20",
+    gpt_weight: "0.40",
+    claude_weight: "0.35",
+    gemini_weight: "0.25",
+    min_edge_threshold: "0.015",
+    pipeline_interval: "30",
+    require_human_approval: "true",
+    auto_approve_threshold: "100",
+    kill_switch: "false",
+    max_trade_size: "100",
+    micro_scheduler_enabled: "false",
+    micro_assets: "btc,eth,sol,xrp",
+    micro_bankroll: "200",
+    micro_max_bet: "20",
+    pipeline_min_days: "1",
+    pipeline_max_days: "30",
+    pipeline_sectors: "sports,crypto,politics,tech,other",
+  };
+  return defaults[key] || "";
 }

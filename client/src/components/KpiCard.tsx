@@ -20,7 +20,7 @@ export default function KpiCard({ label, value, change, isPositive, icon: Icon, 
         <span className="text-xl font-semibold tabular-nums text-foreground" data-testid={`${testId}-value`}>{value}</span>
         {change && (
           <span className={`text-xs font-medium tabular-nums ${isPositive ? "text-profit" : "text-loss"}`}>
-            {isPositive ? "+" : ""}{change}
+            {change}
           </span>
         )}
       </div>

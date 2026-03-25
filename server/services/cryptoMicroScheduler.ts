@@ -1,0 +1,617 @@
+/**
+ * Crypto Micro-Scheduler — 5-Minute BTC/ETH/SOL/XRP Up/Down Trading
+ * 
+ * Every ~60 seconds:
+ * 1. Fetch current 5-min window for each asset
+ * 2. AI momentum analysis with calibration from past results
+ * 3. If edge > 0.5% → place trade (low threshold for near-50/50 markets)
+ * 4. Auto-settle after window expires
+ * 5. Update calibration stats for continuous learning
+ */
+
+import { log } from "../index";
+import { storage } from "../storage";
+import { fetchPrice } from "./polymarket";
+
+const GAMMA_API = "https://gamma-api.polymarket.com";
+const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
+type CryptoAsset = string;
+
+interface MicroMarket {
+  asset: string;
+  slug: string;
+  title: string;
+  conditionId: string;
+  upTokenId: string;
+  downTokenId: string;
+  upPrice: number;
+  downPrice: number;
+  volume24h: number;
+  liquidity: number;
+  endDate: string;
+  tickSize: string;
+  negRisk: boolean;
+  windowStart: number;
+  windowEnd: number;
+}
+
+// --- Calibration tracking ---
+interface AssetCalibration {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  totalPnl: number;
+  upWins: number;
+  upLosses: number;
+  downWins: number;
+  downLosses: number;
+  lastResults: Array<{ direction: string; won: boolean; pnl: number; ts: number }>;
+  avgEdgeRealized: number;
+}
+
+const calibration: Record<string, AssetCalibration> = {};
+
+// --- Adaptive regime tracking ---
+interface WindowResult { ts: number; wins: number; losses: number; totalPnl: number; }
+const windowHistory: WindowResult[] = [];
+const assetCooldown: Record<string, number> = {}; // asset → skip until timestamp
+let lastWindowPnl = 0;
+let consecutiveLossWindows = 0;
+let betSizeMultiplier = 1.0; // Dynamic: 0.5x after losses, 1.5x after wins
+
+function recordWindowResult(wins: number, losses: number, pnl: number) {
+  windowHistory.push({ ts: Date.now(), wins, losses, totalPnl: pnl });
+  if (windowHistory.length > 20) windowHistory.shift();
+  lastWindowPnl = pnl;
+
+  if (losses > wins) {
+    consecutiveLossWindows++;
+    // Progressive reduction: each loss window cuts bet size more
+    betSizeMultiplier = Math.max(0.3, 1.0 - consecutiveLossWindows * 0.2);
+    log(`Regime: loss window (${wins}W/${losses}L), consecutive=${consecutiveLossWindows}, multiplier=${betSizeMultiplier.toFixed(1)}x`, "micro");
+  } else {
+    consecutiveLossWindows = 0;
+    // Recover gradually
+    betSizeMultiplier = Math.min(1.5, betSizeMultiplier + 0.2);
+  }
+}
+
+function shouldSkipAsset(asset: string): boolean {
+  const cooldownUntil = assetCooldown[asset] || 0;
+  if (Date.now() < cooldownUntil) return true;
+  
+  const cal = getCalibration(asset);
+  const recent = cal.lastResults.slice(-5);
+  if (recent.length >= 5) {
+    const recentWR = recent.filter(r => r.won).length / recent.length;
+    if (recentWR < 0.3) {
+      // Skip 2 windows (10 min) after very bad streak
+      assetCooldown[asset] = Date.now() + 600000;
+      log(`Regime: ${asset.toUpperCase()} cooldown (recent WR ${(recentWR*100).toFixed(0)}%), skipping 10 min`, "micro");
+      return true;
+    }
+  }
+  return false;
+}
+
+function getCalibration(asset: string): AssetCalibration {
+  if (!calibration[asset]) {
+    calibration[asset] = {
+      totalTrades: 0, wins: 0, losses: 0, totalPnl: 0,
+      upWins: 0, upLosses: 0, downWins: 0, downLosses: 0,
+      lastResults: [], avgEdgeRealized: 0,
+    };
+  }
+  return calibration[asset];
+}
+
+function updateCalibration(asset: string, direction: string, won: boolean, pnl: number) {
+  const cal = getCalibration(asset);
+  cal.totalTrades++;
+  cal.totalPnl += pnl;
+  if (won) {
+    cal.wins++;
+    if (direction === "Up") cal.upWins++; else cal.downWins++;
+  } else {
+    cal.losses++;
+    if (direction === "Up") cal.upLosses++; else cal.downLosses++;
+  }
+  cal.lastResults.push({ direction, won, pnl, ts: Date.now() });
+  if (cal.lastResults.length > 50) cal.lastResults.shift();
+  cal.avgEdgeRealized = cal.totalPnl / Math.max(cal.totalTrades, 1);
+
+  // Store in memory for persistence
+  storage.upsertMemory({
+    category: "micro_calibration",
+    key: asset,
+    value: JSON.stringify(cal),
+    confidence: cal.totalTrades > 0 ? cal.wins / cal.totalTrades : 0.5,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function loadCalibrationFromMemory() {
+  for (const asset of ALL_ASSETS) {
+    const mem = storage.getMemory("micro_calibration", asset);
+    if (mem.length > 0) {
+      try {
+        calibration[asset] = JSON.parse(mem[0].value);
+      } catch {}
+    }
+  }
+}
+
+// --- State ---
+let schedulerInterval: NodeJS.Timeout | null = null;
+let isRunning = false;
+let lastCycleAt: string | null = null;
+let totalCycles = 0;
+let totalTrades = 0;
+let totalPnl = 0;
+
+// --- Fetch current 5-min market ---
+async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - (now % 300);
+  const windowEnd = windowStart + 300;
+  const slug = `${asset}-updown-5m-${windowStart}`;
+
+  try {
+    const url = `${GAMMA_API}/events?slug=${slug}&limit=1`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const events = await res.json();
+    if (!events || events.length === 0) return null;
+
+    const market = events[0].markets?.[0];
+    if (!market || market.closed) return null;
+
+    const prices = JSON.parse(market.outcomePrices || "[]");
+    const clobIds = JSON.parse(market.clobTokenIds || "[]");
+    if (prices.length < 2 || clobIds.length < 2) return null;
+
+    return {
+      asset, slug, title: market.question || `${asset.toUpperCase()} Up/Down 5m`,
+      conditionId: market.conditionId || "",
+      upTokenId: clobIds[0], downTokenId: clobIds[1],
+      upPrice: parseFloat(prices[0]), downPrice: parseFloat(prices[1]),
+      volume24h: parseFloat(market.volume24hr || "0"),
+      liquidity: parseFloat(market.liquidityNum || "0"),
+      endDate: market.endDate || new Date(windowEnd * 1000).toISOString(),
+      tickSize: String(market.orderPriceMinTickSize || "0.01"),
+      negRisk: market.negRisk || false,
+      windowStart, windowEnd,
+    };
+  } catch { return null; }
+}
+
+// --- Hybrid analysis: market microstructure + calibration + AI reasoning ---
+async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
+  direction: "Up" | "Down";
+  confidence: number;
+  reasoning: string;
+}> {
+  const cal = getCalibration(asset);
+  
+  // === STEP 1: Market microstructure signal ===
+  // Core insight: 5-min markets are near-random. The best edge comes from:
+  // 1) Contrarian when market deviates from 50/50
+  // 2) Following calibration data (what actually worked)
+  
+  let direction: "Up" | "Down";
+  let confidence: number;
+  let reasoning: string;
+
+  const upPrice = market.upPrice;
+  const deviation = Math.abs(upPrice - 0.5);
+
+  // Strategy 1: Strong contrarian when market deviates >3%
+  if (deviation > 0.03) {
+    direction = upPrice > 0.53 ? "Down" : "Up";
+    confidence = 0.50 + deviation * 0.3; // Higher deviation = higher confidence
+    reasoning = `Contrarian: market prices ${direction === "Up" ? "Down" : "Up"} at ${(upPrice > 0.5 ? upPrice : 1-upPrice)*100}%, reverting`;
+  }
+  // Strategy 2: Use calibration bias when available (>5 trades)
+  else if (cal.totalTrades >= 5) {
+    const upWR = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : 0.5;
+    const downWR = (cal.downWins + cal.downLosses) > 0 ? cal.downWins / (cal.downWins + cal.downLosses) : 0.5;
+    
+    if (upWR > downWR + 0.05) {
+      direction = "Up";
+      confidence = 0.50 + (upWR - 0.5) * 0.2;
+      reasoning = `Calibration bias: Up wins ${(upWR*100).toFixed(0)}% vs Down ${(downWR*100).toFixed(0)}%`;
+    } else if (downWR > upWR + 0.05) {
+      direction = "Down";
+      confidence = 0.50 + (downWR - 0.5) * 0.2;
+      reasoning = `Calibration bias: Down wins ${(downWR*100).toFixed(0)}% vs Up ${(upWR*100).toFixed(0)}%`;
+    } else {
+      // No clear bias — use recent streak
+      const recent = cal.lastResults.slice(-3);
+      const recentUpWins = recent.filter(r => r.direction === "Up" && r.won).length;
+      const recentDownWins = recent.filter(r => r.direction === "Down" && r.won).length;
+      direction = recentUpWins >= recentDownWins ? "Up" : "Down";
+      confidence = 0.52;
+      reasoning = `Recent momentum: last 3 trades favor ${direction}`;
+    }
+  }
+  // Strategy 3: Alternating when no data (avoid always-Up bias)
+  else {
+    // Alternate based on window timestamp to avoid directional bias
+    const windowParity = (market.windowStart / 300) % 2 === 0;
+    direction = windowParity ? "Up" : "Down";
+    confidence = 0.52;
+    reasoning = `No calibration data yet, alternating direction`;
+  }
+
+  // Clamp confidence
+  confidence = Math.min(0.62, Math.max(0.51, confidence));
+
+  // === STEP 2: Quick AI validation (optional, non-blocking) ===
+  try {
+    const { default: OpenAI } = await import("openai");
+    const client = new OpenAI();
+
+    const recentStr = cal.lastResults.slice(-5).map(r => 
+      `${r.direction} ${r.won ? "W" : "L"}`
+    ).join(", ");
+
+    const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%.
+My signal: ${direction} (${(confidence*100).toFixed(0)}%). Track: ${cal.totalTrades}trades, ${cal.wins}W/${cal.losses}L. Recent: ${recentStr || "none"}
+Do you AGREE or DISAGREE? Reply JSON: {"agree": true/false, "direction": "Up"/"Down", "confidence_adj": -0.02 to +0.05}`;
+
+    const response = await client.responses.create({ model: "gpt-5", input: prompt });
+    const text = response.output_text || "";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (!parsed.agree && parsed.direction) {
+        // AI disagrees — if strong disagreement, flip
+        direction = parsed.direction === "Down" ? "Down" : "Up";
+        reasoning += ` [AI override: ${parsed.direction}]`;
+      }
+      if (parsed.confidence_adj) {
+        confidence = Math.min(0.62, Math.max(0.51, confidence + parsed.confidence_adj));
+      }
+    }
+  } catch {
+    // AI unavailable — use microstructure signal as-is
+  }
+
+  return { direction, confidence, reasoning };
+}
+
+// --- Execute micro-trade ---
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string): boolean {
+  const killSwitch = storage.getConfig("kill_switch") === "true";
+  if (killSwitch) return false;
+
+  const isPaperTrading = storage.getConfig("paper_trading") !== "false";
+  const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || "200");
+  const microMaxBet = parseFloat(storage.getConfig("micro_max_bet") || "20");
+  
+  const price = direction === "Up" ? market.upPrice : market.downPrice;
+  const impliedEdge = confidence - price;
+  
+  // Very low threshold for 5-min markets (0.5%)
+  if (impliedEdge < 0.005) {
+    log(`Micro: ${market.asset.toUpperCase()} ${direction} — edge ${(impliedEdge * 100).toFixed(1)}% < 0.5%, skipping`, "micro");
+    return false;
+  }
+
+  // Sizing: use percentage of max_bet based on edge strength
+  // Edge 0.5-2% → 25% of max bet (min $5)
+  // Edge 2-5% → 50% of max bet
+  // Edge 5-10% → 75% of max bet
+  // Edge >10% → 100% of max bet
+  let betFraction: number;
+  if (impliedEdge >= 0.10) betFraction = 1.0;
+  else if (impliedEdge >= 0.05) betFraction = 0.75;
+  else if (impliedEdge >= 0.02) betFraction = 0.50;
+  else betFraction = 0.25;
+  
+  const rawSize = microMaxBet * betFraction * betSizeMultiplier;
+  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
+  
+  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: edge=${(impliedEdge*100).toFixed(1)}% frac=${betFraction} mult=${betSizeMultiplier.toFixed(1)}x → $${size.toFixed(2)}`, "micro");
+
+  // Create all DB records
+  const opp = storage.createOpportunity({
+    externalId: `micro-${market.slug}-${direction}`,
+    platform: "polymarket",
+    title: `[5m] ${market.title}`,
+    description: `5-min ${market.asset.toUpperCase()} prediction. AI: ${direction} (${(confidence * 100).toFixed(0)}%). ${reasoning}`,
+    category: "crypto",
+    marketUrl: `https://polymarket.com/event/${market.slug}`,
+    currentPrice: price,
+    volume24h: market.volume24h,
+    totalLiquidity: market.liquidity,
+    marketProbability: price,
+    conditionId: market.conditionId,
+    clobTokenIds: JSON.stringify([market.upTokenId, market.downTokenId]),
+    tickSize: market.tickSize,
+    negRisk: market.negRisk ? 1 : 0,
+    endDate: market.endDate,
+    slug: market.slug,
+    aiProbability: confidence,
+    edge: impliedEdge,
+    edgePercent: impliedEdge * 100,
+    confidence: confidence > 0.58 ? "medium" : "low",
+    kellyFraction: impliedEdge * 0.15,
+    recommendedSize: size,
+    recommendedSide: direction === "Up" ? "YES" : "NO",
+    status: "approved",
+    pipelineStage: "execution",
+    discoveredAt: new Date().toISOString(),
+  });
+
+  const execution = storage.createExecution({
+    opportunityId: opp.id,
+    platform: "polymarket",
+    side: direction === "Up" ? "YES" : "NO",
+    orderType: "market",
+    requestedPrice: price,
+    executedPrice: price,
+    size,
+    quantity: size / price,
+    status: "filled",
+    paperTrade: isPaperTrading ? 1 : 0,
+    slippage: 0, fees: 0,
+    submittedAt: new Date().toISOString(),
+    filledAt: new Date().toISOString(),
+  });
+
+  const position = storage.createActivePosition({
+    opportunityId: opp.id,
+    executionId: execution.id,
+    platform: "polymarket",
+    title: `[5m] ${market.title}`,
+    side: direction === "Up" ? "YES" : "NO",
+    entryPrice: price,
+    currentPrice: price,
+    size,
+    unrealizedPnl: 0,
+    unrealizedPnlPercent: 0,
+    status: "open",
+    openedAt: new Date().toISOString(),
+  });
+
+  storage.createSettlement({
+    opportunityId: opp.id,
+    positionId: position.id,
+    ourPrediction: confidence,
+    marketPriceAtEntry: price,
+    status: "monitoring",
+    createdAt: new Date().toISOString(),
+  });
+
+  storage.createAuditEntry({
+    action: "execute",
+    entityType: "execution",
+    entityId: execution.id,
+    actor: "agent:micro_scheduler",
+    details: JSON.stringify({ asset: market.asset, direction, confidence, size, price, edge: impliedEdge, paper: isPaperTrading }),
+    timestamp: new Date().toISOString(),
+  });
+
+  log(`⚡ MICRO: ${market.asset.toUpperCase()} ${direction} $${size.toFixed(2)} @ ${(price * 100).toFixed(1)}% (edge: ${(impliedEdge * 100).toFixed(1)}%)`, "micro");
+  totalTrades++;
+  return true;
+}
+
+// --- Settle expired trades and update calibration ---
+async function settleMicroTrades(): Promise<number> {
+  const openPositions = storage.getActivePositions("open");
+  const microPositions = openPositions.filter(p => p.title.startsWith("[5m]"));
+  let settled = 0;
+
+  for (const pos of microPositions) {
+    const opp = storage.getOpportunity(pos.opportunityId);
+    if (!opp || !opp.endDate) continue;
+
+    const endTime = new Date(opp.endDate).getTime();
+    const elapsed = Date.now() - endTime;
+    if (elapsed < 30000) continue; // Wait 30s after window
+
+    try {
+      const tokenIds = opp.clobTokenIds ? JSON.parse(opp.clobTokenIds) : [];
+      if (tokenIds.length === 0) continue;
+
+      let finalUpPrice: number | null = null;
+      
+      // Try to get price from CLOB
+      const priceStr = await fetchPrice(tokenIds[0]);
+      if (priceStr) finalUpPrice = parseFloat(priceStr);
+
+      // Fallback: if price unavailable after >2 minutes, settle as loss
+      // (expired markets often don't return CLOB prices)
+      if (finalUpPrice === null && elapsed > 120000) {
+        // Use the current price from the opportunity (last known)
+        finalUpPrice = opp.currentPrice || 0.5;
+        log(`Micro: Force-settling expired position #${pos.id} (${elapsed/1000}s expired, CLOB unavailable)`, "micro");
+      }
+      
+      if (finalUpPrice === null) continue; // Still waiting
+
+      const outcome = finalUpPrice > 0.5 ? "YES" : "NO";
+      const wasCorrect = pos.side === outcome;
+      const priceDiff = pos.side === "YES" ? finalUpPrice - pos.entryPrice : pos.entryPrice - finalUpPrice;
+      const realizedPnl = priceDiff * pos.size;
+
+      // Close position
+      storage.updateActivePosition(pos.id, {
+        status: "closed",
+        currentPrice: finalUpPrice,
+        unrealizedPnl: Math.round(realizedPnl * 100) / 100,
+        closedAt: new Date().toISOString(),
+      });
+
+      // Update settlement
+      const settlement = storage.getSettlement(pos.opportunityId);
+      if (settlement) {
+        storage.updateSettlement(settlement.id, {
+          outcome,
+          finalPrice: finalUpPrice,
+          realizedPnl: Math.round(realizedPnl * 100) / 100,
+          realizedPnlPercent: pos.entryPrice > 0 ? Math.round((realizedPnl / pos.size) * 10000) / 100 : 0,
+          wasCorrect: wasCorrect ? 1 : 0,
+          status: "settled",
+          resolvedAt: new Date().toISOString(),
+        });
+      }
+
+      storage.updateOpportunity(pos.opportunityId, {
+        currentPrice: finalUpPrice,
+        status: "settled",
+        pipelineStage: "settlement",
+      });
+
+      totalPnl += realizedPnl;
+      settled++;
+
+      // Extract asset name from title: "[5m] Bitcoin Up..." → "btc"
+      const assetMap: Record<string, string> = { "bitcoin": "btc", "ethereum": "eth", "solana": "sol", "xrp": "xrp" };
+      const titleLower = (opp.title || "").toLowerCase();
+      let asset = "btc";
+      for (const [name, code] of Object.entries(assetMap)) {
+        if (titleLower.includes(name)) { asset = code; break; }
+      }
+      const direction = pos.side === "YES" ? "Up" : "Down";
+      
+      // Update calibration
+      updateCalibration(asset, direction, wasCorrect, realizedPnl);
+
+      const icon = wasCorrect ? "✓" : "✗";
+      const cal = getCalibration(asset);
+      log(`⚡ SETTLED ${icon}: ${asset.toUpperCase()} ${direction} → ${outcome}, PnL: $${realizedPnl.toFixed(2)} | Win rate: ${(cal.wins/cal.totalTrades*100).toFixed(0)}% (${cal.wins}/${cal.totalTrades})`, "micro");
+
+    } catch {}
+  }
+
+  // Record window result for regime tracking
+  if (settled > 0) {
+    const windowWins = settled; // We counted settled positions
+    // Re-count actual wins/losses from this batch
+    let batchWins = 0, batchLosses = 0, batchPnl = 0;
+    // Use the last N settled positions
+    const allPos = storage.getActivePositions("closed");
+    const recentClosed = allPos.filter(p => p.title?.startsWith("[5m]")).slice(-settled);
+    for (const p of recentClosed) {
+      if ((p.unrealizedPnl || 0) > 0) batchWins++; else batchLosses++;
+      batchPnl += p.unrealizedPnl || 0;
+    }
+    recordWindowResult(batchWins, batchLosses, batchPnl);
+  }
+
+  return settled;
+}
+
+// --- Main cycle ---
+async function runMicroCycle(): Promise<void> {
+  if (isRunning) return;
+  isRunning = true;
+
+  try {
+    totalCycles++;
+    if (storage.getConfig("micro_scheduler_enabled") !== "true") { isRunning = false; return; }
+
+    // Load calibration from memory on first cycle
+    if (totalCycles === 1) loadCalibrationFromMemory();
+
+    // Settle expired trades
+    const settled = await settleMicroTrades();
+    if (settled > 0) {
+      log(`Micro: settled ${settled} trades. Total P&L: $${totalPnl.toFixed(2)}`, "micro");
+    }
+
+    // Get enabled assets
+    const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
+
+    for (const asset of enabledAssets) {
+      // Adaptive: skip assets on cooldown (bad recent performance)
+      if (shouldSkipAsset(asset)) {
+        log(`Micro: ${asset.toUpperCase()} on cooldown, skipping`, "micro");
+        continue;
+      }
+
+      const market = await fetchMicroMarket(asset);
+      if (!market) continue;
+
+      // Check if already traded this window
+      if (storage.getOpportunityByExternalId(`micro-${market.slug}-Up`) || 
+          storage.getOpportunityByExternalId(`micro-${market.slug}-Down`)) continue;
+
+      // Min liquidity $500
+      if (market.liquidity < 500) continue;
+
+      // AI analysis with calibration context
+      const analysis = await analyzeWithCalibration(asset, market);
+      
+      // Execute with dynamic bet size multiplier
+      executeMicroTrade(market, analysis.direction, analysis.confidence, analysis.reasoning);
+    }
+
+    lastCycleAt = new Date().toISOString();
+  } catch (err) {
+    log(`Micro cycle error: ${err}`, "micro");
+  } finally {
+    isRunning = false;
+  }
+}
+
+// --- Public API ---
+export function startMicroScheduler(): void {
+  if (schedulerInterval) clearInterval(schedulerInterval);
+  storage.setConfig("micro_scheduler_enabled", "true");
+  runMicroCycle();
+  schedulerInterval = setInterval(() => runMicroCycle(), 60 * 1000);
+  log("⚡ Micro-scheduler started (BTC/ETH/SOL/XRP 5-min markets)", "micro");
+}
+
+export function stopMicroScheduler(): void {
+  if (schedulerInterval) { clearInterval(schedulerInterval); schedulerInterval = null; }
+  storage.setConfig("micro_scheduler_enabled", "false");
+  log("Micro-scheduler stopped", "micro");
+}
+
+export function getMicroStatus() {
+  const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim());
+  
+  // Build calibration summary
+  const calSummary: Record<string, any> = {};
+  for (const asset of enabledAssets) {
+    const cal = getCalibration(asset);
+    if (cal.totalTrades > 0) {
+      calSummary[asset] = {
+        trades: cal.totalTrades,
+        winRate: Math.round(cal.wins / cal.totalTrades * 100),
+        pnl: Math.round(cal.totalPnl * 100) / 100,
+        upWinRate: (cal.upWins + cal.upLosses) > 0 ? Math.round(cal.upWins / (cal.upWins + cal.upLosses) * 100) : null,
+        downWinRate: (cal.downWins + cal.downLosses) > 0 ? Math.round(cal.downWins / (cal.downWins + cal.downLosses) * 100) : null,
+      };
+    }
+  }
+
+  // Cooldown status per asset
+  const cooldowns: Record<string, boolean> = {};
+  for (const asset of enabledAssets) {
+    cooldowns[asset.toLowerCase()] = shouldSkipAsset(asset.toLowerCase());
+  }
+
+  return {
+    active: schedulerInterval !== null && storage.getConfig("micro_scheduler_enabled") === "true",
+    totalCycles,
+    totalTrades,
+    totalPnl: Math.round(totalPnl * 100) / 100,
+    lastCycleAt,
+    enabledAssets,
+    microBankroll: parseFloat(storage.getConfig("micro_bankroll") || "200"),
+    microMaxBet: parseFloat(storage.getConfig("micro_max_bet") || "20"),
+    calibration: calSummary,
+    regime: {
+      betSizeMultiplier: Math.round(betSizeMultiplier * 100) / 100,
+      consecutiveLossWindows,
+      lastWindowPnl: Math.round(lastWindowPnl * 100) / 100,
+      cooldowns,
+    },
+  };
+}

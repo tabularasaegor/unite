@@ -1,42 +1,28 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { X, ExternalLink, RefreshCw } from "lucide-react";
+import { X, ExternalLink, Zap, RefreshCw } from "lucide-react";
 
-function getDaysRemaining(endDate: string | null): { days: number | null; label: string; color: string } {
-  if (!endDate) return { days: null, label: "", color: "" };
-  const now = new Date();
-  const end = new Date(endDate);
-  const diff = Math.ceil((end.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-  if (diff < 0) return { days: diff, label: "Просрочен", color: "bg-red-500/10 text-red-500 border-red-500/20" };
-  if (diff < 7) return { days: diff, label: `${diff}д`, color: "bg-red-500/10 text-red-500 border-red-500/20" };
-  if (diff <= 30) return { days: diff, label: `${diff}д`, color: "bg-yellow-500/10 text-yellow-500 border-yellow-500/20" };
-  return { days: diff, label: `${diff}д`, color: "bg-muted text-muted-foreground" };
+function cleanTitle(title: string) {
+  return title.replace(/^\[5m\]\s*/, "");
 }
 
-function formatDate(dateStr: string | null): string {
-  if (!dateStr) return "";
-  try {
-    return new Date(dateStr).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" });
-  } catch { return ""; }
-}
-
-export default function Positions() {
+export default function MicroPositions() {
   const { toast } = useToast();
 
   const { data: openPositions, refetch: refetchOpen, isFetching: fetchingOpen } = useQuery({
-    queryKey: ["/api/positions", "regular", "open"],
-    queryFn: () => apiRequest("GET", "/api/positions?type=regular&status=open").then(r => r.json()),
+    queryKey: ["/api/positions", "micro", "open"],
+    queryFn: () => apiRequest("GET", "/api/positions?type=micro&status=open").then(r => r.json()),
     refetchInterval: 30000,
   });
 
   const { data: closedPositions, refetch: refetchClosed, isFetching: fetchingClosed } = useQuery({
-    queryKey: ["/api/positions", "regular", "closed"],
-    queryFn: () => apiRequest("GET", "/api/positions?type=regular&status=closed").then(r => r.json()),
+    queryKey: ["/api/positions", "micro", "closed"],
+    queryFn: () => apiRequest("GET", "/api/positions?type=micro&status=closed").then(r => r.json()),
   });
 
   const isFetching = fetchingOpen || fetchingClosed;
@@ -55,11 +41,13 @@ export default function Positions() {
   const totalSize = (openPositions || []).reduce((s: number, p: any) => s + p.size, 0);
 
   return (
-    <div className="flex-1 overflow-auto p-6 space-y-6" data-testid="positions-page">
+    <div className="flex-1 overflow-auto p-6 space-y-6" data-testid="micro-positions-page">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-semibold">Позиции</h2>
-          <p className="text-sm text-muted-foreground">Управление активными и закрытыми позициями</p>
+          <h2 className="text-xl font-semibold flex items-center gap-2">
+            <Zap className="h-5 w-5 text-amber-500" /> Микро-позиции
+          </h2>
+          <p className="text-sm text-muted-foreground">5-минутные крипто-позиции</p>
         </div>
         <Button variant="outline" size="sm" onClick={refreshAll} disabled={isFetching} className="gap-1.5">
           <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`} />
@@ -67,7 +55,6 @@ export default function Positions() {
         </Button>
       </div>
 
-      {/* Summary */}
       <div className="grid grid-cols-3 gap-4">
         <Card>
           <CardContent className="pt-4 pb-3">
@@ -99,53 +86,41 @@ export default function Positions() {
           <Card>
             <CardContent className="pt-4">
               <div className="space-y-2">
-                {(openPositions || []).map((pos: any) => {
-                  const deadline = getDaysRemaining(pos.endDate);
-                  return (
-                    <div key={pos.id} className="flex items-center justify-between py-2 border-b border-border/30">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          {pos.marketUrl ? (
-                            <a href={pos.marketUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium truncate hover:text-primary transition-colors flex items-center gap-1" data-testid={`pos-link-${pos.id}`}>
-                              {pos.title}
-                              <ExternalLink className="w-3 h-3 flex-shrink-0 text-muted-foreground" />
-                            </a>
-                          ) : (
-                            <p className="text-sm font-medium truncate">{pos.title}</p>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <Badge variant="outline" className="text-[10px]">{pos.platform}</Badge>
-                          <Badge variant={pos.side === "YES" ? "default" : "destructive"} className="text-[10px]">{pos.side}</Badge>
-                          <span className="text-xs font-mono tabular-nums">Вход: {(pos.entryPrice * 100).toFixed(1)}%</span>
-                          <span className="text-xs font-mono tabular-nums">Текущ: {((pos.currentPrice || 0) * 100).toFixed(1)}%</span>
-                          <span className="text-xs font-mono tabular-nums">${pos.size.toFixed(0)}</span>
-                        </div>
-                        {pos.endDate && (
-                          <div className="flex items-center gap-1.5 mt-1">
-                            <span className="text-[10px] text-muted-foreground">Дедлайн: {formatDate(pos.endDate)}</span>
-                            {deadline.label && (
-                              <Badge variant="outline" className={`text-[10px] h-4 ${deadline.color}`}>{deadline.label}</Badge>
-                            )}
-                          </div>
+                {(openPositions || []).map((pos: any) => (
+                  <div key={pos.id} className="flex items-center justify-between py-2 border-b border-border/30">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        {pos.marketUrl ? (
+                          <a href={pos.marketUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium truncate hover:text-primary transition-colors flex items-center gap-1">
+                            {cleanTitle(pos.title)}
+                            <ExternalLink className="w-3 h-3 flex-shrink-0 text-muted-foreground" />
+                          </a>
+                        ) : (
+                          <p className="text-sm font-medium truncate">{cleanTitle(pos.title)}</p>
                         )}
                       </div>
-                      <div className="flex items-center gap-3 ml-4">
-                        <div className="text-right">
-                          <div className={`text-sm font-mono font-semibold tabular-nums ${(pos.unrealizedPnl || 0) >= 0 ? "text-green-500" : "text-red-500"}`}>
-                            ${(pos.unrealizedPnl || 0).toFixed(2)}
-                          </div>
-                          <div className="text-[10px] text-muted-foreground tabular-nums">
-                            {(pos.unrealizedPnlPercent || 0).toFixed(1)}%
-                          </div>
-                        </div>
-                        <Button size="sm" variant="destructive" onClick={() => closeMut.mutate(pos.id)} disabled={closeMut.isPending} data-testid={`btn-close-${pos.id}`}>
-                          <X className="w-3 h-3 mr-1" /> Закрыть
-                        </Button>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <Badge variant={pos.side === "YES" ? "default" : "destructive"} className="text-[10px]">{pos.side}</Badge>
+                        <span className="text-xs font-mono tabular-nums">Вход: {(pos.entryPrice * 100).toFixed(1)}¢</span>
+                        <span className="text-xs font-mono tabular-nums">Текущ: {((pos.currentPrice || 0) * 100).toFixed(1)}¢</span>
+                        <span className="text-xs font-mono tabular-nums">${pos.size.toFixed(2)}</span>
                       </div>
                     </div>
-                  );
-                })}
+                    <div className="flex items-center gap-3 ml-4">
+                      <div className="text-right">
+                        <div className={`text-sm font-mono font-semibold tabular-nums ${(pos.unrealizedPnl || 0) >= 0 ? "text-green-500" : "text-red-500"}`}>
+                          ${(pos.unrealizedPnl || 0).toFixed(2)}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground tabular-nums">
+                          {(pos.unrealizedPnlPercent || 0).toFixed(1)}%
+                        </div>
+                      </div>
+                      <Button size="sm" variant="destructive" onClick={() => closeMut.mutate(pos.id)} disabled={closeMut.isPending}>
+                        <X className="w-3 h-3 mr-1" /> Закрыть
+                      </Button>
+                    </div>
+                  </div>
+                ))}
                 {(openPositions || []).length === 0 && <p className="text-sm text-muted-foreground text-center py-4">Нет открытых позиций</p>}
               </div>
             </CardContent>
@@ -162,15 +137,14 @@ export default function Positions() {
                       <div className="flex items-center gap-1.5">
                         {pos.marketUrl ? (
                           <a href={pos.marketUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium truncate hover:text-primary transition-colors flex items-center gap-1">
-                            {pos.title}
+                            {cleanTitle(pos.title)}
                             <ExternalLink className="w-3 h-3 flex-shrink-0 text-muted-foreground" />
                           </a>
                         ) : (
-                          <p className="text-sm font-medium truncate">{pos.title}</p>
+                          <p className="text-sm font-medium truncate">{cleanTitle(pos.title)}</p>
                         )}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
-                        <Badge variant="outline" className="text-[10px]">{pos.platform}</Badge>
                         <Badge variant={pos.side === "YES" ? "default" : "destructive"} className="text-[10px]">{pos.side}</Badge>
                         <span className="font-mono tabular-nums">Закрыта: {pos.closedAt ? new Date(pos.closedAt).toLocaleDateString("ru-RU") : "—"}</span>
                       </div>

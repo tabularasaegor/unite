@@ -1,3 +1,4 @@
+import { Component, type ReactNode } from "react";
 import { Switch, Route, Router } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
 import { queryClient } from "./lib/queryClient";
@@ -6,13 +7,44 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/dashboard";
-import Markets from "@/pages/markets";
+import Scanner from "@/pages/scanner";
+import Opportunities from "@/pages/opportunities";
+import OpportunityDetail from "@/pages/opportunity-detail";
+import RiskConsole from "@/pages/risk-console";
 import Positions from "@/pages/positions";
 import Trades from "@/pages/trades";
-import Predictions from "@/pages/predictions";
+import Settlements from "@/pages/settlements";
+import PostMortems from "@/pages/post-mortems";
+import AuditLogPage from "@/pages/audit-log";
 import SettingsPage from "@/pages/settings";
+import MicroDashboard from "@/pages/micro-dashboard";
+import MicroPositions from "@/pages/micro-positions";
+import MicroTrades from "@/pages/micro-trades";
+import MicroSettlements from "@/pages/micro-settlements";
 import AppSidebar from "@/components/AppSidebar";
 import { useTheme } from "@/hooks/use-theme";
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: string }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: "" };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error: error.message };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, color: "#ef4444", fontFamily: "sans-serif" }}>
+          <h2>Application Error</h2>
+          <pre style={{ whiteSpace: "pre-wrap" }}>{this.state.error}</pre>
+          <button onClick={() => window.location.reload()} style={{ marginTop: 16, padding: "8px 16px" }}>Reload</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function AppLayout() {
   const { theme, toggleTheme } = useTheme();
@@ -22,11 +54,20 @@ function AppLayout() {
       <AppSidebar theme={theme} toggleTheme={toggleTheme} />
       <Switch>
         <Route path="/" component={Dashboard} />
-        <Route path="/markets" component={Markets} />
+        <Route path="/scanner" component={Scanner} />
+        <Route path="/opportunities/:id" component={OpportunityDetail} />
+        <Route path="/opportunities" component={Opportunities} />
+        <Route path="/risk-console" component={RiskConsole} />
         <Route path="/positions" component={Positions} />
         <Route path="/trades" component={Trades} />
-        <Route path="/predictions" component={Predictions} />
+        <Route path="/settlements" component={Settlements} />
+        <Route path="/post-mortems" component={PostMortems} />
+        <Route path="/audit-log" component={AuditLogPage} />
         <Route path="/settings" component={SettingsPage} />
+        <Route path="/micro/positions" component={MicroPositions} />
+        <Route path="/micro/trades" component={MicroTrades} />
+        <Route path="/micro/settlements" component={MicroSettlements} />
+        <Route path="/micro" component={MicroDashboard} />
         <Route component={NotFound} />
       </Switch>
     </div>
@@ -35,14 +76,16 @@ function AppLayout() {
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <Toaster />
-        <Router hook={useHashLocation}>
-          <AppLayout />
-        </Router>
-      </TooltipProvider>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <Toaster />
+          <Router hook={useHashLocation}>
+            <AppLayout />
+          </Router>
+        </TooltipProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }
 

@@ -30,7 +30,9 @@ export const getQueryFn: <T>(options: {
 }) => QueryFunction<T> =
   ({ on401: unauthorizedBehavior }) =>
   async ({ queryKey }) => {
-    const res = await fetch(`${API_BASE}${queryKey.join("/")}`);
+    // Only join string parts of queryKey for URL, skip objects
+    const urlParts = queryKey.filter((k): k is string => typeof k === "string");
+    const res = await fetch(`${API_BASE}${urlParts.join("/")}`);
 
     if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;
@@ -47,7 +49,7 @@ export const queryClient = new QueryClient({
       refetchInterval: false,
       refetchOnWindowFocus: false,
       staleTime: Infinity,
-      retry: false,
+      retry: 1,
     },
     mutations: {
       retry: false,
