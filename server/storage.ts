@@ -20,8 +20,9 @@ import {
 
 import path from "path";
 
-// Use absolute path to ensure data.db is always found regardless of CWD
-const DB_PATH = path.resolve(process.cwd(), "data.db");
+// Use DATA_DIR env var for Railway Volume persistence, fallback to CWD
+const dataDir = process.env.DATA_DIR || process.cwd();
+const DB_PATH = path.resolve(dataDir, "data.db");
 const sqlite = new Database(DB_PATH);
 sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
