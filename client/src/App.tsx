@@ -54,7 +54,7 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
   return (
     <div className="flex h-screen overflow-hidden bg-background">
       <AppSidebar theme={theme} toggleTheme={toggleTheme} onLogout={onLogout} />
-      <main className="flex-1 overflow-hidden pt-14 md:pt-0">
+      <main className="flex-1 overflow-auto pt-14 md:pt-0">
       <Switch>
         <Route path="/" component={Dashboard} />
         <Route path="/scanner" component={Scanner} />
