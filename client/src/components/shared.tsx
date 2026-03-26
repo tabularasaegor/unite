@@ -299,10 +299,14 @@ export function ModelLogPanel({ entries, isLoading }: { entries: LogEntry[]; isL
 }
 
 // ─── Date formatter ──────────────────────────────────────────────
-export function formatDate(dateStr: string | null | undefined) {
+export function formatDate(dateStr: string | Date | null | undefined) {
   if (!dateStr) return "—";
   try {
-    // Handle SQLite datetime format ("2026-03-26 10:07:26") and ISO format
+    // Handle Date objects, ISO strings, and legacy SQLite datetime format
+    if (dateStr instanceof Date) {
+      if (isNaN(dateStr.getTime())) return "—";
+      return dateStr.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+    }
     const normalized = dateStr.includes("T") ? dateStr : dateStr.replace(" ", "T") + "Z";
     const d = new Date(normalized);
     if (isNaN(d.getTime())) return dateStr;
@@ -314,6 +318,6 @@ export function formatDate(dateStr: string | null | undefined) {
       minute: "2-digit",
     });
   } catch {
-    return dateStr;
+    return String(dateStr);
   }
 }

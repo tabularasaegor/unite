@@ -42,13 +42,14 @@ interface GammaMarket {
 
 // ─── Config Helpers ──────────────────────────────────────────────
 
-function getConfigInt(key: string, def: number): number {
-  const val = storage.getConfig(key);
+async function getConfigInt(key: string, def: number): Promise<number> {
+  const val = await storage.getConfig(key);
   return val ? parseInt(val, 10) : def;
 }
 
-function getConfigStr(key: string, def: string): string {
-  return storage.getConfig(key) || def;
+async function getConfigStr(key: string, def: string): Promise<string> {
+  const val = await storage.getConfig(key);
+  return val || def;
 }
 
 // ─── Category Detection ──────────────────────────────────────────
@@ -85,10 +86,10 @@ export async function scanMarkets(): Promise<{
   skipped: number;
   errors: string[];
 }> {
-  const maxPerRun = getConfigInt("pipeline_max_per_run", 30);
-  const minDays = getConfigInt("pipeline_min_days", 0);
-  const maxDays = getConfigInt("pipeline_max_days", 30);
-  const sectors = getConfigStr("pipeline_sectors", "sports,crypto,politics,tech,other")
+  const maxPerRun = await getConfigInt("pipeline_max_per_run", 30);
+  const minDays = await getConfigInt("pipeline_min_days", 0);
+  const maxDays = await getConfigInt("pipeline_max_days", 30);
+  const sectors = (await getConfigStr("pipeline_sectors", "sports,crypto,politics,tech,other"))
     .split(",")
     .map(s => s.trim().toLowerCase());
 
@@ -138,7 +139,7 @@ export async function scanMarkets(): Promise<{
         }
 
         // Check if already tracked
-        const existing = storage.getOpportunities()
+        const existing = (await storage.getOpportunities())
           .find(o => o.externalId === event.id);
         if (existing) {
           result.skipped++;
@@ -169,7 +170,7 @@ export async function scanMarkets(): Promise<{
           prices = JSON.parse(market.outcomePrices || "[]");
         } catch { /* */ }
 
-        storage.createOpportunity({
+        await storage.createOpportunity({
           externalId: event.id,
           platform: "polymarket",
           title: event.title,
@@ -195,9 +196,9 @@ export async function scanMarkets(): Promise<{
     result.errors.push(`Scan error: ${String(err)}`);
   }
 
-  storage.addAuditEntry("сканирование",
+  await storage.addAuditEntry("сканирование",
     `Просканировано ${result.scanned}, добавлено ${result.added}, пропущено ${result.skipped}`);
-  storage.addModelLog("PIPELINE_SCAN", undefined,
+  await storage.addModelLog("PIPELINE_SCAN", undefined,
     JSON.stringify(result));
 
   return result;
@@ -209,20 +210,20 @@ export async function scanMarkets(): Promise<{
  * Run AI research on an opportunity. Placeholder — updates pipeline stage.
  */
 export async function runResearch(opportunityId: number): Promise<{ success: boolean; message: string }> {
-  const opp = storage.getOpportunity(opportunityId);
+  const opp = await storage.getOpportunity(opportunityId);
   if (!opp) {
     return { success: false, message: "Opportunity not found" };
   }
 
   // Update stage
-  storage.updateOpportunity(opportunityId, { pipelineStage: "researching" });
+  await storage.updateOpportunity(opportunityId, { pipelineStage: "researching" });
 
   // Placeholder: in production this would call AI agents
-  storage.updateOpportunity(opportunityId, {
+  await storage.updateOpportunity(opportunityId, {
     pipelineStage: "researched",
   });
 
-  storage.addAuditEntry("исследование",
+  await storage.addAuditEntry("исследование",
     `Исследование завершено для #${opportunityId}: ${opp.title}`);
 
   return { success: true, message: "Research completed (placeholder)" };
@@ -230,9 +231,9 @@ export async function runResearch(opportunityId: number): Promise<{ success: boo
 
 // ─── Pipeline Dashboard Stats ────────────────────────────────────
 
-export function getPipelineDashboard() {
-  const allOpps = storage.getOpportunities();
-  const positions = storage.getPositions({ source: "pipeline" });
+export async function getPipelineDashboard() {
+  const allOpps = await storage.getOpportunities();
+  const positions = await storage.getPositions({ source: "pipeline" });
   const openPositions = positions.filter(p => p.status === "open");
   const closedPositions = positions.filter(p => p.status === "settled" || p.status === "closed");
 

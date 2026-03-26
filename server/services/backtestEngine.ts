@@ -528,7 +528,7 @@ function createDynamicThresholdStrategy(): (w: WindowData, windowIdx: number) =>
 
       // Adjust confidence by rolling WR
       const adjustedConf = sig.confidence * (0.5 + recentWr);
-      if (adjustedConf > bestAdjustedConf && sig.direction !== "skip") {
+      if (adjustedConf > bestAdjustedConf) {
         bestAdjustedConf = adjustedConf;
         bestSignal = { direction: sig.direction, confidence: Math.min(sig.confidence, 0.70) };
       }
@@ -556,7 +556,7 @@ function createDynamicThresholdUpdater(): (w: WindowData) => void {
 
 // ─── Main Backtest Runner ────────────────────────────────────────
 
-export function runBacktest(numWindows: number = 2000): BacktestRunResult {
+export async function runBacktest(numWindows: number = 2000): Promise<BacktestRunResult> {
   console.log(`[Backtest] Starting with ${numWindows} windows...`);
   const startTime = Date.now();
 
@@ -699,7 +699,7 @@ export function runBacktest(numWindows: number = 2000): BacktestRunResult {
 
   // Save to database
   for (const result of allResults) {
-    storage.saveBacktestResult({
+    await storage.saveBacktestResult({
       strategyName: result.strategyName,
       totalTrades: result.totalTrades,
       wins: result.wins,
@@ -721,7 +721,7 @@ export function runBacktest(numWindows: number = 2000): BacktestRunResult {
     `[Backtest] Complete in ${elapsed}ms. Best model: ${bestModel} (WR: ${allResults[0]?.winRate ?? 0})`
   );
 
-  storage.addAuditEntry(
+  await storage.addAuditEntry(
     "бэктест",
     `Завершён бэктест ${numWindows} окон. Лучшая модель: ${bestModel} (WR: ${((allResults[0]?.winRate ?? 0) * 100).toFixed(1)}%)`
   );

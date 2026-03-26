@@ -1,209 +1,209 @@
-import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { mysqlTable, varchar, int, double, boolean, text, serial, timestamp } from "drizzle-orm/mysql-core";
 import { createInsertSchema } from "drizzle-zod";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 
 // ─── Users ───────────────────────────────────────────────────────
-export const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  username: text("username").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+export const users = mysqlTable("users", {
+  id: serial("id").primaryKey(),
+  username: varchar("username", { length: 255 }).notNull().unique(),
+  passwordHash: varchar("password_hash", { length: 255 }).notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Platform Config (key-value) ─────────────────────────────────
-export const platformConfig = sqliteTable("platform_config", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  key: text("key").notNull().unique(),
+export const platformConfig = mysqlTable("platform_config", {
+  id: serial("id").primaryKey(),
+  key: varchar("key", { length: 255 }).notNull().unique(),
   value: text("value").notNull(),
-  updatedAt: text("updated_at").notNull().default("(datetime('now'))"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 // ─── Opportunities (discovered markets) ──────────────────────────
-export const opportunities = sqliteTable("opportunities", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  externalId: text("external_id").notNull(),
-  platform: text("platform").notNull().default("polymarket"),
+export const opportunities = mysqlTable("opportunities", {
+  id: serial("id").primaryKey(),
+  externalId: varchar("external_id", { length: 255 }).notNull(),
+  platform: varchar("platform", { length: 64 }).notNull().default("polymarket"),
   title: text("title").notNull(),
-  category: text("category").notNull().default("crypto"),
-  currentPrice: real("current_price"),
-  volume24h: real("volume_24h"),
-  status: text("status").notNull().default("active"),
-  pipelineStage: text("pipeline_stage").notNull().default("scanned"),
-  aiProbability: real("ai_probability"),
-  edge: real("edge"),
-  conditionId: text("condition_id"),
+  category: varchar("category", { length: 64 }).notNull().default("crypto"),
+  currentPrice: double("current_price"),
+  volume24h: double("volume_24h"),
+  status: varchar("status", { length: 64 }).notNull().default("active"),
+  pipelineStage: varchar("pipeline_stage", { length: 64 }).notNull().default("scanned"),
+  aiProbability: double("ai_probability"),
+  edge: double("edge"),
+  conditionId: varchar("condition_id", { length: 255 }),
   clobTokenIds: text("clob_token_ids"),
-  tickSize: real("tick_size"),
-  negRisk: integer("neg_risk", { mode: "boolean" }).default(false),
-  endDate: text("end_date"),
-  slug: text("slug"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
-  updatedAt: text("updated_at").notNull().default("(datetime('now'))"),
+  tickSize: double("tick_size"),
+  negRisk: boolean("neg_risk").default(false),
+  endDate: varchar("end_date", { length: 64 }),
+  slug: varchar("slug", { length: 512 }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 // ─── Research Reports ────────────────────────────────────────────
-export const researchReports = sqliteTable("research_reports", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id").notNull(),
-  agentType: text("agent_type").notNull(),
+export const researchReports = mysqlTable("research_reports", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id").notNull(),
+  agentType: varchar("agent_type", { length: 128 }).notNull(),
   content: text("content").notNull(),
-  confidence: real("confidence"),
+  confidence: double("confidence"),
   sources: text("sources"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Probability Estimates ───────────────────────────────────────
-export const probabilityEstimates = sqliteTable("probability_estimates", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id").notNull(),
-  modelName: text("model_name").notNull(),
-  estimatedProbability: real("estimated_probability").notNull(),
-  confidence: real("confidence"),
+export const probabilityEstimates = mysqlTable("probability_estimates", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id").notNull(),
+  modelName: varchar("model_name", { length: 128 }).notNull(),
+  estimatedProbability: double("estimated_probability").notNull(),
+  confidence: double("confidence"),
   reasoning: text("reasoning"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Risk Assessments ────────────────────────────────────────────
-export const riskAssessments = sqliteTable("risk_assessments", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id").notNull(),
-  kellyFraction: real("kelly_fraction"),
-  positionSize: real("position_size"),
-  riskScore: real("risk_score"),
-  approved: integer("approved", { mode: "boolean" }).default(false),
+export const riskAssessments = mysqlTable("risk_assessments", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id").notNull(),
+  kellyFraction: double("kelly_fraction"),
+  positionSize: double("position_size"),
+  riskScore: double("risk_score"),
+  approved: boolean("approved").default(false),
   blockReason: text("block_reason"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Active Positions ────────────────────────────────────────────
-export const activePositions = sqliteTable("active_positions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id"),
-  side: text("side").notNull(),
-  entryPrice: real("entry_price").notNull(),
-  currentPrice: real("current_price"),
-  size: real("size").notNull(),
-  unrealizedPnl: real("unrealized_pnl").default(0),
-  realizedPnl: real("realized_pnl").default(0),
-  status: text("status").notNull().default("open"),
-  source: text("source").notNull().default("pipeline"),
-  asset: text("asset"),
-  windowStart: integer("window_start"),
-  windowEnd: integer("window_end"),
-  slug: text("slug"),
-  strategyUsed: text("strategy_used"),
-  confidence: real("confidence"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
-  closedAt: text("closed_at"),
+export const activePositions = mysqlTable("active_positions", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id"),
+  side: varchar("side", { length: 16 }).notNull(),
+  entryPrice: double("entry_price").notNull(),
+  currentPrice: double("current_price"),
+  size: double("size").notNull(),
+  unrealizedPnl: double("unrealized_pnl").default(0),
+  realizedPnl: double("realized_pnl").default(0),
+  status: varchar("status", { length: 32 }).notNull().default("open"),
+  source: varchar("source", { length: 32 }).notNull().default("pipeline"),
+  asset: varchar("asset", { length: 16 }),
+  windowStart: int("window_start"),
+  windowEnd: int("window_end"),
+  slug: varchar("slug", { length: 512 }),
+  strategyUsed: varchar("strategy_used", { length: 64 }),
+  confidence: double("confidence"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  closedAt: timestamp("closed_at"),
 });
 
 // ─── Executions (orders) ─────────────────────────────────────────
-export const executions = sqliteTable("executions", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id"),
-  positionId: integer("position_id"),
-  type: text("type").notNull().default("paper"),
-  side: text("side").notNull(),
-  price: real("price").notNull(),
-  size: real("size").notNull(),
-  orderId: text("order_id"),
-  status: text("status").notNull().default("filled"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+export const executions = mysqlTable("executions", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id"),
+  positionId: int("position_id"),
+  type: varchar("type", { length: 32 }).notNull().default("paper"),
+  side: varchar("side", { length: 16 }).notNull(),
+  price: double("price").notNull(),
+  size: double("size").notNull(),
+  orderId: varchar("order_id", { length: 255 }),
+  status: varchar("status", { length: 32 }).notNull().default("filled"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Settlements ─────────────────────────────────────────────────
-export const settlements = sqliteTable("settlements", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  positionId: integer("position_id").notNull(),
-  opportunityId: integer("opportunity_id"),
-  outcome: text("outcome").notNull(),
-  realizedPnl: real("realized_pnl").notNull(),
-  wasCorrect: integer("was_correct", { mode: "boolean" }),
-  settledAt: text("settled_at").notNull().default("(datetime('now'))"),
+export const settlements = mysqlTable("settlements", {
+  id: serial("id").primaryKey(),
+  positionId: int("position_id").notNull(),
+  opportunityId: int("opportunity_id"),
+  outcome: varchar("outcome", { length: 32 }).notNull(),
+  realizedPnl: double("realized_pnl").notNull(),
+  wasCorrect: boolean("was_correct"),
+  settledAt: timestamp("settled_at").notNull().defaultNow(),
 });
 
 // ─── Post-Mortems ────────────────────────────────────────────────
-export const postMortems = sqliteTable("post_mortems", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  opportunityId: integer("opportunity_id"),
-  settlementId: integer("settlement_id"),
+export const postMortems = mysqlTable("post_mortems", {
+  id: serial("id").primaryKey(),
+  opportunityId: int("opportunity_id"),
+  settlementId: int("settlement_id"),
   analysis: text("analysis"),
   whatHappened: text("what_happened"),
   whatModelPredicted: text("what_model_predicted"),
   whyWrongOrRight: text("why_wrong_or_right"),
   lessonsLearned: text("lessons_learned"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Memory Store (cross-session state) ──────────────────────────
-export const memoryStore = sqliteTable("memory_store", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  category: text("category").notNull(),
-  key: text("key").notNull(),
+export const memoryStore = mysqlTable("memory_store", {
+  id: serial("id").primaryKey(),
+  category: varchar("category", { length: 128 }).notNull(),
+  key: varchar("key_name", { length: 512 }).notNull(),
   value: text("value").notNull(),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
-  updatedAt: text("updated_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 // ─── Audit Log ───────────────────────────────────────────────────
-export const auditLog = sqliteTable("audit_log", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  action: text("action").notNull(),
+export const auditLog = mysqlTable("audit_log", {
+  id: serial("id").primaryKey(),
+  action: varchar("action", { length: 128 }).notNull(),
   details: text("details"),
-  userId: integer("user_id"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  userId: int("user_id"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Performance Snapshots ───────────────────────────────────────
-export const performanceSnapshots = sqliteTable("performance_snapshots", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  source: text("source").notNull(),
-  bankroll: real("bankroll"),
-  totalPnl: real("total_pnl"),
-  winRate: real("win_rate"),
-  tradeCount: integer("trade_count"),
-  snapshotAt: text("snapshot_at").notNull().default("(datetime('now'))"),
+export const performanceSnapshots = mysqlTable("performance_snapshots", {
+  id: serial("id").primaryKey(),
+  source: varchar("source", { length: 32 }).notNull(),
+  bankroll: double("bankroll"),
+  totalPnl: double("total_pnl"),
+  winRate: double("win_rate"),
+  tradeCount: int("trade_count"),
+  snapshotAt: timestamp("snapshot_at").notNull().defaultNow(),
 });
 
 // ─── Model Log (strategy decisions and events) ───────────────────
-export const modelLog = sqliteTable("model_log", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  event: text("event").notNull(),
-  asset: text("asset"),
+export const modelLog = mysqlTable("model_log", {
+  id: serial("id").primaryKey(),
+  event: varchar("event", { length: 128 }).notNull(),
+  asset: varchar("asset", { length: 16 }),
   details: text("details"),
-  createdAt: text("created_at").notNull().default("(datetime('now'))"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Strategy Performance (per-strategy per-asset tracking) ──────
-export const strategyPerformance = sqliteTable("strategy_performance", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  strategyName: text("strategy_name").notNull(),
-  asset: text("asset").notNull(),
-  totalTrades: integer("total_trades").notNull().default(0),
-  wins: integer("wins").notNull().default(0),
-  losses: integer("losses").notNull().default(0),
-  alphaWins: real("alpha_wins").notNull().default(1),
-  betaLosses: real("beta_losses").notNull().default(1),
-  lastUpdated: text("last_updated").notNull().default("(datetime('now'))"),
+export const strategyPerformance = mysqlTable("strategy_performance", {
+  id: serial("id").primaryKey(),
+  strategyName: varchar("strategy_name", { length: 64 }).notNull(),
+  asset: varchar("asset", { length: 16 }).notNull(),
+  totalTrades: int("total_trades").notNull().default(0),
+  wins: int("wins").notNull().default(0),
+  losses: int("losses").notNull().default(0),
+  alphaWins: double("alpha_wins").notNull().default(1),
+  betaLosses: double("beta_losses").notNull().default(1),
+  lastUpdated: timestamp("last_updated").notNull().defaultNow(),
 });
 
 // ─── Backtest Results ─────────────────────────────────────────────
-export const backtestResults = sqliteTable("backtest_results", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  strategyName: text("strategy_name").notNull(),
-  totalTrades: integer("total_trades").notNull(),
-  wins: integer("wins").notNull(),
-  losses: integer("losses").notNull(),
-  winRate: real("win_rate").notNull(),
-  totalPnl: real("total_pnl").notNull(),
-  avgPnl: real("avg_pnl").notNull(),
-  maxDrawdown: real("max_drawdown").notNull(),
-  sharpeRatio: real("sharpe_ratio").notNull(),
-  avgConfidence: real("avg_confidence").notNull(),
+export const backtestResults = mysqlTable("backtest_results", {
+  id: serial("id").primaryKey(),
+  strategyName: varchar("strategy_name", { length: 64 }).notNull(),
+  totalTrades: int("total_trades").notNull(),
+  wins: int("wins").notNull(),
+  losses: int("losses").notNull(),
+  winRate: double("win_rate").notNull(),
+  totalPnl: double("total_pnl").notNull(),
+  avgPnl: double("avg_pnl").notNull(),
+  maxDrawdown: double("max_drawdown").notNull(),
+  sharpeRatio: double("sharpe_ratio").notNull(),
+  avgConfidence: double("avg_confidence").notNull(),
   rollingWr50: text("rolling_wr_50"),
-  runAt: text("run_at").notNull(),
-  batchId: text("batch_id").notNull(),
+  runAt: varchar("run_at", { length: 64 }).notNull(),
+  batchId: varchar("batch_id", { length: 64 }).notNull(),
 });
 
 // ─── Zod Schemas ─────────────────────────────────────────────────

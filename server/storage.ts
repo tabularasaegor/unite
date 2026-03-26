@@ -1,5 +1,5 @@
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
 import { eq, and, desc, sql, like, asc } from "drizzle-orm";
 import {
   users, platformConfig, opportunities, researchReports,
@@ -13,419 +13,472 @@ import {
   type PlatformConfig, type BacktestResult, type InsertBacktestResult,
 } from "@shared/schema";
 
-const DB_PATH = process.env.DATA_DIR
-  ? `${process.env.DATA_DIR}/data.db`
-  : "data.db";
+// ─── Database Connection ──────────────────────────────────────────
 
-const sqlite = new Database(DB_PATH);
-sqlite.pragma("journal_mode = WAL");
-sqlite.pragma("foreign_keys = ON");
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL environment variable is required. Set it to your MySQL connection string.");
+}
 
-export const db = drizzle(sqlite);
+const pool = mysql.createPool({
+  uri: DATABASE_URL,
+  waitForConnections: true,
+  connectionLimit: 10,
+  ssl: DATABASE_URL.includes("tidb") || DATABASE_URL.includes("aiven") || DATABASE_URL.includes("clever")
+    ? { rejectUnauthorized: true }
+    : undefined,
+});
 
-// ─── Schema push (first run only) ────────────────────────────────
-export function ensureSchema() {
-  const tables = sqlite.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
-  ).get();
-  if (!tables) {
+export const db = drizzle(pool);
+
+// ─── Schema push (auto-create tables) ───────────────────────────
+export async function ensureSchema() {
+  const conn = await pool.getConnection();
+  try {
+    // Check if users table exists
+    const [rows] = await conn.query(
+      "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'"
+    );
+    if ((rows as any[]).length > 0) {
+      console.log("[DB] Tables already exist — skipping schema creation.");
+      // Check for backtest_results table (migration)
+      const [btRows] = await conn.query(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'backtest_results'"
+      );
+      if ((btRows as any[]).length === 0) {
+        await conn.query(`
+          CREATE TABLE backtest_results (
+            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            strategy_name VARCHAR(64) NOT NULL,
+            total_trades INT NOT NULL,
+            wins INT NOT NULL,
+            losses INT NOT NULL,
+            win_rate DOUBLE NOT NULL,
+            total_pnl DOUBLE NOT NULL,
+            avg_pnl DOUBLE NOT NULL,
+            max_drawdown DOUBLE NOT NULL,
+            sharpe_ratio DOUBLE NOT NULL,
+            avg_confidence DOUBLE NOT NULL,
+            rolling_wr_50 TEXT,
+            run_at VARCHAR(64) NOT NULL,
+            batch_id VARCHAR(64) NOT NULL
+          )
+        `);
+        console.log("[DB] Migration: backtest_results table created.");
+      }
+      return;
+    }
+
     console.log("[DB] First run — creating schema...");
-    // Use drizzle-kit push programmatically via raw SQL
     const schema = `
       CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL UNIQUE,
-        password_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(255) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS platform_config (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT NOT NULL UNIQUE,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        \`key\` VARCHAR(255) NOT NULL UNIQUE,
         value TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS opportunities (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        external_id TEXT NOT NULL,
-        platform TEXT NOT NULL DEFAULT 'polymarket',
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        external_id VARCHAR(255) NOT NULL,
+        platform VARCHAR(64) NOT NULL DEFAULT 'polymarket',
         title TEXT NOT NULL,
-        category TEXT NOT NULL DEFAULT 'crypto',
-        current_price REAL,
-        volume_24h REAL,
-        status TEXT NOT NULL DEFAULT 'active',
-        pipeline_stage TEXT NOT NULL DEFAULT 'scanned',
-        ai_probability REAL,
-        edge REAL,
-        condition_id TEXT,
+        category VARCHAR(64) NOT NULL DEFAULT 'crypto',
+        current_price DOUBLE,
+        volume_24h DOUBLE,
+        status VARCHAR(64) NOT NULL DEFAULT 'active',
+        pipeline_stage VARCHAR(64) NOT NULL DEFAULT 'scanned',
+        ai_probability DOUBLE,
+        edge DOUBLE,
+        condition_id VARCHAR(255),
         clob_token_ids TEXT,
-        tick_size REAL,
-        neg_risk INTEGER DEFAULT 0,
-        end_date TEXT,
-        slug TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        tick_size DOUBLE,
+        neg_risk BOOLEAN DEFAULT FALSE,
+        end_date VARCHAR(64),
+        slug VARCHAR(512),
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS research_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER NOT NULL,
-        agent_type TEXT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT NOT NULL,
+        agent_type VARCHAR(128) NOT NULL,
         content TEXT NOT NULL,
-        confidence REAL,
+        confidence DOUBLE,
         sources TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS probability_estimates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER NOT NULL,
-        model_name TEXT NOT NULL,
-        estimated_probability REAL NOT NULL,
-        confidence REAL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT NOT NULL,
+        model_name VARCHAR(128) NOT NULL,
+        estimated_probability DOUBLE NOT NULL,
+        confidence DOUBLE,
         reasoning TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS risk_assessments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER NOT NULL,
-        kelly_fraction REAL,
-        position_size REAL,
-        risk_score REAL,
-        approved INTEGER DEFAULT 0,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT NOT NULL,
+        kelly_fraction DOUBLE,
+        position_size DOUBLE,
+        risk_score DOUBLE,
+        approved BOOLEAN DEFAULT FALSE,
         block_reason TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS active_positions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER,
-        side TEXT NOT NULL,
-        entry_price REAL NOT NULL,
-        current_price REAL,
-        size REAL NOT NULL,
-        unrealized_pnl REAL DEFAULT 0,
-        realized_pnl REAL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'open',
-        source TEXT NOT NULL DEFAULT 'pipeline',
-        asset TEXT,
-        window_start INTEGER,
-        window_end INTEGER,
-        slug TEXT,
-        strategy_used TEXT,
-        confidence REAL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        closed_at TEXT
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT,
+        side VARCHAR(16) NOT NULL,
+        entry_price DOUBLE NOT NULL,
+        current_price DOUBLE,
+        size DOUBLE NOT NULL,
+        unrealized_pnl DOUBLE DEFAULT 0,
+        realized_pnl DOUBLE DEFAULT 0,
+        status VARCHAR(32) NOT NULL DEFAULT 'open',
+        source VARCHAR(32) NOT NULL DEFAULT 'pipeline',
+        asset VARCHAR(16),
+        window_start INT,
+        window_end INT,
+        slug VARCHAR(512),
+        strategy_used VARCHAR(64),
+        confidence DOUBLE,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        closed_at TIMESTAMP NULL
       );
       CREATE TABLE IF NOT EXISTS executions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER,
-        position_id INTEGER,
-        type TEXT NOT NULL DEFAULT 'paper',
-        side TEXT NOT NULL,
-        price REAL NOT NULL,
-        size REAL NOT NULL,
-        order_id TEXT,
-        status TEXT NOT NULL DEFAULT 'filled',
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT,
+        position_id INT,
+        type VARCHAR(32) NOT NULL DEFAULT 'paper',
+        side VARCHAR(16) NOT NULL,
+        price DOUBLE NOT NULL,
+        size DOUBLE NOT NULL,
+        order_id VARCHAR(255),
+        status VARCHAR(32) NOT NULL DEFAULT 'filled',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS settlements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        position_id INTEGER NOT NULL,
-        opportunity_id INTEGER,
-        outcome TEXT NOT NULL,
-        realized_pnl REAL NOT NULL,
-        was_correct INTEGER,
-        settled_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        position_id INT NOT NULL,
+        opportunity_id INT,
+        outcome VARCHAR(32) NOT NULL,
+        realized_pnl DOUBLE NOT NULL,
+        was_correct BOOLEAN,
+        settled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS post_mortems (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        opportunity_id INTEGER,
-        settlement_id INTEGER,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        opportunity_id INT,
+        settlement_id INT,
         analysis TEXT,
         what_happened TEXT,
         what_model_predicted TEXT,
         why_wrong_or_right TEXT,
         lessons_learned TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS memory_store (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        category TEXT NOT NULL,
-        key TEXT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        category VARCHAR(128) NOT NULL,
+        key_name VARCHAR(512) NOT NULL,
         value TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(category, key)
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_cat_key (category, key_name)
       );
       CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        action TEXT NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        action VARCHAR(128) NOT NULL,
         details TEXT,
-        user_id INTEGER,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        user_id INT,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS performance_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source TEXT NOT NULL,
-        bankroll REAL,
-        total_pnl REAL,
-        win_rate REAL,
-        trade_count INTEGER,
-        snapshot_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        source VARCHAR(32) NOT NULL,
+        bankroll DOUBLE,
+        total_pnl DOUBLE,
+        win_rate DOUBLE,
+        trade_count INT,
+        snapshot_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS model_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event TEXT NOT NULL,
-        asset TEXT,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        event VARCHAR(128) NOT NULL,
+        asset VARCHAR(16),
         details TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS strategy_performance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        strategy_name TEXT NOT NULL,
-        asset TEXT NOT NULL,
-        total_trades INTEGER NOT NULL DEFAULT 0,
-        wins INTEGER NOT NULL DEFAULT 0,
-        losses INTEGER NOT NULL DEFAULT 0,
-        alpha_wins REAL NOT NULL DEFAULT 1,
-        beta_losses REAL NOT NULL DEFAULT 1,
-        last_updated TEXT NOT NULL DEFAULT (datetime('now'))
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        strategy_name VARCHAR(64) NOT NULL,
+        asset VARCHAR(16) NOT NULL,
+        total_trades INT NOT NULL DEFAULT 0,
+        wins INT NOT NULL DEFAULT 0,
+        losses INT NOT NULL DEFAULT 0,
+        alpha_wins DOUBLE NOT NULL DEFAULT 1,
+        beta_losses DOUBLE NOT NULL DEFAULT 1,
+        last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
       CREATE TABLE IF NOT EXISTS backtest_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        strategy_name TEXT NOT NULL,
-        total_trades INTEGER NOT NULL,
-        wins INTEGER NOT NULL,
-        losses INTEGER NOT NULL,
-        win_rate REAL NOT NULL,
-        total_pnl REAL NOT NULL,
-        avg_pnl REAL NOT NULL,
-        max_drawdown REAL NOT NULL,
-        sharpe_ratio REAL NOT NULL,
-        avg_confidence REAL NOT NULL,
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        strategy_name VARCHAR(64) NOT NULL,
+        total_trades INT NOT NULL,
+        wins INT NOT NULL,
+        losses INT NOT NULL,
+        win_rate DOUBLE NOT NULL,
+        total_pnl DOUBLE NOT NULL,
+        avg_pnl DOUBLE NOT NULL,
+        max_drawdown DOUBLE NOT NULL,
+        sharpe_ratio DOUBLE NOT NULL,
+        avg_confidence DOUBLE NOT NULL,
         rolling_wr_50 TEXT,
-        run_at TEXT NOT NULL,
-        batch_id TEXT NOT NULL
+        run_at VARCHAR(64) NOT NULL,
+        batch_id VARCHAR(64) NOT NULL
       );
     `;
-    sqlite.exec(schema);
-    console.log("[DB] Schema created.");
-  }
 
-  // Migrate: add backtest_results table if it doesn't exist (for existing DBs)
-  const btTable = sqlite.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='backtest_results'"
-  ).get();
-  if (!btTable) {
-    sqlite.exec(`
-      CREATE TABLE IF NOT EXISTS backtest_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        strategy_name TEXT NOT NULL,
-        total_trades INTEGER NOT NULL,
-        wins INTEGER NOT NULL,
-        losses INTEGER NOT NULL,
-        win_rate REAL NOT NULL,
-        total_pnl REAL NOT NULL,
-        avg_pnl REAL NOT NULL,
-        max_drawdown REAL NOT NULL,
-        sharpe_ratio REAL NOT NULL,
-        avg_confidence REAL NOT NULL,
-        rolling_wr_50 TEXT,
-        run_at TEXT NOT NULL,
-        batch_id TEXT NOT NULL
-      );
-    `);
-    console.log("[DB] Migration: backtest_results table created.");
+    // Execute each statement separately (mysql2 doesn't support multi-statement by default)
+    const statements = schema.split(";").map(s => s.trim()).filter(s => s.length > 0);
+    for (const stmt of statements) {
+      await conn.query(stmt);
+    }
+    console.log("[DB] Schema created.");
+  } finally {
+    conn.release();
   }
 }
+
+// ─── Helper: get first row from drizzle select ──────────────────
+// Drizzle mysql2 returns arrays. We need helpers to get single rows.
 
 // ─── Storage Interface ───────────────────────────────────────────
 export const storage = {
   // ── Users ──
-  getUserByUsername(username: string): User | undefined {
-    return db.select().from(users).where(eq(users.username, username)).get();
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const rows = await db.select().from(users).where(eq(users.username, username));
+    return rows[0];
   },
-  createUser(data: InsertUser): User {
-    return db.insert(users).values({ ...data, createdAt: new Date().toISOString() }).returning().get();
+  async createUser(data: InsertUser): Promise<User> {
+    const now = new Date();
+    await db.insert(users).values({ ...data, createdAt: now });
+    const rows = await db.select().from(users).where(eq(users.username, data.username));
+    return rows[0]!;
   },
 
   // ── Config ──
-  getConfig(key: string): string | undefined {
-    const row = db.select().from(platformConfig).where(eq(platformConfig.key, key)).get();
-    return row?.value;
+  async getConfig(key: string): Promise<string | undefined> {
+    const rows = await db.select().from(platformConfig).where(eq(platformConfig.key, key));
+    return rows[0]?.value;
   },
-  getAllConfig(): PlatformConfig[] {
-    return db.select().from(platformConfig).all();
+  async getAllConfig(): Promise<PlatformConfig[]> {
+    return await db.select().from(platformConfig);
   },
-  setConfig(key: string, value: string) {
-    const existing = db.select().from(platformConfig).where(eq(platformConfig.key, key)).get();
-    if (existing) {
-      db.update(platformConfig)
-        .set({ value, updatedAt: new Date().toISOString() })
-        .where(eq(platformConfig.key, key))
-        .run();
+  async setConfig(key: string, value: string) {
+    const rows = await db.select().from(platformConfig).where(eq(platformConfig.key, key));
+    if (rows[0]) {
+      await db.update(platformConfig)
+        .set({ value, updatedAt: new Date() })
+        .where(eq(platformConfig.key, key));
     } else {
-      db.insert(platformConfig).values({ key, value }).run();
+      await db.insert(platformConfig).values({ key, value });
     }
   },
 
   // ── Opportunities ──
-  getOpportunities(filter?: { status?: string; category?: string; pipelineStage?: string }) {
-    let q = db.select().from(opportunities).orderBy(desc(opportunities.createdAt));
-    // Filter applied in route layer for simplicity
-    return q.all();
+  async getOpportunities(filter?: { status?: string; category?: string; pipelineStage?: string }) {
+    const rows = await db.select().from(opportunities).orderBy(desc(opportunities.createdAt));
+    return rows;
   },
-  getOpportunity(id: number) {
-    return db.select().from(opportunities).where(eq(opportunities.id, id)).get();
+  async getOpportunity(id: number) {
+    const rows = await db.select().from(opportunities).where(eq(opportunities.id, id));
+    return rows[0];
   },
-  createOpportunity(data: any) {
-    const now = new Date().toISOString();
-    return db.insert(opportunities).values({ ...data, createdAt: now, updatedAt: now }).returning().get();
+  async createOpportunity(data: any) {
+    const now = new Date();
+    const result = await db.insert(opportunities).values({ ...data, createdAt: now, updatedAt: now });
+    const insertId = (result as any)[0]?.insertId;
+    if (insertId) {
+      const rows = await db.select().from(opportunities).where(eq(opportunities.id, insertId));
+      return rows[0];
+    }
+    return data;
   },
-  updateOpportunity(id: number, data: any) {
-    return db.update(opportunities).set({ ...data, updatedAt: new Date().toISOString() })
-      .where(eq(opportunities.id, id)).run();
+  async updateOpportunity(id: number, data: any) {
+    await db.update(opportunities).set({ ...data, updatedAt: new Date() })
+      .where(eq(opportunities.id, id));
   },
 
   // ── Positions ──
-  getPositions(filter: { source?: string; status?: string } = {}) {
+  async getPositions(filter: { source?: string; status?: string } = {}) {
     const conditions = [];
     if (filter.source) conditions.push(eq(activePositions.source, filter.source));
     if (filter.status) conditions.push(eq(activePositions.status, filter.status));
     const q = conditions.length > 0
       ? db.select().from(activePositions).where(and(...conditions))
       : db.select().from(activePositions);
-    return q.orderBy(desc(activePositions.createdAt)).all();
+    return await q.orderBy(desc(activePositions.createdAt));
   },
-  getPosition(id: number) {
-    return db.select().from(activePositions).where(eq(activePositions.id, id)).get();
+  async getPosition(id: number) {
+    const rows = await db.select().from(activePositions).where(eq(activePositions.id, id));
+    return rows[0];
   },
-  createPosition(data: any): ActivePosition {
-    return db.insert(activePositions).values({ ...data, createdAt: new Date().toISOString() }).returning().get();
+  async createPosition(data: any): Promise<ActivePosition> {
+    const now = new Date();
+    const result = await db.insert(activePositions).values({ ...data, createdAt: now });
+    const insertId = (result as any)[0]?.insertId;
+    const rows = await db.select().from(activePositions).where(eq(activePositions.id, insertId));
+    return rows[0]!;
   },
-  updatePosition(id: number, data: any) {
-    return db.update(activePositions).set(data).where(eq(activePositions.id, id)).run();
+  async updatePosition(id: number, data: any) {
+    await db.update(activePositions).set(data).where(eq(activePositions.id, id));
   },
 
   // ── Executions ──
-  getExecutions(filter: { source?: string } = {}) {
-    // Join with positions if needed — keep simple for now
-    return db.select().from(executions).orderBy(desc(executions.createdAt)).all();
+  async getExecutions(filter: { source?: string } = {}) {
+    return await db.select().from(executions).orderBy(desc(executions.createdAt));
   },
-  createExecution(data: any): Execution {
-    return db.insert(executions).values({ ...data, createdAt: new Date().toISOString() }).returning().get();
+  async createExecution(data: any): Promise<Execution> {
+    const now = new Date();
+    const result = await db.insert(executions).values({ ...data, createdAt: now });
+    const insertId = (result as any)[0]?.insertId;
+    const rows = await db.select().from(executions).where(eq(executions.id, insertId));
+    return rows[0]!;
   },
 
   // ── Settlements ──
-  getSettlements() {
-    return db.select().from(settlements).orderBy(desc(settlements.settledAt)).all();
+  async getSettlements() {
+    return await db.select().from(settlements).orderBy(desc(settlements.settledAt));
   },
-  createSettlement(data: any): Settlement {
-    return db.insert(settlements).values({ ...data, settledAt: new Date().toISOString() }).returning().get();
+  async createSettlement(data: any): Promise<Settlement> {
+    const now = new Date();
+    const result = await db.insert(settlements).values({ ...data, settledAt: now });
+    const insertId = (result as any)[0]?.insertId;
+    const rows = await db.select().from(settlements).where(eq(settlements.id, insertId));
+    return rows[0]!;
   },
 
   // ── Post-Mortems ──
-  getPostMortems() {
-    return db.select().from(postMortems).orderBy(desc(postMortems.createdAt)).all();
+  async getPostMortems() {
+    return await db.select().from(postMortems).orderBy(desc(postMortems.createdAt));
   },
-  createPostMortem(data: any) {
-    return db.insert(postMortems).values({ ...data, createdAt: new Date().toISOString() }).returning().get();
+  async createPostMortem(data: any) {
+    const now = new Date();
+    const result = await db.insert(postMortems).values({ ...data, createdAt: now });
+    const insertId = (result as any)[0]?.insertId;
+    const rows = await db.select().from(postMortems).where(eq(postMortems.id, insertId));
+    return rows[0];
   },
 
   // ── Audit Log ──
-  getAuditLog(limit = 200) {
-    return db.select().from(auditLog).orderBy(desc(auditLog.createdAt)).limit(limit).all();
+  async getAuditLog(limit = 200) {
+    return await db.select().from(auditLog).orderBy(desc(auditLog.createdAt)).limit(limit);
   },
-  addAuditEntry(action: string, details?: string, userId?: number) {
-    return db.insert(auditLog).values({
+  async addAuditEntry(action: string, details?: string, userId?: number) {
+    await db.insert(auditLog).values({
       action,
       details: details || null,
       userId: userId || null,
-      createdAt: new Date().toISOString(),
-    }).run();
+      createdAt: new Date(),
+    });
   },
 
   // ── Model Log ──
-  getModelLog(limit = 200, asset?: string) {
+  async getModelLog(limit = 200, asset?: string) {
     if (asset) {
-      return db.select().from(modelLog)
+      return await db.select().from(modelLog)
         .where(eq(modelLog.asset, asset))
-        .orderBy(desc(modelLog.createdAt)).limit(limit).all();
+        .orderBy(desc(modelLog.createdAt)).limit(limit);
     }
-    return db.select().from(modelLog).orderBy(desc(modelLog.createdAt)).limit(limit).all();
+    return await db.select().from(modelLog).orderBy(desc(modelLog.createdAt)).limit(limit);
   },
-  addModelLog(event: string, asset?: string, details?: string) {
-    return db.insert(modelLog).values({
+  async addModelLog(event: string, asset?: string, details?: string) {
+    await db.insert(modelLog).values({
       event,
       asset: asset || null,
       details: details || null,
-      createdAt: new Date().toISOString(),
-    }).run();
+      createdAt: new Date(),
+    });
   },
 
   // ── Strategy Performance ──
-  getStrategyPerformance(asset?: string) {
+  async getStrategyPerformance(asset?: string) {
     if (asset) {
-      return db.select().from(strategyPerformance)
-        .where(eq(strategyPerformance.asset, asset)).all();
+      return await db.select().from(strategyPerformance)
+        .where(eq(strategyPerformance.asset, asset));
     }
-    return db.select().from(strategyPerformance).all();
+    return await db.select().from(strategyPerformance);
   },
-  getOrCreateStrategyPerf(strategyName: string, asset: string): StrategyPerf {
-    let row = db.select().from(strategyPerformance)
+  async getOrCreateStrategyPerf(strategyName: string, asset: string): Promise<StrategyPerf> {
+    let rows = await db.select().from(strategyPerformance)
       .where(and(
         eq(strategyPerformance.strategyName, strategyName),
         eq(strategyPerformance.asset, asset)
-      )).get();
-    if (!row) {
-      row = db.insert(strategyPerformance).values({
-        strategyName, asset,
-        totalTrades: 0, wins: 0, losses: 0,
-        alphaWins: 1, betaLosses: 1,
-      }).returning().get();
-    }
-    return row;
+      ));
+    if (rows[0]) return rows[0];
+
+    await db.insert(strategyPerformance).values({
+      strategyName, asset,
+      totalTrades: 0, wins: 0, losses: 0,
+      alphaWins: 1, betaLosses: 1,
+    });
+    rows = await db.select().from(strategyPerformance)
+      .where(and(
+        eq(strategyPerformance.strategyName, strategyName),
+        eq(strategyPerformance.asset, asset)
+      ));
+    return rows[0]!;
   },
-  updateStrategyPerf(id: number, data: Partial<StrategyPerf>) {
-    return db.update(strategyPerformance)
-      .set({ ...data, lastUpdated: new Date().toISOString() })
-      .where(eq(strategyPerformance.id, id)).run();
+  async updateStrategyPerf(id: number, data: Partial<StrategyPerf>) {
+    await db.update(strategyPerformance)
+      .set({ ...data, lastUpdated: new Date() })
+      .where(eq(strategyPerformance.id, id));
   },
 
   // ── Performance Snapshots ──
-  getPerformanceSnapshots(source: string, limit = 100) {
-    return db.select().from(performanceSnapshots)
+  async getPerformanceSnapshots(source: string, limit = 100) {
+    return await db.select().from(performanceSnapshots)
       .where(eq(performanceSnapshots.source, source))
       .orderBy(desc(performanceSnapshots.snapshotAt))
-      .limit(limit).all();
+      .limit(limit);
   },
-  addPerformanceSnapshot(data: any) {
-    return db.insert(performanceSnapshots).values(data).run();
+  async addPerformanceSnapshot(data: any) {
+    await db.insert(performanceSnapshots).values(data);
   },
 
   // ── Memory Store ──
-  getMemory(category: string, key: string): string | undefined {
-    const row = db.select().from(memoryStore)
-      .where(and(eq(memoryStore.category, category), eq(memoryStore.key, key))).get();
-    return row?.value;
+  async getMemory(category: string, key: string): Promise<string | undefined> {
+    const rows = await db.select().from(memoryStore)
+      .where(and(eq(memoryStore.category, category), eq(memoryStore.key, key)));
+    return rows[0]?.value;
   },
-  setMemory(category: string, key: string, value: string) {
-    const existing = db.select().from(memoryStore)
-      .where(and(eq(memoryStore.category, category), eq(memoryStore.key, key))).get();
-    if (existing) {
-      db.update(memoryStore)
-        .set({ value, updatedAt: new Date().toISOString() })
-        .where(eq(memoryStore.id, existing.id)).run();
+  async setMemory(category: string, key: string, value: string) {
+    const rows = await db.select().from(memoryStore)
+      .where(and(eq(memoryStore.category, category), eq(memoryStore.key, key)));
+    if (rows[0]) {
+      await db.update(memoryStore)
+        .set({ value, updatedAt: new Date() })
+        .where(eq(memoryStore.id, rows[0].id));
     } else {
-      db.insert(memoryStore).values({ category, key, value }).run();
+      await db.insert(memoryStore).values({ category, key, value });
     }
   },
-  getMemoryByCategory(category: string): MemoryStoreEntry[] {
-    return db.select().from(memoryStore)
-      .where(eq(memoryStore.category, category)).all();
+  async getMemoryByCategory(category: string): Promise<MemoryStoreEntry[]> {
+    return await db.select().from(memoryStore)
+      .where(eq(memoryStore.category, category));
   },
 
   // ── Micro Dashboard Stats ──
-  getMicroStats() {
-    const positions = db.select().from(activePositions)
-      .where(eq(activePositions.source, "micro")).all();
+  async getMicroStats() {
+    const positions = await db.select().from(activePositions)
+      .where(eq(activePositions.source, "micro"));
     const closed = positions.filter(p => p.status === "closed" || p.status === "settled");
     const open = positions.filter(p => p.status === "open");
     const wins = closed.filter(p => (p.realizedPnl ?? 0) > 0).length;
@@ -457,36 +510,43 @@ export const storage = {
   },
 
   // ── Micro: recent trades for an asset (for cooldown/calibration) ──
-  getRecentMicroTrades(asset: string, limit = 5) {
-    return db.select().from(activePositions)
+  async getRecentMicroTrades(asset: string, limit = 5) {
+    return await db.select().from(activePositions)
       .where(and(
         eq(activePositions.source, "micro"),
         eq(activePositions.asset, asset),
         eq(activePositions.status, "settled"),
       ))
       .orderBy(desc(activePositions.closedAt))
-      .limit(limit).all();
+      .limit(limit);
   },
 
   // ── Backtest Results ──
-  saveBacktestResult(data: InsertBacktestResult): BacktestResult {
-    return db.insert(backtestResults).values(data).returning().get();
+  async saveBacktestResult(data: InsertBacktestResult): Promise<BacktestResult> {
+    const result = await db.insert(backtestResults).values(data);
+    const insertId = (result as any)[0]?.insertId;
+    const rows = await db.select().from(backtestResults).where(eq(backtestResults.id, insertId));
+    return rows[0]!;
   },
-  getLatestBacktestResults(): BacktestResult[] {
-    // Get the latest batchId
-    const latest = db.select().from(backtestResults)
+  async getLatestBacktestResults(): Promise<BacktestResult[]> {
+    const latest = await db.select().from(backtestResults)
       .orderBy(desc(backtestResults.runAt))
-      .limit(1).get();
-    if (!latest) return [];
-    return db.select().from(backtestResults)
-      .where(eq(backtestResults.batchId, latest.batchId))
-      .orderBy(desc(backtestResults.winRate))
-      .all();
+      .limit(1);
+    if (!latest[0]) return [];
+    return await db.select().from(backtestResults)
+      .where(eq(backtestResults.batchId, latest[0].batchId))
+      .orderBy(desc(backtestResults.winRate));
   },
-  getBacktestResultsByBatch(batchId: string): BacktestResult[] {
-    return db.select().from(backtestResults)
+  async getBacktestResultsByBatch(batchId: string): Promise<BacktestResult[]> {
+    return await db.select().from(backtestResults)
       .where(eq(backtestResults.batchId, batchId))
-      .orderBy(desc(backtestResults.winRate))
-      .all();
+      .orderBy(desc(backtestResults.winRate));
+  },
+
+  // ── Delete memory entry (for logout) ──
+  async deleteMemory(category: string, key: string) {
+    await db.delete(memoryStore).where(
+      and(eq(memoryStore.category, category), eq(memoryStore.key, key))
+    );
   },
 };

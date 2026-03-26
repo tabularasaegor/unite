@@ -69,8 +69,8 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
 
 const SESSION_TTL_MS = 60 * 60 * 1000; // 60 minutes
 
-function validateToken(token: string): { valid: boolean; userId?: number; username?: string } {
-  const sessionJson = storage.getMemory("auth_sessions", token);
+async function validateToken(token: string): Promise<{ valid: boolean; userId?: number; username?: string }> {
+  const sessionJson = await storage.getMemory("auth_sessions", token);
   if (!sessionJson) return { valid: false };
 
   try {
@@ -82,7 +82,7 @@ function validateToken(token: string): { valid: boolean; userId?: number; userna
     }
     // Sliding window: refresh timestamp
     session.createdAt = new Date().toISOString();
-    storage.setMemory("auth_sessions", token, JSON.stringify(session));
+    await storage.setMemory("auth_sessions", token, JSON.stringify(session));
     return { valid: true, userId: session.userId, username: session.username };
   } catch {
     return { valid: false };
@@ -91,7 +91,7 @@ function validateToken(token: string): { valid: boolean; userId?: number; userna
 
 // ─── Auth Middleware ──────────────────────────────────────────────
 
-function authMiddleware(req: Request, res: Response, next: NextFunction) {
+async function authMiddleware(req: Request, res: Response, next: NextFunction) {
   // Skip auth for auth routes
   if (
     req.path === "/api/auth/login" ||
@@ -121,7 +121,7 @@ function authMiddleware(req: Request, res: Response, next: NextFunction) {
     return res.status(401).json({ message: "Требуется авторизация" });
   }
 
-  const result = validateToken(token);
+  const result = await validateToken(token);
   if (!result.valid) {
     return res.status(401).json({ message: "Сессия истекла" });
   }
@@ -139,7 +139,7 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   // Ensure database schema exists
-  ensureSchema();
+  await ensureSchema();
 
   // Apply auth middleware to all /api/* routes
   app.use(authMiddleware);
@@ -162,29 +162,29 @@ export async function registerRoutes(
       }
 
       // Check if user exists
-      const existing = storage.getUserByUsername(username);
+      const existing = await storage.getUserByUsername(username);
       if (existing) {
         return res.status(409).json({ message: "Пользователь уже существует" });
       }
 
       const passwordHash = hashPassword(password);
-      const user = storage.createUser({ username, passwordHash });
+      const user = await storage.createUser({ username, passwordHash });
 
       // Store in registered_users memory for reference
-      storage.setMemory("registered_users", username, JSON.stringify({
+      await storage.setMemory("registered_users", username, JSON.stringify({
         userId: user.id,
         createdAt: new Date().toISOString(),
       }));
 
       // Auto-login: create session
       const token = generateToken();
-      storage.setMemory("auth_sessions", token, JSON.stringify({
+      await storage.setMemory("auth_sessions", token, JSON.stringify({
         userId: user.id,
         username: user.username,
         createdAt: new Date().toISOString(),
       }));
 
-      storage.addAuditEntry("регистрация", `Новый пользователь: ${username}`, user.id);
+      await storage.addAuditEntry("регистрация", `Новый пользователь: ${username}`, user.id);
 
       res.setHeader("Set-Cookie",
         `auth_token=${token}; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`
@@ -209,7 +209,7 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Укажите имя пользователя и пароль" });
       }
 
-      const user = storage.getUserByUsername(username);
+      const user = await storage.getUserByUsername(username);
       if (!user) {
         return res.status(401).json({ message: "Неверное имя пользователя или пароль" });
       }
@@ -220,13 +220,13 @@ export async function registerRoutes(
       }
 
       const token = generateToken();
-      storage.setMemory("auth_sessions", token, JSON.stringify({
+      await storage.setMemory("auth_sessions", token, JSON.stringify({
         userId: user.id,
         username: user.username,
         createdAt: new Date().toISOString(),
       }));
 
-      storage.addAuditEntry("вход", `Пользователь вошёл: ${username}`, user.id);
+      await storage.addAuditEntry("вход", `Пользователь вошёл: ${username}`, user.id);
 
       res.setHeader("Set-Cookie",
         `auth_token=${token}; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`
@@ -257,7 +257,7 @@ export async function registerRoutes(
       return res.json({ authenticated: false });
     }
 
-    const result = validateToken(token);
+    const result = await validateToken(token);
     if (!result.valid) {
       return res.json({ authenticated: false });
     }
@@ -281,12 +281,7 @@ export async function registerRoutes(
     if (token) {
       // Remove session from DB
       try {
-        const { db } = await import("./storage");
-        const { memoryStore } = await import("@shared/schema");
-        const { and, eq } = await import("drizzle-orm");
-        db.delete(memoryStore).where(
-          and(eq(memoryStore.category, "auth_sessions"), eq(memoryStore.key, token))
-        ).run();
+        await storage.deleteMemory("auth_sessions", token);
       } catch {}
     }
     res.setHeader("Set-Cookie", "auth_token=; Path=/; Max-Age=0");
@@ -300,7 +295,7 @@ export async function registerRoutes(
   // GET /api/config
   app.get("/api/config", async (_req: Request, res: Response) => {
     try {
-      const dbConfig = storage.getAllConfig();
+      const dbConfig = await storage.getAllConfig();
       const configMap: Record<string, string> = { ...DEFAULT_CONFIG };
 
       // Override defaults with DB values
@@ -327,7 +322,7 @@ export async function registerRoutes(
     try {
       const keys: Record<string, { set: boolean; masked: string }> = {};
       for (const key of API_KEY_FIELDS) {
-        const val = storage.getConfig(key);
+        const val = await storage.getConfig(key);
         keys[key] = {
           set: !!val && val.length > 0,
           masked: val ? maskSecret(val) : "",
@@ -345,11 +340,11 @@ export async function registerRoutes(
     try {
       const warnings: { id: string; severity: "error" | "warning" | "info"; message: string }[] = [];
 
-      const openaiKey = storage.getConfig("api_key_openai");
-      const anthropicKey = storage.getConfig("api_key_anthropic");
-      const polyKey = storage.getConfig("poly_private_key");
-      const polyAddress = storage.getConfig("poly_funder_address");
-      const paperTrading = storage.getConfig("paper_trading") ?? "true";
+      const openaiKey = await storage.getConfig("api_key_openai");
+      const anthropicKey = await storage.getConfig("api_key_anthropic");
+      const polyKey = await storage.getConfig("poly_private_key");
+      const polyAddress = await storage.getConfig("poly_funder_address");
+      const paperTrading = (await storage.getConfig("paper_trading")) ?? "true";
 
       if (!openaiKey) {
         warnings.push({
@@ -383,7 +378,7 @@ export async function registerRoutes(
       }
 
       // Check if backtest has been run
-      const backtestResults = storage.getLatestBacktestResults();
+      const backtestResults = await storage.getLatestBacktestResults();
       if (backtestResults.length === 0) {
         warnings.push({
           id: "no_backtest",
@@ -409,11 +404,11 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Укажите значение" });
       }
 
-      storage.setConfig(key, String(value));
+      await storage.setConfig(key, String(value));
 
       // Mask secrets in audit log
       const auditValue = API_KEY_FIELDS.includes(key) ? maskSecret(String(value)) : String(value);
-      storage.addAuditEntry("настройки", `${key} = ${auditValue}`, (req as any).userId);
+      await storage.addAuditEntry("настройки", `${key} = ${auditValue}`, (req as any).userId);
 
       return res.json({ ok: true, key, value: String(value) });
     } catch (err) {
@@ -427,20 +422,24 @@ export async function registerRoutes(
   // ════════════════════════════════════════════════════════════════
 
   // Micro stats/dashboard handler (shared)
-  function buildMicroStats() {
-    const stats = storage.getMicroStats();
-    const schedulerStatus = getSchedulerStatus();
-    const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || DEFAULT_CONFIG.micro_bankroll);
+  async function buildMicroStats() {
+    const stats = await storage.getMicroStats();
+    const schedulerStatus = await getSchedulerStatus();
+    const microBankroll = parseFloat((await storage.getConfig("micro_bankroll")) || DEFAULT_CONFIG.micro_bankroll);
     const windowEnd = schedulerStatus.currentWindow.endISO;
 
     // Build pnlByAsset from assetStats
     const pnlByAsset = stats.assetStats.map(a => ({ asset: a.asset.toUpperCase(), pnl: a.pnl }));
 
     // Build cumulativePnl from settled micro positions
-    const settledPositions = storage.getPositions({ source: "micro", status: "settled" });
-    const closedPositions = storage.getPositions({ source: "micro", status: "closed" });
+    const settledPositions = await storage.getPositions({ source: "micro", status: "settled" });
+    const closedPositions = await storage.getPositions({ source: "micro", status: "closed" });
     const allClosed = [...settledPositions, ...closedPositions]
-      .sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
+      .sort((a, b) => {
+        const dateA = a.closedAt ? new Date(a.closedAt).getTime() : 0;
+        const dateB = b.closedAt ? new Date(b.closedAt).getTime() : 0;
+        return dateA - dateB;
+      });
     let runningPnl = 0;
     const cumulativePnl = allClosed.map(p => {
       runningPnl += (p.realizedPnl ?? 0);
@@ -473,7 +472,7 @@ export async function registerRoutes(
   // GET /api/micro/stats — primary endpoint used by frontend
   app.get("/api/micro/stats", async (_req: Request, res: Response) => {
     try {
-      return res.json(buildMicroStats());
+      return res.json(await buildMicroStats());
     } catch (err) {
       console.error("[Micro] Stats error:", err);
       return res.status(500).json({ message: "Ошибка загрузки дашборда" });
@@ -483,7 +482,7 @@ export async function registerRoutes(
   // GET /api/micro/dashboard — alias
   app.get("/api/micro/dashboard", async (_req: Request, res: Response) => {
     try {
-      return res.json(buildMicroStats());
+      return res.json(await buildMicroStats());
     } catch (err) {
       console.error("[Micro] Dashboard error:", err);
       return res.status(500).json({ message: "Ошибка загрузки дашборда" });
@@ -495,7 +494,7 @@ export async function registerRoutes(
     try {
       const asset = req.query.asset as string | undefined;
       const limit = parseInt(req.query.limit as string || "200", 10);
-      const logs = storage.getModelLog(limit, asset || undefined);
+      const logs = await storage.getModelLog(limit, asset || undefined);
       return res.json(logs);
     } catch (err) {
       console.error("[Micro] Logs error:", err);
@@ -513,7 +512,7 @@ export async function registerRoutes(
         filter.status = status;
       }
 
-      const positions = storage.getPositions(filter);
+      const positions = await storage.getPositions(filter);
       return res.json(positions);
     } catch (err) {
       console.error("[Micro] Positions error:", err);
@@ -525,10 +524,10 @@ export async function registerRoutes(
   app.get("/api/micro/trades", async (_req: Request, res: Response) => {
     try {
       // Get all micro position IDs, then filter executions
-      const microPositions = storage.getPositions({ source: "micro" });
+      const microPositions = await storage.getPositions({ source: "micro" });
       const positionIds = new Set(microPositions.map(p => p.id));
 
-      const allExecs = storage.getExecutions();
+      const allExecs = await storage.getExecutions();
       const microExecs = allExecs.filter(e => e.positionId && positionIds.has(e.positionId));
 
       return res.json(microExecs);
@@ -541,10 +540,10 @@ export async function registerRoutes(
   // GET /api/micro/settlements
   app.get("/api/micro/settlements", async (_req: Request, res: Response) => {
     try {
-      const microPositions = storage.getPositions({ source: "micro" });
+      const microPositions = await storage.getPositions({ source: "micro" });
       const positionIds = new Set(microPositions.map(p => p.id));
 
-      const allSettlements = storage.getSettlements();
+      const allSettlements = await storage.getSettlements();
       const microSettlements = allSettlements.filter(s => positionIds.has(s.positionId));
 
       return res.json(microSettlements);
@@ -559,7 +558,7 @@ export async function registerRoutes(
     try {
       const asset = req.query.asset as string | undefined;
       const limit = parseInt(req.query.limit as string || "200", 10);
-      const logs = storage.getModelLog(limit, asset || undefined);
+      const logs = await storage.getModelLog(limit, asset || undefined);
       return res.json(logs);
     } catch (err) {
       console.error("[Micro] Model log error:", err);
@@ -571,7 +570,7 @@ export async function registerRoutes(
   app.get("/api/micro/strategy-performance", async (req: Request, res: Response) => {
     try {
       const asset = req.query.asset as string | undefined;
-      const perf = storage.getStrategyPerformance(asset || undefined);
+      const perf = await storage.getStrategyPerformance(asset || undefined);
       return res.json(perf);
     } catch (err) {
       console.error("[Micro] Strategy performance error:", err);
@@ -624,21 +623,20 @@ export async function registerRoutes(
   // ════════════════════════════════════════════════════════════════
 
   // Pipeline stats builder — returns shape expected by frontend PipelineStats interface
-  function buildPipelineStats() {
-    const dashboard = getPipelineDashboard();
+  async function buildPipelineStats() {
+    const dashboard = await getPipelineDashboard();
     return {
+      ...dashboard,
       scanCount: dashboard.stageBreakdown.scanned || 0,
       researchCount: dashboard.stageBreakdown.researched || 0,
       positionCount: dashboard.openPositions + dashboard.closedPositions,
-      totalPnl: dashboard.totalPnl,
-      ...dashboard,
     };
   }
 
   // GET /api/pipeline/stats — primary endpoint for frontend
   app.get("/api/pipeline/stats", async (_req: Request, res: Response) => {
     try {
-      return res.json(buildPipelineStats());
+      return res.json(await buildPipelineStats());
     } catch (err) {
       console.error("[Pipeline] Stats error:", err);
       return res.status(500).json({ message: "Ошибка загрузки статистики пайплайна" });
@@ -648,7 +646,7 @@ export async function registerRoutes(
   // GET /api/pipeline/dashboard — alias
   app.get("/api/pipeline/dashboard", async (_req: Request, res: Response) => {
     try {
-      return res.json(buildPipelineStats());
+      return res.json(await buildPipelineStats());
     } catch (err) {
       console.error("[Pipeline] Dashboard error:", err);
       return res.status(500).json({ message: "Ошибка загрузки дашборда пайплайна" });
@@ -656,8 +654,8 @@ export async function registerRoutes(
   });
 
   // Shared opportunities handler
-  function filterOpportunities(query: { stage?: string; category?: string; status?: string; limit?: string }) {
-    const allOpps = storage.getOpportunities();
+  async function filterOpportunities(query: { stage?: string; category?: string; status?: string; limit?: string }) {
+    const allOpps = await storage.getOpportunities();
     let filtered = allOpps;
     if (query.stage) filtered = filtered.filter(o => o.pipelineStage === query.stage);
     if (query.category) filtered = filtered.filter(o => o.category === query.category);
@@ -669,7 +667,7 @@ export async function registerRoutes(
   // GET /api/opportunities — used by frontend (scanner, pipeline-dashboard, opportunities pages)
   app.get("/api/opportunities", async (req: Request, res: Response) => {
     try {
-      return res.json(filterOpportunities(req.query as any));
+      return res.json(await filterOpportunities(req.query as any));
     } catch (err) {
       console.error("[Pipeline] Opportunities error:", err);
       return res.status(500).json({ message: "Ошибка загрузки возможностей" });
@@ -679,7 +677,7 @@ export async function registerRoutes(
   // GET /api/pipeline/opportunities — alias
   app.get("/api/pipeline/opportunities", async (req: Request, res: Response) => {
     try {
-      return res.json(filterOpportunities(req.query as any));
+      return res.json(await filterOpportunities(req.query as any));
     } catch (err) {
       console.error("[Pipeline] Opportunities error:", err);
       return res.status(500).json({ message: "Ошибка загрузки возможностей" });
@@ -707,7 +705,7 @@ export async function registerRoutes(
       const id = parseInt(req.params.id as string, 10);
       if (isNaN(id)) return res.status(400).json({ message: "Неверный ID" });
 
-      const opp = storage.getOpportunity(id);
+      const opp = await storage.getOpportunity(id);
       if (!opp) return res.status(404).json({ message: "Возможность не найдена" });
 
       // Stage progression
@@ -717,8 +715,8 @@ export async function registerRoutes(
         ? stageOrder[currentIdx + 1]
         : opp.pipelineStage;
 
-      storage.updateOpportunity(id, { pipelineStage: nextStage });
-      storage.addAuditEntry("пайплайн", `Возможность #${id} переведена на стадию: ${nextStage}`, (req as any).userId);
+      await storage.updateOpportunity(id, { pipelineStage: nextStage });
+      await storage.addAuditEntry("пайплайн", `Возможность #${id} переведена на стадию: ${nextStage}`, (req as any).userId);
 
       return res.json({ ok: true, stage: nextStage });
     } catch (err) {
@@ -734,7 +732,7 @@ export async function registerRoutes(
       const filter: { source: string; status?: string } = { source: "pipeline" };
       if (status && status !== "all") filter.status = status;
 
-      const positions = storage.getPositions(filter);
+      const positions = await storage.getPositions(filter);
       return res.json(positions);
     } catch (err) {
       console.error("[Pipeline] Positions error:", err);
@@ -745,10 +743,10 @@ export async function registerRoutes(
   // GET /api/pipeline/trades
   app.get("/api/pipeline/trades", async (_req: Request, res: Response) => {
     try {
-      const pipelinePositions = storage.getPositions({ source: "pipeline" });
+      const pipelinePositions = await storage.getPositions({ source: "pipeline" });
       const positionIds = new Set(pipelinePositions.map(p => p.id));
 
-      const allExecs = storage.getExecutions();
+      const allExecs = await storage.getExecutions();
       const pipelineExecs = allExecs.filter(e => e.positionId && positionIds.has(e.positionId));
 
       return res.json(pipelineExecs);
@@ -761,10 +759,10 @@ export async function registerRoutes(
   // GET /api/pipeline/settlements
   app.get("/api/pipeline/settlements", async (_req: Request, res: Response) => {
     try {
-      const pipelinePositions = storage.getPositions({ source: "pipeline" });
+      const pipelinePositions = await storage.getPositions({ source: "pipeline" });
       const positionIds = new Set(pipelinePositions.map(p => p.id));
 
-      const allSettlements = storage.getSettlements();
+      const allSettlements = await storage.getSettlements();
       const pipelineSettlements = allSettlements.filter(s => positionIds.has(s.positionId));
 
       return res.json(pipelineSettlements);
@@ -777,7 +775,7 @@ export async function registerRoutes(
   // GET /api/pipeline/postmortems
   app.get("/api/pipeline/postmortems", async (_req: Request, res: Response) => {
     try {
-      const postMortems = storage.getPostMortems();
+      const postMortems = await storage.getPostMortems();
       return res.json(postMortems);
     } catch (err) {
       console.error("[Pipeline] Post-mortems error:", err);
@@ -797,7 +795,7 @@ export async function registerRoutes(
       const filter: { source?: string; status?: string } = {};
       if (source) filter.source = source;
       if (status && status !== "all") filter.status = status;
-      return res.json(storage.getPositions(filter));
+      return res.json(await storage.getPositions(filter));
     } catch (err) {
       console.error("[Positions] Error:", err);
       return res.status(500).json({ message: "Ошибка загрузки позиций" });
@@ -809,12 +807,12 @@ export async function registerRoutes(
     try {
       const source = req.query.source as string | undefined;
       if (source) {
-        const positions = storage.getPositions({ source });
+        const positions = await storage.getPositions({ source });
         const positionIds = new Set(positions.map(p => p.id));
-        const allExecs = storage.getExecutions();
+        const allExecs = await storage.getExecutions();
         return res.json(allExecs.filter(e => e.positionId && positionIds.has(e.positionId)));
       }
-      return res.json(storage.getExecutions());
+      return res.json(await storage.getExecutions());
     } catch (err) {
       console.error("[Executions] Error:", err);
       return res.status(500).json({ message: "Ошибка загрузки сделок" });
@@ -826,12 +824,12 @@ export async function registerRoutes(
     try {
       const source = req.query.source as string | undefined;
       if (source) {
-        const positions = storage.getPositions({ source });
+        const positions = await storage.getPositions({ source });
         const positionIds = new Set(positions.map(p => p.id));
-        const allSettlements = storage.getSettlements();
+        const allSettlements = await storage.getSettlements();
         return res.json(allSettlements.filter(s => positionIds.has(s.positionId)));
       }
-      return res.json(storage.getSettlements());
+      return res.json(await storage.getSettlements());
     } catch (err) {
       console.error("[Settlements] Error:", err);
       return res.status(500).json({ message: "Ошибка загрузки расчётов" });
@@ -841,7 +839,7 @@ export async function registerRoutes(
   // GET /api/postmortems — alias for pipeline postmortems
   app.get("/api/postmortems", async (_req: Request, res: Response) => {
     try {
-      return res.json(storage.getPostMortems());
+      return res.json(await storage.getPostMortems());
     } catch (err) {
       console.error("[PostMortems] Error:", err);
       return res.status(500).json({ message: "Ошибка загрузки пост-мортемов" });
@@ -851,16 +849,16 @@ export async function registerRoutes(
   // GET /api/risk/stats — risk console stats
   app.get("/api/risk/stats", async (_req: Request, res: Response) => {
     try {
-      const bankroll = parseFloat(storage.getConfig("bankroll") || DEFAULT_CONFIG.bankroll);
-      const maxPosition = parseFloat(storage.getConfig("max_position") || "500");
-      const maxDrawdownPct = parseFloat(storage.getConfig("max_drawdown") || "20");
+      const bankroll = parseFloat((await storage.getConfig("bankroll")) || DEFAULT_CONFIG.bankroll);
+      const maxPosition = parseFloat((await storage.getConfig("max_position")) || "500");
+      const maxDrawdownPct = parseFloat((await storage.getConfig("max_drawdown")) || "20");
 
       // Calculate allocated capital from open positions
-      const openPositions = storage.getPositions({ status: "open" });
+      const openPositions = await storage.getPositions({ status: "open" });
       const allocated = openPositions.reduce((s, p) => s + (p.size ?? 0), 0);
 
       // Calculate current drawdown from settled positions
-      const allPositions = storage.getPositions({});
+      const allPositions = await storage.getPositions({});
       const settled = allPositions.filter(p => p.status === "settled" || p.status === "closed");
       const totalPnl = settled.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
       const drawdown = totalPnl < 0 ? Math.abs(totalPnl) : 0;
@@ -897,11 +895,11 @@ export async function registerRoutes(
     try {
       const { windows } = req.body || {};
       const numWindows = Math.max(100, Math.min(10000, windows || 2000));
-      const result = runBacktest(numWindows);
+      const result = await runBacktest(numWindows);
 
       // Auto-apply backtest results as Thompson Sampling priors
-      applyBacktestPriors(result.results);
-      storage.addAuditEntry(
+      await applyBacktestPriors(result.results);
+      await storage.addAuditEntry(
         "бэктест",
         `Бэктест ${numWindows} окон завершён, лучшая модель: ${result.bestModel} (${((result.results[0]?.winRate || 0) * 100).toFixed(1)}%), приоры Thompson Sampling обновлены`,
         (req as any).userId
@@ -917,7 +915,7 @@ export async function registerRoutes(
   // POST /api/backtest/apply-priors — re-apply latest backtest to Thompson Sampling
   app.post("/api/backtest/apply-priors", async (req: Request, res: Response) => {
     try {
-      const backtestResults = storage.getLatestBacktestResults();
+      const backtestResults = await storage.getLatestBacktestResults();
       if (backtestResults.length === 0) {
         return res.status(404).json({ message: "Нет результатов бэктеста" });
       }
@@ -931,7 +929,7 @@ export async function registerRoutes(
       }));
 
       applyBacktestPriors(parsed);
-      storage.addAuditEntry("бэктест", "Приоры Thompson Sampling переприменены из последнего бэктеста", (req as any).userId);
+      await storage.addAuditEntry("бэктест", "Приоры Thompson Sampling переприменены из последнего бэктеста", (req as any).userId);
 
       return res.json({ ok: true, applied: parsed.length });
     } catch (err) {
@@ -943,7 +941,7 @@ export async function registerRoutes(
   // GET /api/backtest/results
   app.get("/api/backtest/results", async (_req: Request, res: Response) => {
     try {
-      const results = storage.getLatestBacktestResults();
+      const results = await storage.getLatestBacktestResults();
       if (results.length === 0) {
         return res.json({ results: [], bestModel: null, timestamp: null });
       }
@@ -972,7 +970,7 @@ export async function registerRoutes(
   app.get("/api/audit", async (req: Request, res: Response) => {
     try {
       const limit = parseInt(req.query.limit as string || "200", 10);
-      const logs = storage.getAuditLog(limit);
+      const logs = await storage.getAuditLog(limit);
       return res.json(logs);
     } catch (err) {
       console.error("[Audit] Error:", err);
@@ -985,7 +983,7 @@ export async function registerRoutes(
     try {
       const source = (req.query.source as string) || "micro";
       const limit = parseInt(req.query.limit as string || "100", 10);
-      const snapshots = storage.getPerformanceSnapshots(source, limit);
+      const snapshots = await storage.getPerformanceSnapshots(source, limit);
       return res.json(snapshots);
     } catch (err) {
       console.error("[Performance] Snapshots error:", err);

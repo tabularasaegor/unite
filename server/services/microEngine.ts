@@ -284,13 +284,13 @@ function ciLowerBound(alpha: number, beta: number): number {
  * Select a strategy for a given asset using Thompson Sampling.
  * Returns the chosen strategy name (or "skip").
  */
-function selectStrategyByThompson(asset: Asset): string {
+async function selectStrategyByThompson(asset: Asset): Promise<string> {
   const now = Date.now();
   let bestSample = -1;
   let bestStrategy = "skip";
 
   // Sample from "skip" arm — starts at Beta(1,1)
-  const skipPerf = storage.getOrCreateStrategyPerf("skip", asset);
+  const skipPerf = await storage.getOrCreateStrategyPerf("skip", asset);
   const skipSample = sampleBeta(skipPerf.alphaWins, skipPerf.betaLosses);
 
   bestSample = skipSample;
@@ -305,16 +305,16 @@ function selectStrategyByThompson(asset: Asset): string {
     } else if (disableExpiry && now >= disableExpiry) {
       // Re-enable
       strategyDisabled.delete(disableKey);
-      storage.addModelLog("MODEL_REENABLE", asset, `Re-enabled ${stratName} after cooldown`);
+      await storage.addModelLog("MODEL_REENABLE", asset, `Re-enabled ${stratName} after cooldown`);
     }
 
-    const perf = storage.getOrCreateStrategyPerf(stratName, asset);
+    const perf = await storage.getOrCreateStrategyPerf(stratName, asset);
 
     // Quality control: check 95% CI lower bound
     const ciLower = ciLowerBound(perf.alphaWins, perf.betaLosses);
     if (perf.totalTrades >= 10 && ciLower < CI_LOWER_THRESHOLD) {
       strategyDisabled.set(disableKey, now + DISABLE_COOLDOWN_MS);
-      storage.addModelLog(
+      await storage.addModelLog(
         "MODEL_DISABLE",
         asset,
         `Disabled ${stratName}: CI lower ${ciLower.toFixed(4)} < ${CI_LOWER_THRESHOLD}`
@@ -334,17 +334,17 @@ function selectStrategyByThompson(asset: Asset): string {
 
 // ─── Bet Sizing ──────────────────────────────────────────────────
 
-function getBetSizeMultiplier(): number {
-  const stored = storage.getMemory("micro_state", "betSizeMultiplier");
+async function getBetSizeMultiplier(): Promise<number> {
+  const stored = await storage.getMemory("micro_state", "betSizeMultiplier");
   return stored ? Math.max(BET_SIZE_MIN, Math.min(BET_SIZE_MAX, parseFloat(stored))) : 1.0;
 }
 
-function setBetSizeMultiplier(val: number) {
+async function setBetSizeMultiplier(val: number) {
   const clamped = Math.max(BET_SIZE_MIN, Math.min(BET_SIZE_MAX, val));
-  storage.setMemory("micro_state", "betSizeMultiplier", clamped.toString());
+  await storage.setMemory("micro_state", "betSizeMultiplier", clamped.toString());
 }
 
-function computeBetSize(confidence: number, maxBet: number): number {
+async function computeBetSize(confidence: number, maxBet: number): Promise<number> {
   const edge = confidence - 0.5;
   let basePct: number;
   if (edge < 0.02) basePct = 0.25;
@@ -352,12 +352,12 @@ function computeBetSize(confidence: number, maxBet: number): number {
   else if (edge < 0.10) basePct = 0.75;
   else basePct = 1.0;
 
-  const multiplier = getBetSizeMultiplier();
+  const multiplier = await getBetSizeMultiplier();
   const size = maxBet * basePct * multiplier;
 
   // Check drawdown brake
-  const stats = storage.getMicroStats();
-  const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || "200");
+  const stats = await storage.getMicroStats();
+  const microBankroll = parseFloat(await storage.getConfig("micro_bankroll") || "200");
   const currentBankroll = microBankroll + stats.totalPnl;
   if (sessionPeakBankroll === 0) sessionPeakBankroll = currentBankroll;
   if (currentBankroll > sessionPeakBankroll) sessionPeakBankroll = currentBankroll;
@@ -371,25 +371,25 @@ function computeBetSize(confidence: number, maxBet: number): number {
 
 // ─── Config Helpers ──────────────────────────────────────────────
 
-function getConfigValue(key: string, defaultVal: string): string {
-  return storage.getConfig(key) || defaultVal;
+async function getConfigValue(key: string, defaultVal: string): Promise<string> {
+  return await storage.getConfig(key) || defaultVal;
 }
 
-function getEnabledAssets(): Asset[] {
-  const raw = getConfigValue("micro_assets", "btc,eth,sol,xrp");
+async function getEnabledAssets(): Promise<Asset[]> {
+  const raw = await getConfigValue("micro_assets", "btc,eth,sol,xrp");
   return raw.split(",").map(s => s.trim().toLowerCase()) as Asset[];
 }
 
-function getConfidenceThreshold(): number {
-  return parseFloat(getConfigValue("confidence_threshold", "0.52"));
+async function getConfidenceThreshold(): Promise<number> {
+  return parseFloat(await getConfigValue("confidence_threshold", "0.52"));
 }
 
-function getMaxBet(): number {
-  return parseFloat(getConfigValue("micro_max_bet", "20"));
+async function getMaxBet(): Promise<number> {
+  return parseFloat(await getConfigValue("micro_max_bet", "20"));
 }
 
-function isPaperTrading(): boolean {
-  return getConfigValue("paper_trading", "true") === "true";
+async function isPaperTrading(): Promise<boolean> {
+  return await getConfigValue("paper_trading", "true") === "true";
 }
 
 // ─── Run Strategy Signal ─────────────────────────────────────────
@@ -433,21 +433,21 @@ async function processNewWindow() {
 
   windowState.lastProcessedWindowEnd = windowEnd;
 
-  const assets = getEnabledAssets();
-  const threshold = getConfidenceThreshold();
-  const maxBet = getMaxBet();
+  const assets = await getEnabledAssets();
+  const threshold = await getConfidenceThreshold();
+  const maxBet = await getMaxBet();
 
   for (const asset of assets) {
     try {
       // Check asset cooldown
       const cooldownExpiry = assetCooldowns.get(asset);
       if (cooldownExpiry && Date.now() < cooldownExpiry) {
-        storage.addModelLog("ASSET_COOLDOWN", asset, `Asset on cooldown until ${new Date(cooldownExpiry).toISOString()}`);
+        await storage.addModelLog("ASSET_COOLDOWN", asset, `Asset on cooldown until ${new Date(cooldownExpiry).toISOString()}`);
         continue;
       }
 
       // Check if we already have an open position for this window+asset
-      const existingPositions = storage.getPositions({ source: "micro", status: "open" });
+      const existingPositions = await storage.getPositions({ source: "micro", status: "open" });
       const alreadyTraded = existingPositions.some(
         p => p.asset === asset && p.windowEnd === windowEnd
       );
@@ -457,11 +457,11 @@ async function processNewWindow() {
       const slug = `${asset}-updown-5m-${windowEnd}`;
       const event = await fetchEventBySlug(slug);
       if (!event) {
-        storage.addModelLog("EVENT_NOT_FOUND", asset, `No event for slug ${slug}`);
+        await storage.addModelLog("EVENT_NOT_FOUND", asset, `No event for slug ${slug}`);
         continue;
       }
       if (!event.acceptingOrders) {
-        storage.addModelLog("NOT_ACCEPTING", asset, `Event ${slug} not accepting orders`);
+        await storage.addModelLog("NOT_ACCEPTING", asset, `Event ${slug} not accepting orders`);
         continue;
       }
 
@@ -471,10 +471,10 @@ async function processNewWindow() {
       const downPct = midpoints[event.downTokenId] || 0.5;
 
       // Thompson Sampling: select strategy
-      const selectedStrategy = selectStrategyByThompson(asset);
+      const selectedStrategy = await selectStrategyByThompson(asset);
 
       if (selectedStrategy === "skip") {
-        storage.addModelLog("SKIP", asset, `Thompson selected SKIP for window ${windowEnd}`);
+        await storage.addModelLog("SKIP", asset, `Thompson selected SKIP for window ${windowEnd}`);
         continue;
       }
 
@@ -482,30 +482,30 @@ async function processNewWindow() {
       const signal = await runStrategy(selectedStrategy, asset, event, upPct, downPct);
 
       if (signal.direction === "skip") {
-        storage.addModelLog("STRATEGY_SKIP", asset,
+        await storage.addModelLog("STRATEGY_SKIP", asset,
           `${selectedStrategy} returned skip for window ${windowEnd}`);
         continue;
       }
 
       if (signal.confidence < threshold) {
-        storage.addModelLog("LOW_CONFIDENCE", asset,
+        await storage.addModelLog("LOW_CONFIDENCE", asset,
           `${selectedStrategy}: confidence ${signal.confidence.toFixed(4)} < threshold ${threshold}`);
         continue;
       }
 
       // Compute bet size
-      const betSize = computeBetSize(signal.confidence, maxBet);
+      const betSize = await computeBetSize(signal.confidence, maxBet);
 
       // Determine entry price (paper mode: use midpoint)
       const entryPrice = signal.direction === "up" ? upPct : downPct;
       if (entryPrice <= 0 || entryPrice >= 1) {
-        storage.addModelLog("BAD_PRICE", asset,
+        await storage.addModelLog("BAD_PRICE", asset,
           `Entry price ${entryPrice} out of range for ${selectedStrategy}`);
         continue;
       }
 
       // Create position
-      const position = storage.createPosition({
+      const position = await storage.createPosition({
         side: signal.direction,
         entryPrice,
         currentPrice: entryPrice,
@@ -521,9 +521,9 @@ async function processNewWindow() {
       });
 
       // Create execution record
-      storage.createExecution({
+      await storage.createExecution({
         positionId: position.id,
-        type: isPaperTrading() ? "paper" : "live",
+        type: await isPaperTrading() ? "paper" : "live",
         side: signal.direction,
         price: entryPrice,
         size: betSize,
@@ -533,7 +533,7 @@ async function processNewWindow() {
       // Add to pending settlement
       windowState.pendingSettlement.add(windowEnd);
 
-      storage.addModelLog("TRADE_OPEN", asset,
+      await storage.addModelLog("TRADE_OPEN", asset,
         JSON.stringify({
           positionId: position.id,
           strategy: selectedStrategy,
@@ -547,13 +547,13 @@ async function processNewWindow() {
         })
       );
 
-      storage.addAuditEntry("микро_сделка",
+      await storage.addAuditEntry("микро_сделка",
         `${asset.toUpperCase()} ${signal.direction} $${betSize} @ ${entryPrice.toFixed(4)} через ${selectedStrategy}`
       );
 
     } catch (err) {
       console.error(`[MicroEngine] Error processing ${asset}:`, err);
-      storage.addModelLog("ERROR", asset, `Trade open error: ${String(err)}`);
+      await storage.addModelLog("ERROR", asset, `Trade open error: ${String(err)}`);
     }
   }
 }
@@ -564,7 +564,7 @@ async function settleClosedWindows() {
   const now = Math.floor(Date.now() / 1000);
 
   // Find all open micro positions whose window has ended
-  const openPositions = storage.getPositions({ source: "micro", status: "open" });
+  const openPositions = await storage.getPositions({ source: "micro", status: "open" });
 
   for (const pos of openPositions) {
     if (!pos.windowEnd || !pos.slug || !pos.asset) continue;
@@ -590,7 +590,7 @@ async function settleClosedWindows() {
         outcome = resolved.finalPrice >= resolved.priceToBeat ? "up" : "down";
       } else if (forceSettle) {
         // Force settle: check last trade price or assume loss
-        storage.addModelLog("FORCE_SETTLE", pos.asset, `Force-settling position ${pos.id} after timeout`);
+        await storage.addModelLog("FORCE_SETTLE", pos.asset, `Force-settling position ${pos.id} after timeout`);
         outcome = "unknown";
       }
 
@@ -611,14 +611,14 @@ async function settleClosedWindows() {
       pnl = Math.round(pnl * 100) / 100;
 
       // Update position
-      storage.updatePosition(pos.id, {
+      await storage.updatePosition(pos.id, {
         status: "settled",
         realizedPnl: pnl,
         closedAt: new Date().toISOString(),
       });
 
       // Create settlement
-      storage.createSettlement({
+      await storage.createSettlement({
         positionId: pos.id,
         outcome: outcome,
         realizedPnl: pnl,
@@ -627,26 +627,26 @@ async function settleClosedWindows() {
 
       // Update strategy performance
       if (pos.strategyUsed && outcome !== "unknown") {
-        updateStrategyPerformance(pos.strategyUsed, pos.asset, wasCorrect);
+        await updateStrategyPerformance(pos.strategyUsed, pos.asset, wasCorrect);
       }
 
       // Update bet size multiplier
       if (outcome !== "unknown") {
-        const currentMult = getBetSizeMultiplier();
+        const currentMult = await getBetSizeMultiplier();
         if (wasCorrect) {
-          setBetSizeMultiplier(currentMult + BET_SIZE_WIN_DELTA);
+          await setBetSizeMultiplier(currentMult + BET_SIZE_WIN_DELTA);
         } else {
-          setBetSizeMultiplier(currentMult - BET_SIZE_LOSS_DELTA);
+          await setBetSizeMultiplier(currentMult - BET_SIZE_LOSS_DELTA);
         }
       }
 
       // Check asset cooldown
-      checkAssetCooldown(pos.asset as Asset);
+      await checkAssetCooldown(pos.asset as Asset);
 
       // Snapshot performance
-      snapshotPerformance();
+      await snapshotPerformance();
 
-      storage.addModelLog("TRADE_SETTLED", pos.asset,
+      await storage.addModelLog("TRADE_SETTLED", pos.asset,
         JSON.stringify({
           positionId: pos.id,
           strategy: pos.strategyUsed,
@@ -658,21 +658,21 @@ async function settleClosedWindows() {
         })
       );
 
-      storage.addAuditEntry("микро_расчёт",
+      await storage.addAuditEntry("микро_расчёт",
         `${pos.asset?.toUpperCase()} ${pos.side} → ${outcome}: ${wasCorrect ? "ВЫИГРЫШ" : "ПРОИГРЫШ"} $${pnl.toFixed(2)}`
       );
 
     } catch (err) {
       console.error(`[MicroEngine] Settlement error for position ${pos.id}:`, err);
-      storage.addModelLog("ERROR", pos.asset, `Settlement error: ${String(err)}`);
+      await storage.addModelLog("ERROR", pos.asset, `Settlement error: ${String(err)}`);
     }
   }
 }
 
 // ─── Strategy Performance Update ─────────────────────────────────
 
-function updateStrategyPerformance(strategyName: string, asset: string, won: boolean) {
-  const perf = storage.getOrCreateStrategyPerf(strategyName, asset);
+async function updateStrategyPerformance(strategyName: string, asset: string, won: boolean) {
+  const perf = await storage.getOrCreateStrategyPerf(strategyName, asset);
 
   // Update wins/losses
   const newWins = perf.wins + (won ? 1 : 0);
@@ -683,7 +683,7 @@ function updateStrategyPerformance(strategyName: string, asset: string, won: boo
   const newAlpha = perf.alphaWins + (won ? 1 : 0);
   const newBeta = perf.betaLosses + (won ? 0 : 1);
 
-  storage.updateStrategyPerf(perf.id, {
+  await storage.updateStrategyPerf(perf.id, {
     totalTrades: newTotal,
     wins: newWins,
     losses: newLosses,
@@ -692,13 +692,13 @@ function updateStrategyPerformance(strategyName: string, asset: string, won: boo
   });
 
   // Apply discounting to ALL strategies for this asset
-  applyDiscounting(asset);
+  await applyDiscounting(asset);
 }
 
-function applyDiscounting(asset: string) {
-  const allPerf = storage.getStrategyPerformance(asset);
+async function applyDiscounting(asset: string) {
+  const allPerf = await storage.getStrategyPerformance(asset);
   for (const perf of allPerf) {
-    storage.updateStrategyPerf(perf.id, {
+    await storage.updateStrategyPerf(perf.id, {
       alphaWins: perf.alphaWins * DISCOUNT_LAMBDA,
       betaLosses: perf.betaLosses * DISCOUNT_LAMBDA,
     });
@@ -707,8 +707,8 @@ function applyDiscounting(asset: string) {
 
 // ─── Cooldown & Quality Control ──────────────────────────────────
 
-function checkAssetCooldown(asset: Asset) {
-  const recent = storage.getRecentMicroTrades(asset, COOLDOWN_LOOKBACK);
+async function checkAssetCooldown(asset: Asset) {
+  const recent = await storage.getRecentMicroTrades(asset, COOLDOWN_LOOKBACK);
   if (recent.length < COOLDOWN_LOOKBACK) return;
 
   const wins = recent.filter(p => (p.realizedPnl ?? 0) > 0).length;
@@ -717,7 +717,7 @@ function checkAssetCooldown(asset: Asset) {
   if (wr < COOLDOWN_WR_THRESHOLD) {
     const expiry = Date.now() + COOLDOWN_DURATION_MS;
     assetCooldowns.set(asset, expiry);
-    storage.addModelLog("ASSET_COOLDOWN_SET", asset,
+    await storage.addModelLog("ASSET_COOLDOWN_SET", asset,
       `WR ${(wr * 100).toFixed(1)}% < ${COOLDOWN_WR_THRESHOLD * 100}% over last ${COOLDOWN_LOOKBACK} — cooldown until ${new Date(expiry).toISOString()}`
     );
   }
@@ -725,11 +725,11 @@ function checkAssetCooldown(asset: Asset) {
 
 // ─── Performance Snapshot ────────────────────────────────────────
 
-function snapshotPerformance() {
-  const stats = storage.getMicroStats();
-  const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || "200");
+async function snapshotPerformance() {
+  const stats = await storage.getMicroStats();
+  const microBankroll = parseFloat(await storage.getConfig("micro_bankroll") || "200");
 
-  storage.addPerformanceSnapshot({
+  await storage.addPerformanceSnapshot({
     source: "micro",
     bankroll: microBankroll + stats.totalPnl,
     totalPnl: stats.totalPnl,
@@ -740,14 +740,14 @@ function snapshotPerformance() {
 
 // ─── Calibration from History ────────────────────────────────────
 
-export function calibrateFromHistory() {
+export async function calibrateFromHistory() {
   console.log("[MicroEngine] Calibrating from historical data...");
 
   const assets: Asset[] = ["btc", "eth", "sol", "xrp"];
 
   // Reset strategy performance from settled positions
   for (const asset of assets) {
-    const settled = storage.getPositions({ source: "micro", status: "settled" })
+    const settled = (await storage.getPositions({ source: "micro", status: "settled" }))
       .filter(p => p.asset === asset);
 
     // Group by strategy
@@ -762,11 +762,11 @@ export function calibrateFromHistory() {
 
     // Update strategy performance with counts
     for (const [strat, counts] of Object.entries(stratCounts)) {
-      const perf = storage.getOrCreateStrategyPerf(strat, asset);
+      const perf = await storage.getOrCreateStrategyPerf(strat, asset);
       // Apply discount to historical data proportional to age
       const alpha = 1 + counts.wins * 0.9; // Slight discount for historical
       const beta = 1 + counts.losses * 0.9;
-      storage.updateStrategyPerf(perf.id, {
+      await storage.updateStrategyPerf(perf.id, {
         totalTrades: counts.wins + counts.losses,
         wins: counts.wins,
         losses: counts.losses,
@@ -776,28 +776,28 @@ export function calibrateFromHistory() {
     }
 
     // Recalculate bet size multiplier from trailing wins/losses
-    const recentTrades = storage.getRecentMicroTrades(asset, 10);
+    const recentTrades = await storage.getRecentMicroTrades(asset, 10);
     const recentWins = recentTrades.filter(p => (p.realizedPnl ?? 0) > 0).length;
     const recentTotal = recentTrades.length;
     if (recentTotal >= 5) {
       const wr = recentWins / recentTotal;
       const mult = 0.5 + wr; // e.g. 60% WR → 1.1x
-      setBetSizeMultiplier(Math.max(BET_SIZE_MIN, Math.min(BET_SIZE_MAX, mult)));
+      await setBetSizeMultiplier(Math.max(BET_SIZE_MIN, Math.min(BET_SIZE_MAX, mult)));
     }
 
     // Check cooldowns
-    checkAssetCooldown(asset);
+    await checkAssetCooldown(asset);
   }
 
-  storage.addModelLog("CALIBRATION_AUDIT", undefined,
+  await storage.addModelLog("CALIBRATION_AUDIT", undefined,
     JSON.stringify({
-      betSizeMultiplier: getBetSizeMultiplier(),
+      betSizeMultiplier: await getBetSizeMultiplier(),
       cooldowns: Object.fromEntries(assetCooldowns),
       disabledStrategies: Object.fromEntries(strategyDisabled),
     })
   );
 
-  storage.addAuditEntry("калибровка", "Микро-движок откалиброван по историческим данным");
+  await storage.addAuditEntry("калибровка", "Микро-движок откалиброван по историческим данным");
   console.log("[MicroEngine] Calibration complete.");
 }
 
@@ -810,7 +810,7 @@ export function calibrateFromHistory() {
  * Scale factor 0.3 gives the backtest ~30% weight of real data.
  * Applied to ALL 4 assets equally (backtest is asset-agnostic).
  */
-export function applyBacktestPriors(
+export async function applyBacktestPriors(
   results: { strategyName: string; winRate: number; totalTrades: number; wins: number; losses: number }[]
 ) {
   const PRIOR_SCALE = 0.3; // How much to weight backtest vs real experience
@@ -829,7 +829,7 @@ export function applyBacktestPriors(
     const newBeta = 1 + scaledLosses;
 
     for (const asset of assets) {
-      const perf = storage.getOrCreateStrategyPerf(result.strategyName, asset);
+      const perf = await storage.getOrCreateStrategyPerf(result.strategyName, asset);
 
       // Only apply priors if there are fewer than 20 real trades
       // (once enough real data exists, backtest priors become irrelevant)
@@ -840,7 +840,7 @@ export function applyBacktestPriors(
         continue;
       }
 
-      storage.updateStrategyPerf(perf.id, {
+      await storage.updateStrategyPerf(perf.id, {
         alphaWins: newAlpha + (perf.totalTrades > 0 ? perf.wins : 0),
         betaLosses: newBeta + (perf.totalTrades > 0 ? perf.losses : 0),
       });
@@ -854,7 +854,7 @@ export function applyBacktestPriors(
     }
   }
 
-  storage.addModelLog(
+  await storage.addModelLog(
     "PRIORS_APPLIED",
     undefined,
     `Backtest priors applied for ${results.filter(r => microStrategyNames.has(r.strategyName)).length} strategies`
@@ -874,18 +874,18 @@ export async function runMicroTick() {
     await processNewWindow();
   } catch (err) {
     console.error("[MicroEngine] Tick error:", err);
-    storage.addModelLog("TICK_ERROR", undefined, String(err));
+    await storage.addModelLog("TICK_ERROR", undefined, String(err));
   }
 }
 
 // ─── Scheduler ───────────────────────────────────────────────────
 
-export function startScheduler() {
+export async function startScheduler() {
   if (schedulerRunning) return;
   schedulerRunning = true;
 
   // Run calibration on start
-  calibrateFromHistory();
+  await calibrateFromHistory();
 
   // Tick every 30 seconds
   schedulerInterval = setInterval(runMicroTick, 30000);
@@ -893,24 +893,24 @@ export function startScheduler() {
   // Run first tick immediately
   runMicroTick();
 
-  storage.addModelLog("SCHEDULER_START", undefined, "Micro scheduler started");
-  storage.addAuditEntry("запуск", "Микро-планировщик запущен");
+  await storage.addModelLog("SCHEDULER_START", undefined, "Micro scheduler started");
+  await storage.addAuditEntry("запуск", "Микро-планировщик запущен");
   console.log("[MicroEngine] Scheduler started — ticking every 30s");
 }
 
-export function stopScheduler() {
+export async function stopScheduler() {
   if (schedulerInterval) {
     clearInterval(schedulerInterval);
     schedulerInterval = null;
   }
   schedulerRunning = false;
 
-  storage.addModelLog("SCHEDULER_STOP", undefined, "Micro scheduler stopped");
-  storage.addAuditEntry("остановка", "Микро-планировщик остановлен");
+  await storage.addModelLog("SCHEDULER_STOP", undefined, "Micro scheduler stopped");
+  await storage.addAuditEntry("остановка", "Микро-планировщик остановлен");
   console.log("[MicroEngine] Scheduler stopped");
 }
 
-export function getSchedulerStatus() {
+export async function getSchedulerStatus() {
   const windowEnd = getCurrentWindowEnd();
   const windowStart = windowEnd - 300;
   const now = Math.floor(Date.now() / 1000);
@@ -925,7 +925,7 @@ export function getSchedulerStatus() {
       endISO: new Date(windowEnd * 1000).toISOString(),
       secondsRemaining: Math.max(0, windowEnd - now),
     },
-    betSizeMultiplier: getBetSizeMultiplier(),
+    betSizeMultiplier: await getBetSizeMultiplier(),
     assetCooldowns: Object.fromEntries(assetCooldowns),
     disabledStrategies: Object.fromEntries(strategyDisabled),
     sessionPeakBankroll,
