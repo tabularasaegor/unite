@@ -141,8 +141,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ authenticated: !!token && isTokenValid(token) });
   });
 
-  // --- Auth disabled — all API routes are public ---
-  app.use("/api", (_req, _res, next) => next());
+  // --- Auth middleware (simple token check) ---
+  app.use("/api", (req, res, next) => {
+    if (req.path.startsWith("/auth")) return next();
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token || !isTokenValid(token)) {
+      return res.status(401).json({ error: "Требуется авторизация" });
+    }
+    next();
+  });
 
   // ============================================================================
   // PREDICTION MARKET PLATFORM — API Routes
