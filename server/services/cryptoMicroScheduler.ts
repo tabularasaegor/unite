@@ -466,27 +466,47 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
     reasoning = `CONTRARIAN: market ${upPrice > 0.53 ? "Up" : "Down"} at ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}%, betting against`;
     strategy = "contrarian";
   }
-  // === TIER 2: CALIBRATION (>5 trades — use per-asset rolling WR) ===
+  // === TIER 2: CALIBRATION (>5 trades — ROLLING window, anti-bias) ===
+  // Uses last 20 results. BOTH directions must have >= 5 samples and 
+  // each direction must represent >= 30% of the window to be valid.
+  // This prevents feedback loops where one direction dominates.
   else if (cal.totalTrades >= 5) {
-    const upWR = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : 0.5;
-    const downWR = (cal.downWins + cal.downLosses) > 0 ? cal.downWins / (cal.downWins + cal.downLosses) : 0.5;
+    const recentN = cal.lastResults.slice(-20);
+    const recentUp = recentN.filter(r => r.direction === "Up");
+    const recentDown = recentN.filter(r => r.direction === "Down");
+    const total = recentN.length;
     
-    if (upWR > downWR + 0.05) {
-      direction = "Up";
-      confidence = 0.50 + (upWR - 0.5) * 0.2;
-      reasoning = `CALIBRATION: ${asset.toUpperCase()} Up WR=${(upWR*100).toFixed(0)}% > Down ${(downWR*100).toFixed(0)}%`;
-    } else if (downWR > upWR + 0.05) {
-      direction = "Down";
-      confidence = 0.50 + (downWR - 0.5) * 0.2;
-      reasoning = `CALIBRATION: ${asset.toUpperCase()} Down WR=${(downWR*100).toFixed(0)}% > Up ${(upWR*100).toFixed(0)}%`;
+    // Anti-bias gate: both directions need >= 5 samples AND >= 30% representation
+    const upRatio = total > 0 ? recentUp.length / total : 0;
+    const downRatio = total > 0 ? recentDown.length / total : 0;
+    const hasBalancedData = recentUp.length >= 5 && recentDown.length >= 5 && upRatio >= 0.30 && downRatio >= 0.30;
+    
+    if (hasBalancedData) {
+      const upWR = recentUp.filter(r => r.won).length / recentUp.length;
+      const downWR = recentDown.filter(r => r.won).length / recentDown.length;
+      
+      // Need >10% WR difference to make a directional call
+      if (upWR > downWR + 0.10) {
+        direction = "Up";
+        confidence = 0.50 + (upWR - 0.5) * 0.15;
+        reasoning = `CALIBRATION: ${asset.toUpperCase()} Up WR=${(upWR*100).toFixed(0)}% > Down ${(downWR*100).toFixed(0)}% (${recentUp.length}/${recentDown.length} samples)`;
+      } else if (downWR > upWR + 0.10) {
+        direction = "Down";
+        confidence = 0.50 + (downWR - 0.5) * 0.15;
+        reasoning = `CALIBRATION: ${asset.toUpperCase()} Down WR=${(downWR*100).toFixed(0)}% > Up ${(upWR*100).toFixed(0)}% (${recentDown.length}/${recentUp.length} samples)`;
+      } else {
+        // Balanced WRs — alternate by window parity
+        const windowParity = (market.windowStart / 300) % 2 === 0;
+        direction = windowParity ? "Up" : "Down";
+        confidence = 0.52;
+        reasoning = `CALIBRATION: equal (Up ${(upWR*100).toFixed(0)}% vs Down ${(downWR*100).toFixed(0)}%), parity → ${direction}`;
+      }
     } else {
-      // No clear directional bias — use recent 3-trade streak
-      const recent = cal.lastResults.slice(-3);
-      const recentUpWins = recent.filter(r => r.direction === "Up" && r.won).length;
-      const recentDownWins = recent.filter(r => r.direction === "Down" && r.won).length;
-      direction = recentUpWins >= recentDownWins ? "Up" : "Down";
+      // Imbalanced sample — data is biased, fall back to alternating
+      const windowParity = (market.windowStart / 300) % 2 === 0;
+      direction = windowParity ? "Up" : "Down";
       confidence = 0.52;
-      reasoning = `CALIBRATION: balanced, recent momentum → ${direction}`;
+      reasoning = `CALIBRATION: imbalanced data (Up:${recentUp.length} Down:${recentDown.length}), parity → ${direction}`;
     }
     strategy = "calibration";
   }
