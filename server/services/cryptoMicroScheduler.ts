@@ -92,7 +92,7 @@ function recordWindowResult(wins: number, losses: number, pnl: number) {
   if (losses > wins) {
     consecutiveLossWindows++;
     // AGGRESSIVE decay: drop to base 1.0 immediately, then reduce further
-    betSizeMultiplier = Math.max(0.25, 1.0 - consecutiveLossWindows * 0.25);
+    betSizeMultiplier = Math.max(0.3, betSizeMultiplier - 0.2);
     logModelChange("LOSS_WINDOW", `${wins}W/${losses}L, consec=${consecutiveLossWindows}, mult: ${prevMult.toFixed(2)}→${betSizeMultiplier.toFixed(2)}`);
   } else {
     if (consecutiveLossWindows > 0) {
@@ -100,7 +100,7 @@ function recordWindowResult(wins: number, losses: number, pnl: number) {
     }
     consecutiveLossWindows = 0;
     // SLOW recovery: only +0.1 per win window, HARD CAP at 1.0 (never over-leverage)
-    betSizeMultiplier = Math.min(1.0, betSizeMultiplier + 0.1);
+    betSizeMultiplier = Math.min(1.5, betSizeMultiplier + 0.1);
     logModelChange("WIN_WINDOW", `${wins}W/${losses}L, mult=${betSizeMultiplier.toFixed(2)}x`);
   }
 
@@ -117,13 +117,13 @@ function shouldSkipAsset(asset: string): boolean {
   if (Date.now() < cooldownUntil) return true;
   
   const cal = getCalibration(asset);
-  // Use last 3 results (faster reaction) instead of 5
-  const recent = cal.lastResults.slice(-3);
-  if (recent.length >= 3) {
+  // Spec: WR<30% over last 5 trades → 10min cooldown
+  const recent = cal.lastResults.slice(-5);
+  if (recent.length >= 5) {
     const recentWR = recent.filter(r => r.won).length / recent.length;
-    if (recentWR < 0.34) { // 0 or 1 win out of 3
+    if (recentWR < 0.30) {
       assetCooldown[asset] = Date.now() + 600000; // 10 min cooldown
-      logModelChange("ASSET_COOLDOWN", `${asset.toUpperCase()} WR=${(recentWR*100).toFixed(0)}% last 3 → skip 10min`);
+      logModelChange("ASSET_COOLDOWN", `${asset.toUpperCase()} WR=${(recentWR*100).toFixed(0)}% last 5 → skip 10min`);
       return true;
     }
   }
@@ -281,17 +281,14 @@ function auditCalibrationOnStartup(): void {
     // Check last 5 results for recent performance
     const recent5 = cal.lastResults.slice(-5);
     const recent5WR = recent5.length > 0 ? recent5.filter(r => r.won).length / recent5.length : 0.5;
-    const recent3 = cal.lastResults.slice(-3);
-    const recent3WR = recent3.length > 0 ? recent3.filter(r => r.won).length / recent3.length : 0.5;
-
     // Log per-asset calibration summary
     const recentStr = recent5.map(r => r.won ? "✓" : "✗").join("");
     assetReports.push(`${asset.toUpperCase()}: ${cal.wins}W/${cal.losses}L (${wr.toFixed(0)}%) last5=[${recentStr}] (${(recent5WR*100).toFixed(0)}%)`);
 
-    // If last 3 results are bad, set cooldown
-    if (recent3.length >= 3 && recent3WR < 0.34) {
-      assetCooldown[asset] = Date.now() + 600000; // 10 min cooldown
-      logModelChange("STARTUP_COOLDOWN", `${asset.toUpperCase()} poor recent WR: ${(recent3WR*100).toFixed(0)}% last 3 → 10min cooldown`);
+    // Spec: WR<30% over last 5 → 10min cooldown
+    if (recent5.length >= 5 && recent5WR < 0.30) {
+      assetCooldown[asset] = Date.now() + 600000;
+      logModelChange("STARTUP_COOLDOWN", `${asset.toUpperCase()} WR=${(recent5WR*100).toFixed(0)}% last 5 → 10min cooldown`);
     }
 
     // Count trailing losses for regime calculation
@@ -327,7 +324,7 @@ function auditCalibrationOnStartup(): void {
   // Set consecutiveLossWindows based on trailing losses
   if (globalTrailingLosses >= 4) {
     consecutiveLossWindows = Math.floor(globalTrailingLosses / 2);
-    betSizeMultiplier = Math.max(0.25, 1.0 - consecutiveLossWindows * 0.25);
+    betSizeMultiplier = Math.max(0.3, 1.0 - consecutiveLossWindows * 0.2);
     logModelChange("STARTUP_REGIME", `${globalTrailingLosses} trailing losses → mult=${betSizeMultiplier.toFixed(2)}x, consec=${consecutiveLossWindows}`);
   } else {
     betSizeMultiplier = 1.0;
@@ -522,11 +519,11 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
     // AI unavailable — strategy signal stands as-is
   }
 
-  return { direction, confidence, reasoning, mlBetMult: 1.0 };
+  return { direction, confidence, reasoning };
 }
 
 // --- Execute micro-trade ---
-function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, mlBetMult?: number): boolean {
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string): boolean {
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
@@ -792,24 +789,9 @@ async function runMicroCycle(): Promise<void> {
       analyses.push({ asset, market, ...analysis });
     }
 
-    // --- Diversification: prevent all-same-direction ---
-    if (analyses.length >= 3) {
-      const upCount = analyses.filter(a => a.direction === "Up").length;
-      const downCount = analyses.filter(a => a.direction === "Down").length;
-      
-      if (upCount === analyses.length || downCount === analyses.length) {
-        // All same direction — flip the weakest signal to diversify
-        const sorted = [...analyses].sort((a, b) => a.confidence - b.confidence);
-        const weakest = sorted[0];
-        weakest.direction = weakest.direction === "Up" ? "Down" : "Up";
-        weakest.reasoning += " [DIVERSIFIED: flipped weakest]";
-        logModelChange("DIVERSIFY", `All ${upCount > 0 ? "Up" : "Down"} → flipped ${weakest.asset.toUpperCase()} to ${weakest.direction}`);
-      }
-    }
-
-    // Execute all trades with ML bet multiplier
+    // Execute trades (no diversification — each asset decides independently per spec)
     for (const a of analyses) {
-      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, (a as any).mlBetMult);
+      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning);
     }
 
     lastCycleAt = new Date().toISOString();
