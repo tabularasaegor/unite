@@ -121,9 +121,6 @@ export async function scanMarkets(): Promise<{
       for (const event of events) {
         result.scanned++;
 
-        // Skip restricted (5-min) events
-        if ((event as any).restricted) continue;
-
         // Check date range
         if (event.endDate) {
           const endDate = new Date(event.endDate);

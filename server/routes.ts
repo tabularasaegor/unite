@@ -426,22 +426,80 @@ export async function registerRoutes(
   // MICRO ROUTES
   // ════════════════════════════════════════════════════════════════
 
-  // GET /api/micro/dashboard
+  // Micro stats/dashboard handler (shared)
+  function buildMicroStats() {
+    const stats = storage.getMicroStats();
+    const schedulerStatus = getSchedulerStatus();
+    const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || DEFAULT_CONFIG.micro_bankroll);
+    const windowEnd = schedulerStatus.currentWindow.endISO;
+
+    // Build pnlByAsset from assetStats
+    const pnlByAsset = stats.assetStats.map(a => ({ asset: a.asset.toUpperCase(), pnl: a.pnl }));
+
+    // Build cumulativePnl from settled micro positions
+    const settledPositions = storage.getPositions({ source: "micro", status: "settled" });
+    const closedPositions = storage.getPositions({ source: "micro", status: "closed" });
+    const allClosed = [...settledPositions, ...closedPositions]
+      .sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
+    let runningPnl = 0;
+    const cumulativePnl = allClosed.map(p => {
+      runningPnl += (p.realizedPnl ?? 0);
+      return {
+        date: p.closedAt ? new Date(p.closedAt).toLocaleDateString("ru-RU", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "",
+        pnl: Math.round(runningPnl * 100) / 100,
+      };
+    });
+
+    return {
+      ...stats,
+      winRate: Math.round(stats.winRate * 10000) / 100, // convert 0-1 to percentage
+      assetStats: stats.assetStats.map(a => ({
+        ...a,
+        winRate: Math.round(a.winRate * 10000) / 100,
+        pnl: Math.round(a.pnl * 100) / 100,
+        status: a.trades > 0 ? "active" : "idle",
+      })),
+      pnlByAsset,
+      cumulativePnl,
+      currentBankroll: Math.round((microBankroll + stats.totalPnl) * 100) / 100,
+      startingBankroll: microBankroll,
+      schedulerRunning: schedulerStatus.running,
+      nextWindow: windowEnd,
+      currentWindow: schedulerStatus.currentWindow.startISO,
+      scheduler: schedulerStatus,
+    };
+  }
+
+  // GET /api/micro/stats — primary endpoint used by frontend
+  app.get("/api/micro/stats", async (_req: Request, res: Response) => {
+    try {
+      return res.json(buildMicroStats());
+    } catch (err) {
+      console.error("[Micro] Stats error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки дашборда" });
+    }
+  });
+
+  // GET /api/micro/dashboard — alias
   app.get("/api/micro/dashboard", async (_req: Request, res: Response) => {
     try {
-      const stats = storage.getMicroStats();
-      const schedulerStatus = getSchedulerStatus();
-      const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || DEFAULT_CONFIG.micro_bankroll);
-
-      return res.json({
-        ...stats,
-        currentBankroll: Math.round((microBankroll + stats.totalPnl) * 100) / 100,
-        startingBankroll: microBankroll,
-        scheduler: schedulerStatus,
-      });
+      return res.json(buildMicroStats());
     } catch (err) {
       console.error("[Micro] Dashboard error:", err);
       return res.status(500).json({ message: "Ошибка загрузки дашборда" });
+    }
+  });
+
+  // GET /api/micro/logs — alias for model-log, used by frontend
+  app.get("/api/micro/logs", async (req: Request, res: Response) => {
+    try {
+      const asset = req.query.asset as string | undefined;
+      const limit = parseInt(req.query.limit as string || "200", 10);
+      const logs = storage.getModelLog(limit, asset || undefined);
+      return res.json(logs);
+    } catch (err) {
+      console.error("[Micro] Logs error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки лога модели" });
     }
   });
 
@@ -565,33 +623,63 @@ export async function registerRoutes(
   // PIPELINE ROUTES
   // ════════════════════════════════════════════════════════════════
 
-  // GET /api/pipeline/dashboard
+  // Pipeline stats builder — returns shape expected by frontend PipelineStats interface
+  function buildPipelineStats() {
+    const dashboard = getPipelineDashboard();
+    return {
+      scanCount: dashboard.stageBreakdown.scanned || 0,
+      researchCount: dashboard.stageBreakdown.researched || 0,
+      positionCount: dashboard.openPositions + dashboard.closedPositions,
+      totalPnl: dashboard.totalPnl,
+      ...dashboard,
+    };
+  }
+
+  // GET /api/pipeline/stats — primary endpoint for frontend
+  app.get("/api/pipeline/stats", async (_req: Request, res: Response) => {
+    try {
+      return res.json(buildPipelineStats());
+    } catch (err) {
+      console.error("[Pipeline] Stats error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки статистики пайплайна" });
+    }
+  });
+
+  // GET /api/pipeline/dashboard — alias
   app.get("/api/pipeline/dashboard", async (_req: Request, res: Response) => {
     try {
-      const dashboard = getPipelineDashboard();
-      return res.json(dashboard);
+      return res.json(buildPipelineStats());
     } catch (err) {
       console.error("[Pipeline] Dashboard error:", err);
       return res.status(500).json({ message: "Ошибка загрузки дашборда пайплайна" });
     }
   });
 
-  // GET /api/pipeline/opportunities
+  // Shared opportunities handler
+  function filterOpportunities(query: { stage?: string; category?: string; status?: string; limit?: string }) {
+    const allOpps = storage.getOpportunities();
+    let filtered = allOpps;
+    if (query.stage) filtered = filtered.filter(o => o.pipelineStage === query.stage);
+    if (query.category) filtered = filtered.filter(o => o.category === query.category);
+    if (query.status) filtered = filtered.filter(o => o.status === query.status);
+    if (query.limit) filtered = filtered.slice(0, parseInt(query.limit, 10));
+    return filtered;
+  }
+
+  // GET /api/opportunities — used by frontend (scanner, pipeline-dashboard, opportunities pages)
+  app.get("/api/opportunities", async (req: Request, res: Response) => {
+    try {
+      return res.json(filterOpportunities(req.query as any));
+    } catch (err) {
+      console.error("[Pipeline] Opportunities error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки возможностей" });
+    }
+  });
+
+  // GET /api/pipeline/opportunities — alias
   app.get("/api/pipeline/opportunities", async (req: Request, res: Response) => {
     try {
-      const allOpps = storage.getOpportunities();
-
-      // Apply query filters
-      const stage = req.query.stage as string | undefined;
-      const category = req.query.category as string | undefined;
-      const status = req.query.status as string | undefined;
-
-      let filtered = allOpps;
-      if (stage) filtered = filtered.filter(o => o.pipelineStage === stage);
-      if (category) filtered = filtered.filter(o => o.category === category);
-      if (status) filtered = filtered.filter(o => o.status === status);
-
-      return res.json(filtered);
+      return res.json(filterOpportunities(req.query as any));
     } catch (err) {
       console.error("[Pipeline] Opportunities error:", err);
       return res.status(500).json({ message: "Ошибка загрузки возможностей" });
@@ -610,6 +698,32 @@ export async function registerRoutes(
     } catch (err) {
       console.error("[Pipeline] Scan error:", err);
       return res.status(500).json({ message: "Ошибка сканирования рынков" });
+    }
+  });
+
+  // POST /api/pipeline/advance/:id — advance an opportunity to next stage
+  app.post("/api/pipeline/advance/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id as string, 10);
+      if (isNaN(id)) return res.status(400).json({ message: "Неверный ID" });
+
+      const opp = storage.getOpportunity(id);
+      if (!opp) return res.status(404).json({ message: "Возможность не найдена" });
+
+      // Stage progression
+      const stageOrder = ["scanned", "researching", "researched", "estimated", "risk_assessed", "approved", "executed", "settled"];
+      const currentIdx = stageOrder.indexOf(opp.pipelineStage);
+      const nextStage = currentIdx >= 0 && currentIdx < stageOrder.length - 1
+        ? stageOrder[currentIdx + 1]
+        : opp.pipelineStage;
+
+      storage.updateOpportunity(id, { pipelineStage: nextStage });
+      storage.addAuditEntry("пайплайн", `Возможность #${id} переведена на стадию: ${nextStage}`, (req as any).userId);
+
+      return res.json({ ok: true, stage: nextStage });
+    } catch (err) {
+      console.error("[Pipeline] Advance error:", err);
+      return res.status(500).json({ message: "Ошибка продвижения стадии" });
     }
   });
 
@@ -668,6 +782,109 @@ export async function registerRoutes(
     } catch (err) {
       console.error("[Pipeline] Post-mortems error:", err);
       return res.status(500).json({ message: "Ошибка загрузки пост-мортемов" });
+    }
+  });
+
+  // ════════════════════════════════════════════════════════════════
+  // CROSS-SOURCE ROUTES — used by frontend pages with ?source= param
+  // ════════════════════════════════════════════════════════════════
+
+  // GET /api/positions — universal positions endpoint
+  app.get("/api/positions", async (req: Request, res: Response) => {
+    try {
+      const source = req.query.source as string | undefined;
+      const status = req.query.status as string | undefined;
+      const filter: { source?: string; status?: string } = {};
+      if (source) filter.source = source;
+      if (status && status !== "all") filter.status = status;
+      return res.json(storage.getPositions(filter));
+    } catch (err) {
+      console.error("[Positions] Error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки позиций" });
+    }
+  });
+
+  // GET /api/executions — universal executions endpoint
+  app.get("/api/executions", async (req: Request, res: Response) => {
+    try {
+      const source = req.query.source as string | undefined;
+      if (source) {
+        const positions = storage.getPositions({ source });
+        const positionIds = new Set(positions.map(p => p.id));
+        const allExecs = storage.getExecutions();
+        return res.json(allExecs.filter(e => e.positionId && positionIds.has(e.positionId)));
+      }
+      return res.json(storage.getExecutions());
+    } catch (err) {
+      console.error("[Executions] Error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки сделок" });
+    }
+  });
+
+  // GET /api/settlements — universal settlements endpoint
+  app.get("/api/settlements", async (req: Request, res: Response) => {
+    try {
+      const source = req.query.source as string | undefined;
+      if (source) {
+        const positions = storage.getPositions({ source });
+        const positionIds = new Set(positions.map(p => p.id));
+        const allSettlements = storage.getSettlements();
+        return res.json(allSettlements.filter(s => positionIds.has(s.positionId)));
+      }
+      return res.json(storage.getSettlements());
+    } catch (err) {
+      console.error("[Settlements] Error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки расчётов" });
+    }
+  });
+
+  // GET /api/postmortems — alias for pipeline postmortems
+  app.get("/api/postmortems", async (_req: Request, res: Response) => {
+    try {
+      return res.json(storage.getPostMortems());
+    } catch (err) {
+      console.error("[PostMortems] Error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки пост-мортемов" });
+    }
+  });
+
+  // GET /api/risk/stats — risk console stats
+  app.get("/api/risk/stats", async (_req: Request, res: Response) => {
+    try {
+      const bankroll = parseFloat(storage.getConfig("bankroll") || DEFAULT_CONFIG.bankroll);
+      const maxPosition = parseFloat(storage.getConfig("max_position") || "500");
+      const maxDrawdownPct = parseFloat(storage.getConfig("max_drawdown") || "20");
+
+      // Calculate allocated capital from open positions
+      const openPositions = storage.getPositions({ status: "open" });
+      const allocated = openPositions.reduce((s, p) => s + (p.size ?? 0), 0);
+
+      // Calculate current drawdown from settled positions
+      const allPositions = storage.getPositions({});
+      const settled = allPositions.filter(p => p.status === "settled" || p.status === "closed");
+      const totalPnl = settled.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+      const drawdown = totalPnl < 0 ? Math.abs(totalPnl) : 0;
+      const maxDrawdown = bankroll * (maxDrawdownPct / 100);
+
+      // Kelly fraction from win stats
+      const wins = settled.filter(p => (p.realizedPnl ?? 0) > 0).length;
+      const wr = settled.length > 0 ? wins / settled.length : 0;
+      const avgWin = wins > 0 ? settled.filter(p => (p.realizedPnl ?? 0) > 0).reduce((s, p) => s + (p.realizedPnl ?? 0), 0) / wins : 0;
+      const losses = settled.length - wins;
+      const avgLoss = losses > 0 ? Math.abs(settled.filter(p => (p.realizedPnl ?? 0) <= 0).reduce((s, p) => s + (p.realizedPnl ?? 0), 0)) / losses : 1;
+      const kellyFraction = avgLoss > 0 ? Math.max(0, wr - (1 - wr) / (avgWin / avgLoss || 1)) : 0;
+
+      return res.json({
+        bankroll,
+        allocated: Math.round(allocated * 100) / 100,
+        maxPosition,
+        kellyFraction: Math.round(kellyFraction * 1000) / 1000,
+        drawdown: Math.round(drawdown * 100) / 100,
+        maxDrawdown: Math.round(maxDrawdown * 100) / 100,
+      });
+    } catch (err) {
+      console.error("[Risk] Stats error:", err);
+      return res.status(500).json({ message: "Ошибка загрузки риск-данных" });
     }
   });
 
