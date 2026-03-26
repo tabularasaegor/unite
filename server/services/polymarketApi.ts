@@ -12,13 +12,18 @@ export type Asset = (typeof SUPPORTED_ASSETS)[number];
 // ─── Slug Generation ─────────────────────────────────────────────
 
 /**
- * Compute the slug for a 5-min window ending `windowsAhead` windows from now.
- * windowsAhead=1 → the NEXT window end (the one currently being traded).
+ * Compute the slug for a 5-min window.
+ * 
+ * IMPORTANT: Polymarket slug timestamp = window START time.
+ * The event "btc-updown-5m-1774561200" covers 21:40:00 - 21:45:00.
+ * The slug timestamp (1774561200) is 21:40:00 = the window START.
+ * 
+ * windowsAhead=1 → the currently tradeable window (the one starting at the next 5-min mark).
  */
 export function getUpcomingSlug(asset: Asset, windowsAhead = 1): string {
   const t = Math.floor(Date.now() / 1000);
-  const nextWindowEnd = (Math.floor(t / 300) + windowsAhead) * 300;
-  return `${asset}-updown-5m-${nextWindowEnd}`;
+  const nextWindowStart = (Math.floor(t / 300) + windowsAhead) * 300;
+  return `${asset}-updown-5m-${nextWindowStart}`;
 }
 
 /**
@@ -30,9 +35,25 @@ export function slugToTimestamp(slug: string): number {
 }
 
 /**
- * Get current window end timestamp (the window that is currently in progress).
+ * Get current window end timestamp.
+ * 
+ * This returns the END time of the currently tradeable window.
+ * If we're at 21:38, the next tradeable window starts at 21:40 and ends at 21:45.
+ * getCurrentWindowEnd() returns 21:45 (1774561500).
+ * The slug for this window uses 21:40 (the start): btc-updown-5m-1774561200
  */
 export function getCurrentWindowEnd(): number {
+  const t = Math.floor(Date.now() / 1000);
+  // Next 5-min boundary is the START of the next window
+  const nextWindowStart = Math.ceil(t / 300) * 300;
+  // The window ends 300s after it starts
+  return nextWindowStart + 300;
+}
+
+/**
+ * Get current window start (= the slug timestamp for the current window).
+ */
+export function getCurrentWindowStart(): number {
   const t = Math.floor(Date.now() / 1000);
   return Math.ceil(t / 300) * 300;
 }
@@ -114,8 +135,9 @@ export async function fetchEventBySlug(slug: string): Promise<ParsedEvent | null
 
     const market = event.markets[0];
     const tokenIds: string[] = JSON.parse(market.clobTokenIds);
-    const windowEnd = slugToTimestamp(slug);
-    const windowStart = windowEnd - 300;
+    // Slug timestamp = window START time on Polymarket
+    const windowStart = slugToTimestamp(slug);
+    const windowEnd = windowStart + 300;
 
     return {
       eventId: event.id,
@@ -235,23 +257,76 @@ export async function getPriceHistory(
 }
 
 /**
- * Check if an event has been resolved. Returns the event with final prices if resolved.
+ * Check if an event has been resolved.
+ * 
+ * PRIMARY method: use market.outcomePrices (e.g. ["1","0"] or ["0","1"]).
+ * This is available as soon as the event closes — much faster than eventMetadata.finalPrice
+ * which can take 10-15 minutes to populate.
+ * 
+ * FALLBACK: eventMetadata.finalPrice/priceToBeat if outcomePrices is not available.
  */
 export async function fetchResolvedEvent(slug: string): Promise<{
   resolved: boolean;
+  outcome?: "up" | "down";
   finalPrice?: number;
   priceToBeat?: number;
   closed: boolean;
 } | null> {
   try {
-    const event = await fetchEventBySlug(slug);
-    if (!event) return null;
+    const resp = await fetch(`${GAMMA_BASE}/events?slug=${encodeURIComponent(slug)}`);
+    if (!resp.ok) return null;
+    const events: GammaEvent[] = await resp.json() as GammaEvent[];
+    if (!events || events.length === 0) return null;
+
+    const event = events[0];
+    if (!event.markets || event.markets.length === 0) {
+      return { resolved: false, closed: event.closed };
+    }
+
+    const market = event.markets[0];
+    const meta = event.eventMetadata;
+
+    // Method 1: outcomePrices — fastest resolution signal
+    // outcomes = ["Up", "Down"], outcomePrices = ["1", "0"] means Up won
+    if (event.closed && (market as any).outcomePrices) {
+      try {
+        const outcomePrices: string[] = JSON.parse((market as any).outcomePrices);
+        if (outcomePrices.length >= 2) {
+          const upPrice = parseFloat(outcomePrices[0]);
+          const downPrice = parseFloat(outcomePrices[1]);
+          if ((upPrice === 1 && downPrice === 0) || (upPrice === 0 && downPrice === 1)) {
+            const outcome: "up" | "down" = upPrice === 1 ? "up" : "down";
+            return {
+              resolved: true,
+              outcome,
+              finalPrice: meta?.finalPrice,
+              priceToBeat: meta?.priceToBeat,
+              closed: true,
+            };
+          }
+        }
+      } catch {
+        // outcomePrices might not be parseable, fall through
+      }
+    }
+
+    // Method 2: eventMetadata.finalPrice (takes 10-15 min to populate)
+    if (event.closed && meta?.finalPrice !== undefined && meta?.priceToBeat !== undefined) {
+      const outcome: "up" | "down" = meta.finalPrice >= meta.priceToBeat ? "up" : "down";
+      return {
+        resolved: true,
+        outcome,
+        finalPrice: meta.finalPrice,
+        priceToBeat: meta.priceToBeat,
+        closed: true,
+      };
+    }
 
     return {
-      resolved: event.closed && event.finalPrice !== undefined,
-      finalPrice: event.finalPrice,
-      priceToBeat: event.priceToBeat,
+      resolved: false,
       closed: event.closed,
+      finalPrice: meta?.finalPrice,
+      priceToBeat: meta?.priceToBeat,
     };
   } catch (err) {
     console.error(`[Polymarket] Failed to check resolution for ${slug}:`, err);

@@ -19,6 +19,7 @@ import {
   type Asset,
   getUpcomingSlug,
   getCurrentWindowEnd,
+  getCurrentWindowStart,
   fetchEventBySlug,
   fetchResolvedEvent,
   getMidpoints,
@@ -58,7 +59,8 @@ const COOLDOWN_LOOKBACK = 8;
 const COOLDOWN_DURATION_MS = 10 * 60 * 1000; // 10 min
 const DISABLE_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
 const CI_LOWER_THRESHOLD = 0.42;
-const SETTLEMENT_DELAY_SEC = 20;
+const SETTLEMENT_DELAY_SEC = 30;
+const FORCE_SETTLE_SEC = 900; // 15 min — Polymarket needs 5-10 min to resolve
 const MAX_TRADE_WINDOW_SEC = 180; // Trade within first 3 minutes (was 2.5)
 
 // ─── Module State ────────────────────────────────────────────────
@@ -486,9 +488,12 @@ async function runStrategy(
 // ─── Main Tick: Open Trades ──────────────────────────────────────
 
 async function processNewWindow() {
-  const windowEnd = getCurrentWindowEnd();
+  // windowStart = slug timestamp (Polymarket uses start time in slug)
+  // windowEnd = actual end of the window (windowStart + 300)
+  const windowStart = getCurrentWindowStart();
+  const windowEnd = getCurrentWindowEnd(); // = windowStart + 300
   const now = Math.floor(Date.now() / 1000);
-  const timeIntoWindow = now - (windowEnd - 300);
+  const timeIntoWindow = now - windowStart;
 
   // Only trade within first MAX_TRADE_WINDOW_SEC of window
   if (timeIntoWindow > MAX_TRADE_WINDOW_SEC) return;
@@ -520,22 +525,17 @@ async function processNewWindow() {
         continue;
       }
 
-      // Check if we already have an open position for this window+asset
-      const existingPositions = await storage.getPositions({ source: "micro", status: "open" });
-      const alreadyTraded = existingPositions.some(
-        p => p.asset === asset && p.windowEnd === windowEnd
+      // Check if we already have ANY position for this window+asset (open OR settled)
+      // Use SLUG as the definitive check to prevent duplicates even if windowEnd values differ
+      const slug = `${asset}-updown-5m-${windowStart}`;
+      const openPos = await storage.getPositions({ source: "micro", status: "open" });
+      const settledPos = await storage.getPositions({ source: "micro", status: "settled" });
+      const alreadyTraded = [...openPos, ...settledPos].some(
+        p => p.asset === asset && (p.slug === slug || p.windowEnd === windowEnd)
       );
       if (alreadyTraded) continue;
 
-      // Also check settled positions for this window
-      const settledPositions = await storage.getPositions({ source: "micro", status: "settled" });
-      const alreadySettled = settledPositions.some(
-        p => p.asset === asset && p.windowEnd === windowEnd
-      );
-      if (alreadySettled) continue;
-
       // Fetch event
-      const slug = `${asset}-updown-5m-${windowEnd}`;
       const event = await fetchEventBySlug(slug);
       if (!event) {
         if (attempts <= 2) {
@@ -702,31 +702,44 @@ async function settleClosedWindows() {
     const settleAfter = pos.windowEnd + SETTLEMENT_DELAY_SEC;
     if (now < settleAfter) continue;
 
-    // Force settle if more than 3 min past window end
-    const forceSettle = now > pos.windowEnd + 180;
+    // Force settle only after FORCE_SETTLE_SEC (15 min) — Polymarket needs time
+    const forceSettle = now > pos.windowEnd + FORCE_SETTLE_SEC;
 
     try {
       const resolved = await fetchResolvedEvent(pos.slug);
+      const secSinceEnd = now - pos.windowEnd;
 
-      if (!resolved && !forceSettle) continue;
-      if (resolved && !resolved.resolved && !forceSettle) continue;
+      // Skip if Polymarket hasn't resolved AND we haven't timed out
+      if (!resolved || !resolved.resolved) {
+        if (!forceSettle) {
+          // Not resolved, not force-settling — wait for next tick
+          continue;
+        }
+      }
 
       let outcome: "up" | "down" | "unknown" = "unknown";
       let pnl = 0;
 
-      if (resolved && resolved.resolved && resolved.finalPrice !== undefined && resolved.priceToBeat !== undefined) {
-        outcome = resolved.finalPrice >= resolved.priceToBeat ? "up" : "down";
+      if (resolved && resolved.resolved && resolved.outcome) {
+        outcome = resolved.outcome;
+        console.log(`[Settlement] ${pos.id} ${pos.asset} ${pos.side}: resolved as ${outcome} (${secSinceEnd}s after end)`);
       } else if (forceSettle) {
+        console.log(`[Settlement] ${pos.id} ${pos.asset}: FORCE SETTLE after ${secSinceEnd}s`);
         await storage.addModelLog("FORCE_SETTLE", pos.asset,
-          `Force-settling position ${pos.id} after timeout`);
+          `Force-settling position ${pos.id} after ${secSinceEnd}s (limit: ${FORCE_SETTLE_SEC}s)`);
         outcome = "unknown";
+      } else {
+        // Safety: should not reach here, but skip just in case
+        continue;
       }
 
       const wasCorrect = outcome !== "unknown" && pos.side === outcome;
 
       if (wasCorrect) {
+        // Win: payout = size / entryPrice (you bought shares at entryPrice, they're now worth $1)
         pnl = pos.size * (1 / pos.entryPrice - 1);
       } else if (outcome !== "unknown") {
+        // Loss: you lose the full bet
         pnl = -pos.size;
       } else {
         pnl = 0;
@@ -789,6 +802,58 @@ async function settleClosedWindows() {
       await storage.addModelLog("ERROR", pos.asset, `Settlement error: ${String(err)}`);
     }
   }
+}
+
+// ─── Re-Settle Unknown Outcomes ───────────────────────────────────
+
+/**
+ * Re-settle positions that were force-settled with outcome=unknown.
+ * Now that Polymarket has resolved them, we can get the correct outcome.
+ * Runs once on startup.
+ */
+export async function reSettleUnknowns() {
+  console.log("[MicroEngine] Re-settling unknown outcomes...");
+  const settledPositions = await storage.getPositions({ source: "micro", status: "settled" });
+  const unknowns = settledPositions.filter(p => p.realizedPnl === 0 && p.slug);
+  
+  let fixed = 0;
+  for (const pos of unknowns) {
+    try {
+      const resolved = await fetchResolvedEvent(pos.slug!);
+      if (!resolved || !resolved.resolved || !resolved.outcome) continue;
+
+      const outcome = resolved.outcome;
+      const wasCorrect = pos.side === outcome;
+      let pnl: number;
+
+      if (wasCorrect) {
+        pnl = pos.size * (1 / pos.entryPrice - 1);
+      } else {
+        pnl = -pos.size;
+      }
+      pnl = Math.round(pnl * 100) / 100;
+
+      await storage.updatePosition(pos.id, {
+        realizedPnl: pnl,
+      });
+
+      // Update strategy performance
+      if (pos.strategyUsed && pos.asset) {
+        await updateStrategyPerformance(pos.strategyUsed, pos.asset, wasCorrect);
+      }
+
+      fixed++;
+      console.log(`[MicroEngine] Re-settled ${pos.id} ${pos.asset} ${pos.side}: ${outcome} -> ${wasCorrect ? 'WIN' : 'LOSS'} $${pnl}`);
+    } catch (err) {
+      // Silent skip for individual errors
+    }
+  }
+
+  if (fixed > 0) {
+    await storage.addModelLog("RE_SETTLE", undefined, `Re-settled ${fixed} unknown positions with correct outcomes`);
+    await storage.addAuditEntry("перерасчёт", `Пересчитано ${fixed} позиций с unknown исходом`);
+  }
+  console.log(`[MicroEngine] Re-settle complete: ${fixed} fixed out of ${unknowns.length} unknowns`);
 }
 
 // ─── Strategy Performance Update ─────────────────────────────────
@@ -983,6 +1048,9 @@ export async function runMicroTick() {
 export async function startScheduler() {
   if (schedulerRunning) return;
   schedulerRunning = true;
+
+  // Re-settle any unknown outcomes from previous runs
+  await reSettleUnknowns();
 
   // Run calibration on start
   await calibrateFromHistory();

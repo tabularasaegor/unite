@@ -8,6 +8,7 @@ import {
   getSchedulerStatus,
   calibrateFromHistory,
   applyBacktestPriors,
+  reSettleUnknowns,
 } from "./services/microEngine";
 import {
   scanMarkets,
@@ -616,6 +617,17 @@ export async function registerRoutes(
     } catch (err) {
       console.error("[Micro] Scheduler status error:", err);
       return res.status(500).json({ message: "Ошибка получения статуса" });
+    }
+  });
+
+  // POST /api/micro/re-settle — re-settle unknown outcomes
+  app.post("/api/micro/re-settle", async (_req: Request, res: Response) => {
+    try {
+      await reSettleUnknowns();
+      return res.json({ ok: true, message: "Перерасчёт завершён" });
+    } catch (err) {
+      console.error("[Micro] Re-settle error:", err);
+      return res.status(500).json({ message: "Ошибка перерасчёта" });
     }
   });
 
