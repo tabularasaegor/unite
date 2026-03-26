@@ -12,7 +12,6 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
-import { computeMLSignal, rebuildCalibrationFromDB } from "./mlCalibration";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
@@ -336,9 +335,7 @@ function auditCalibrationOnStartup(): void {
 }
 
 /**
- * Rebuild calibration from full DB trade history using ML module.
- * This replaces loadCalibrationFromMemory() with actual DB data,
- * ensuring calibration always matches reality.
+ * Rebuild calibration from full DB trade history (self-contained).
  */
 function rebuildCalibrationFromHistory(): void {
   try {
@@ -346,44 +343,56 @@ function rebuildCalibrationFromHistory(): void {
     const microClosed = allPositions.filter(p => p.title?.startsWith("[5m]"));
     
     if (microClosed.length === 0) {
-      // Fall back to stored calibration if no DB history
       loadCalibrationFromMemory();
       return;
     }
 
-    const result = rebuildCalibrationFromDB(microClosed.map(p => ({
-      title: p.title,
-      side: p.side,
-      unrealizedPnl: p.unrealizedPnl || 0,
-      closedAt: p.closedAt || "",
-      entryPrice: p.entryPrice,
-      size: p.size,
-    })));
+    const assetMap: Record<string, string> = { bitcoin: "btc", ethereum: "eth", solana: "sol", xrp: "xrp" };
+    const sorted = [...microClosed].sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
+    let totalW = 0, totalL = 0, totalPnl = 0;
 
-    // Update calibration map with rebuilt data
-    for (const [asset, cal] of Object.entries(result.perAsset)) {
-      calibration[asset] = cal;
-      // Also persist to memory for backup
-      storage.upsertMemory({
-        category: "micro_calibration",
-        key: asset,
-        value: JSON.stringify(cal),
-        confidence: cal.totalTrades > 0 ? cal.wins / cal.totalTrades : 0.5,
-        createdAt: new Date().toISOString(),
-      });
+    // Reset calibration from scratch
+    for (const asset of ALL_ASSETS) {
+      calibration[asset] = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, upWins: 0, upLosses: 0, downWins: 0, downLosses: 0, lastResults: [], avgEdgeRealized: 0 };
+    }
+
+    for (const pos of sorted) {
+      const titleLower = (pos.title || "").toLowerCase();
+      let asset = "btc";
+      for (const [name, code] of Object.entries(assetMap)) {
+        if (titleLower.includes(name)) { asset = code; break; }
+      }
+      const cal = calibration[asset];
+      const won = (pos.unrealizedPnl || 0) > 0;
+      const pnl = pos.unrealizedPnl || 0;
+      const direction = pos.side === "YES" ? "Up" : "Down";
+
+      cal.totalTrades++; cal.totalPnl += pnl; totalPnl += pnl;
+      if (won) { cal.wins++; totalW++; if (direction === "Up") cal.upWins++; else cal.downWins++; }
+      else { cal.losses++; totalL++; if (direction === "Up") cal.upLosses++; else cal.downLosses++; }
+      cal.lastResults.push({ direction, won, pnl, ts: new Date(pos.closedAt || "").getTime() || Date.now() });
+      if (cal.lastResults.length > 50) cal.lastResults.shift();
+      cal.avgEdgeRealized = cal.totalPnl / Math.max(cal.totalTrades, 1);
+    }
+
+    // Persist to memory
+    for (const [asset, cal] of Object.entries(calibration)) {
+      if (cal.totalTrades > 0) {
+        storage.upsertMemory({ category: "micro_calibration", key: asset, value: JSON.stringify(cal), confidence: cal.wins / cal.totalTrades, createdAt: new Date().toISOString() });
+      }
     }
     calibrationLoaded = true;
 
-    logModelChange("ML_CALIBRATION", 
-      `Rebuilt from ${result.overall.trades} trades: ${result.overall.wins}W/${result.overall.losses}L ` +
-      `(${result.overall.winRate}%) P&L=$${result.overall.pnl} | ` +
-      Object.entries(result.perAsset).map(([a, c]) => 
-        `${a.toUpperCase()}: ${c.wins}W/${c.losses}L (${c.totalTrades > 0 ? Math.round(c.wins/c.totalTrades*100) : 0}%)`
-      ).join(", ")
+    const total = totalW + totalL;
+    logModelChange("CALIBRATION_REBUILD",
+      `${total} trades: ${totalW}W/${totalL}L (${total > 0 ? Math.round(totalW/total*100) : 0}%) P&L=$${Math.round(totalPnl*100)/100} | ` +
+      Object.entries(calibration).filter(([,c]) => c.totalTrades > 0).map(([a, c]) =>
+        `${a.toUpperCase()}: ${c.wins}W/${c.losses}L (${Math.round(c.wins/c.totalTrades*100)}%) Up:${c.upWins}/${c.upWins+c.upLosses} Down:${c.downWins}/${c.downWins+c.downLosses}`
+      ).join(" | ")
     );
   } catch (err) {
-    log(`ML calibration rebuild error: ${err}`, "micro");
-    loadCalibrationFromMemory(); // fallback
+    log(`Calibration rebuild error: ${err}`, "micro");
+    loadCalibrationFromMemory();
   }
 }
 

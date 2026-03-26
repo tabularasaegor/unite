@@ -423,7 +423,102 @@ export default function MicroDashboard() {
         </Card>
       )}
 
-      {/* Row 7: Recent Trades Table */}
+      {/* Row 7: Direction + Strategy + Hourly Analytics */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* Direction Stats */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Направление (Up vs Down)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {s.directionStats ? (
+              <div className="space-y-2">
+                <div className="flex justify-between items-center text-xs">
+                  <span className="font-medium text-green-500">Up (YES)</span>
+                  <span className="font-mono tabular-nums">
+                    {s.directionStats.up.wins}/{s.directionStats.up.trades} ({s.directionStats.up.trades > 0 ? Math.round(s.directionStats.up.wins/s.directionStats.up.trades*100) : 0}%)
+                  </span>
+                  <span className={`font-mono tabular-nums font-medium ${s.directionStats.up.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${s.directionStats.up.pnl}</span>
+                </div>
+                <div className="flex justify-between items-center text-xs">
+                  <span className="font-medium text-red-500">Down (NO)</span>
+                  <span className="font-mono tabular-nums">
+                    {s.directionStats.down.wins}/{s.directionStats.down.trades} ({s.directionStats.down.trades > 0 ? Math.round(s.directionStats.down.wins/s.directionStats.down.trades*100) : 0}%)
+                  </span>
+                  <span className={`font-mono tabular-nums font-medium ${s.directionStats.down.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${s.directionStats.down.pnl}</span>
+                </div>
+              </div>
+            ) : <p className="text-xs text-muted-foreground">Нет данных</p>}
+          </CardContent>
+        </Card>
+
+        {/* Strategy Stats */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Стратегии</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {(s.strategyBreakdown || []).length > 0 ? (
+              <div className="space-y-1">
+                {(s.strategyBreakdown || []).map((st: any) => (
+                  <div key={st.strategy} className="flex justify-between items-center text-xs">
+                    <span className="font-medium capitalize">{st.strategy}</span>
+                    <span className="font-mono tabular-nums">{st.wins}/{st.trades} ({st.winRate}%)</span>
+                    <span className={`font-mono tabular-nums font-medium ${st.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${st.pnl}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-xs text-muted-foreground">Нет данных</p>}
+          </CardContent>
+        </Card>
+
+        {/* Hourly Performance */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">По часам (UTC)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {(s.hourlyBreakdown || []).length > 0 ? (
+              <div className="space-y-1 max-h-32 overflow-y-auto">
+                {(s.hourlyBreakdown || []).map((h: any) => (
+                  <div key={h.hour} className="flex justify-between items-center text-xs">
+                    <span className="font-mono">{h.hour}</span>
+                    <span className={`font-mono tabular-nums ${h.winRate >= 60 ? "text-green-500" : h.winRate < 45 ? "text-red-500" : ""}`}>{h.winRate}%</span>
+                    <span className={`font-mono tabular-nums ${h.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${h.pnl}</span>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-xs text-muted-foreground">Нет данных</p>}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Row 8: Asset+Direction Matrix */}
+      {(s.assetDirectionMatrix || []).length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Матрица Актив × Направление</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-7 gap-2 py-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider border-b">
+              <div>Актив</div><div>Напр.</div><div>Сделок</div><div>Побед</div><div>WR%</div><div>P&L</div><div>Сигнал</div>
+            </div>
+            {(s.assetDirectionMatrix || []).sort((a: any, b: any) => b.pnl - a.pnl).map((m: any, i: number) => (
+              <div key={i} className="grid grid-cols-7 gap-2 py-1.5 items-center border-b border-border/20 text-xs">
+                <div className="font-semibold">{m.asset}</div>
+                <div>{m.direction === "Up" ? <span className="text-green-500">Up</span> : <span className="text-red-500">Down</span>}</div>
+                <div className="font-mono tabular-nums">{m.trades}</div>
+                <div className="font-mono tabular-nums">{m.wins}</div>
+                <div className={`font-mono tabular-nums font-medium ${m.winRate >= 60 ? "text-green-500" : m.winRate < 45 ? "text-red-500" : ""}`}>{m.winRate}%</div>
+                <div className={`font-mono tabular-nums font-medium ${m.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${m.pnl}</div>
+                <div className="text-muted-foreground">{m.winRate >= 55 ? "✓" : m.winRate < 45 ? "✗" : "—"}</div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Row 9: Recent Trades Table */}
       <Card>
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">

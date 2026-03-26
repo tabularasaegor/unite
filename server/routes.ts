@@ -530,6 +530,65 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         avgConfidence: a.trades > 0 ? Math.round(a.totalConfidence / a.trades * 100) : 0,
       }));
 
+      // --- Extended analytics ---
+      // Per-direction (Up vs Down)
+      const upTrades = timeSeries.filter(t => t.direction === "Up");
+      const downTrades = timeSeries.filter(t => t.direction === "Down");
+      const directionStats = {
+        up: { trades: upTrades.length, wins: upTrades.filter(t => t.won).length, pnl: Math.round(upTrades.reduce((s,t) => s+t.pnl, 0)*100)/100 },
+        down: { trades: downTrades.length, wins: downTrades.filter(t => t.won).length, pnl: Math.round(downTrades.reduce((s,t) => s+t.pnl, 0)*100)/100 },
+      };
+
+      // Per-strategy (from reasoning text in opportunities)
+      const strategyStats: Record<string, { trades: number; wins: number; pnl: number }> = {};
+      for (const pos of closedMicro) {
+        const opp = storage.getOpportunity(pos.opportunityId);
+        const desc = opp?.description || "";
+        let strategy = "unknown";
+        if (desc.includes("CONTRARIAN")) strategy = "contrarian";
+        else if (desc.includes("CALIBRATION")) strategy = "calibration";
+        else if (desc.includes("ALTERNATE")) strategy = "alternate";
+        else if (desc.includes("ML(")) strategy = "ml";
+        if (!strategyStats[strategy]) strategyStats[strategy] = { trades: 0, wins: 0, pnl: 0 };
+        strategyStats[strategy].trades++;
+        if ((pos.unrealizedPnl || 0) > 0) strategyStats[strategy].wins++;
+        strategyStats[strategy].pnl += pos.unrealizedPnl || 0;
+      }
+      const strategyBreakdown = Object.entries(strategyStats).map(([s, d]) => ({
+        strategy: s, trades: d.trades, wins: d.wins,
+        winRate: d.trades > 0 ? Math.round(d.wins/d.trades*100) : 0,
+        pnl: Math.round(d.pnl*100)/100,
+      }));
+
+      // Hourly breakdown
+      const hourlyMap: Record<string, { trades: number; wins: number; pnl: number }> = {};
+      for (const t of timeSeries) {
+        const h = t.time.slice(11, 13) || "??";
+        if (!hourlyMap[h]) hourlyMap[h] = { trades: 0, wins: 0, pnl: 0 };
+        hourlyMap[h].trades++;
+        if (t.won) hourlyMap[h].wins++;
+        hourlyMap[h].pnl += t.pnl;
+      }
+      const hourlyBreakdown = Object.entries(hourlyMap).sort(([a],[b]) => a.localeCompare(b)).map(([h, d]) => ({
+        hour: h + ":00 UTC", trades: d.trades, wins: d.wins,
+        winRate: d.trades > 0 ? Math.round(d.wins/d.trades*100) : 0,
+        pnl: Math.round(d.pnl*100)/100,
+      }));
+
+      // Per-asset + direction matrix
+      const assetDirectionMatrix: Array<{ asset: string; direction: string; trades: number; wins: number; winRate: number; pnl: number }> = [];
+      for (const t of timeSeries) {
+        let entry = assetDirectionMatrix.find(e => e.asset === t.asset && e.direction === t.direction);
+        if (!entry) {
+          entry = { asset: t.asset, direction: t.direction, trades: 0, wins: 0, winRate: 0, pnl: 0 };
+          assetDirectionMatrix.push(entry);
+        }
+        entry.trades++;
+        if (t.won) entry.wins++;
+        entry.pnl += t.pnl;
+      }
+      assetDirectionMatrix.forEach(e => { e.winRate = e.trades > 0 ? Math.round(e.wins/e.trades*100) : 0; e.pnl = Math.round(e.pnl*100)/100; });
+
       res.json({
         totalTrades,
         totalWins,
@@ -543,7 +602,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         maxLossStreak,
         currentStreak,
         assetStats,
-        timeSeries: timeSeries.slice(-100), // Last 100
+        directionStats,
+        strategyBreakdown,
+        hourlyBreakdown,
+        assetDirectionMatrix,
+        timeSeries: timeSeries.slice(-100),
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
