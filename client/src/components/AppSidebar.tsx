@@ -15,7 +15,6 @@ import {
   FileBarChart,
   Zap,
   Gauge,
-  LogOut,
 } from "lucide-react";
 
 const pipelineItems = [
@@ -44,7 +43,6 @@ const bottomItems = [
 interface AppSidebarProps {
   theme: "light" | "dark";
   toggleTheme: () => void;
-  onLogout: () => void;
 }
 
 function NavItem({ item, location }: { item: { href: string; label: string; icon: any }; location: string }) {
@@ -71,7 +69,7 @@ function NavItem({ item, location }: { item: { href: string; label: string; icon
   );
 }
 
-export default function AppSidebar({ theme, toggleTheme, onLogout }: AppSidebarProps) {
+export default function AppSidebar({ theme, toggleTheme }: AppSidebarProps) {
   const [location] = useLocation();
 
   return (
@@ -132,14 +130,7 @@ export default function AppSidebar({ theme, toggleTheme, onLogout }: AppSidebarP
           {theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           {theme === "dark" ? "Светлая тема" : "Тёмная тема"}
         </button>
-        <button
-          onClick={onLogout}
-          className="flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-colors w-full"
-          data-testid="button-logout"
-        >
-          <LogOut className="w-4 h-4" />
-          Выйти
-        </button>
+
       </div>
     </aside>
   );

@@ -1,4 +1,4 @@
-import { Component, useState, type ReactNode } from "react";
+import { Component, type ReactNode } from "react";
 import { Switch, Route, Router } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
 import { queryClient } from "./lib/queryClient";
@@ -22,9 +22,7 @@ import MicroPositions from "@/pages/micro-positions";
 import MicroTrades from "@/pages/micro-trades";
 import MicroSettlements from "@/pages/micro-settlements";
 import AppSidebar from "@/components/AppSidebar";
-import LoginPage from "@/pages/login";
 import { useTheme } from "@/hooks/use-theme";
-import { isAuthenticated, logout } from "@/lib/auth";
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean; error: string }> {
   constructor(props: { children: ReactNode }) {
@@ -48,12 +46,12 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boole
   }
 }
 
-function AppLayout({ onLogout }: { onLogout: () => void }) {
+function AppLayout() {
   const { theme, toggleTheme } = useTheme();
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
-      <AppSidebar theme={theme} toggleTheme={toggleTheme} onLogout={onLogout} />
+      <AppSidebar theme={theme} toggleTheme={toggleTheme} />
       <Switch>
         <Route path="/" component={Dashboard} />
         <Route path="/scanner" component={Scanner} />
@@ -77,35 +75,13 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
 }
 
 function App() {
-  const [authed, setAuthed] = useState(isAuthenticated());
-
-  const handleLogout = () => {
-    logout();
-    queryClient.clear();
-    setAuthed(false);
-  };
-
-  const handleLogin = () => {
-    // Clear any stale cached queries from before auth
-    queryClient.clear();
-    setAuthed(true);
-  };
-
-  if (!authed) {
-    return (
-      <ErrorBoundary>
-        <LoginPage onLogin={handleLogin} />
-      </ErrorBoundary>
-    );
-  }
-
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
         <TooltipProvider>
           <Toaster />
           <Router hook={useHashLocation}>
-            <AppLayout onLogout={handleLogout} />
+            <AppLayout />
           </Router>
         </TooltipProvider>
       </QueryClientProvider>

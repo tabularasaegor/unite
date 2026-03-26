@@ -4,13 +4,6 @@ const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {
-    // On 401, clear stale token and force re-login
-    if (res.status === 401) {
-      const { logout } = await import("@/lib/auth");
-      logout();
-      window.location.reload();
-      return;
-    }
     const text = (await res.text()) || res.statusText;
     throw new Error(`${res.status}: ${text}`);
   }
@@ -23,8 +16,6 @@ export async function apiRequest(
 ): Promise<Response> {
   const headers: Record<string, string> = {};
   if (data) headers["Content-Type"] = "application/json";
-  const token = (window as any).__AUTH_TOKEN__;
-  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${url}`, {
     method,
     headers,
@@ -35,25 +26,15 @@ export async function apiRequest(
   return res;
 }
 
-type UnauthorizedBehavior = "returnNull" | "throw";
 export const getQueryFn: <T>(options: {
-  on401: UnauthorizedBehavior;
+  on401: "returnNull" | "throw";
 }) => QueryFunction<T> =
   ({ on401: unauthorizedBehavior }) =>
   async ({ queryKey }) => {
-    // Only join string parts of queryKey for URL, skip objects
     const urlParts = queryKey.filter((k): k is string => typeof k === "string");
-    const headers: Record<string, string> = {};
-    const token = (window as any).__AUTH_TOKEN__;
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-    const res = await fetch(`${API_BASE}${urlParts.join("/")}`, { headers });
+    const res = await fetch(`${API_BASE}${urlParts.join("/")}`);
 
-    if (res.status === 401) {
-      if (unauthorizedBehavior === "returnNull") return null;
-      // Clear stale token and force re-login
-      const { logout } = await import("@/lib/auth");
-      logout();
-      window.location.reload();
+    if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;
     }
 
@@ -67,7 +48,7 @@ export const queryClient = new QueryClient({
       queryFn: getQueryFn({ on401: "throw" }),
       refetchInterval: false,
       refetchOnWindowFocus: false,
-      staleTime: 30000, // 30 seconds — data refreshes on navigation
+      staleTime: 30000,
       retry: 1,
     },
     mutations: {
