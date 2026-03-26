@@ -204,29 +204,176 @@ export async function scanMarkets(): Promise<{
   return result;
 }
 
-// ─── Research (placeholder) ──────────────────────────────────────
+
+// ─── Research ────────────────────────────────────────────────────
 
 /**
- * Run AI research on an opportunity. Placeholder — updates pipeline stage.
+ * Run research on an opportunity: fetch fresh market data, compute basic metrics,
+ * generate a research report and probability estimate, then advance to risk assessment.
  */
 export async function runResearch(opportunityId: number): Promise<{ success: boolean; message: string }> {
   const opp = await storage.getOpportunity(opportunityId);
   if (!opp) {
-    return { success: false, message: "Opportunity not found" };
+    return { success: false, message: "Возможность не найдена" };
   }
 
-  // Update stage
   await storage.updateOpportunity(opportunityId, { pipelineStage: "researching" });
 
-  // Placeholder: in production this would call AI agents
-  await storage.updateOpportunity(opportunityId, {
-    pipelineStage: "researched",
+  try {
+    // 1. Fetch fresh market data from Gamma
+    let freshPrice: number | null = opp.currentPrice;
+    let freshVolume = opp.volume24h || 0;
+    let outcomes: string[] = [];
+    let prices: number[] = [];
+    if (opp.externalId) {
+      try {
+        const resp = await fetch(`${GAMMA_BASE}/events/${opp.externalId}`);
+        if (resp.ok) {
+          const ev = await resp.json() as GammaEvent;
+          freshVolume = ev.volume24hr || freshVolume;
+          if (ev.markets?.[0]) {
+            try { outcomes = JSON.parse(ev.markets[0].outcomePrices || "[]"); } catch {}
+            try { prices = JSON.parse(ev.markets[0].outcomePrices || "[]").map(Number); } catch {}
+            freshPrice = prices[0] ?? freshPrice;
+          }
+        }
+      } catch { /* use cached data */ }
+    }
+
+    // 2. Generate research report
+    const impliedProb = freshPrice ?? 0.5;
+    const spreadInfo = prices.length >= 2
+      ? `Yes: ${(prices[0]*100).toFixed(1)}%, No: ${(prices[1]*100).toFixed(1)}%`
+      : "N/A";
+
+    const reportBody = [
+      `## Исследование: ${opp.title}`,
+      ``,
+      `**Категория:** ${opp.category}`,
+      `**Платформа:** ${opp.platform}`,
+      `**Объём 24ч:** $${freshVolume.toLocaleString()}`,
+      `**Текущая цена (implied prob):** ${(impliedProb * 100).toFixed(1)}%`,
+      `**Расклад:** ${spreadInfo}`,
+      `**Дата завершения:** ${opp.endDate || "N/A"}`,
+      ``,
+      `### Анализ`,
+      impliedProb > 0.85
+        ? `Рынок сильно склоняется к "Yes" (${(impliedProb*100).toFixed(0)}%). Ограниченный upside для Yes-позиции.`
+        : impliedProb < 0.15
+        ? `Рынок сильно склоняется к "No" (Yes всего ${(impliedProb*100).toFixed(0)}%). Ограниченный upside для No.`
+        : `Рынок в зоне неопределённости (${(impliedProb*100).toFixed(0)}%). Потенциально интересно для торговли.`,
+      ``,
+      freshVolume < 5000
+        ? `⚠️ Низкий объём ($${freshVolume}) — ликвидность может быть недостаточной.`
+        : `✅ Достаточный объём ($${freshVolume.toLocaleString()}) для торговли.`,
+    ].join("\n");
+
+    // Save research report
+    await storage.createResearchReport({
+      opportunityId,
+      content: reportBody,
+      agentModel: "pipeline-analyzer",
+    });
+
+    // 3. Generate probability estimate
+    const volumeAdjust = freshVolume > 50000 ? 0.02 : freshVolume > 10000 ? 0.01 : 0;
+    const estimatedProb = Math.max(0.05, Math.min(0.95,
+      impliedProb + (impliedProb > 0.5 ? volumeAdjust : -volumeAdjust)));
+
+    await storage.createProbabilityEstimate({
+      opportunityId,
+      yesProb: estimatedProb,
+      noProb: 1 - estimatedProb,
+      method: "market-implied + volume-adjustment",
+    });
+
+    // 4. Advance stage
+    await storage.updateOpportunity(opportunityId, {
+      pipelineStage: "estimated",
+      currentPrice: freshPrice,
+      volume24h: freshVolume,
+    });
+
+    // 5. Automatic risk assessment
+    await runRiskAssessment(opportunityId, estimatedProb, freshPrice ?? 0.5, freshVolume);
+
+    await storage.addAuditEntry("исследование",
+      `Исследование + оценка рисков завершены для #${opportunityId}: ${opp.title}`);
+
+    return { success: true, message: `Исследование завершено, оценка вероятности: ${(estimatedProb * 100).toFixed(1)}%` };
+  } catch (err) {
+    console.error(`[Pipeline] Research error for #${opportunityId}:`, err);
+    await storage.updateOpportunity(opportunityId, { pipelineStage: "scanned" });
+    return { success: false, message: `Ошибка исследования: ${String(err)}` };
+  }
+}
+
+// ─── Risk Assessment ────────────────────────────────────────────
+
+async function runRiskAssessment(
+  opportunityId: number,
+  estimatedProb: number,
+  marketPrice: number,
+  volume24h: number
+) {
+  // Kelly Criterion: f* = (bp - q) / b
+  const edge = estimatedProb - marketPrice;
+  const b = marketPrice > 0 && marketPrice < 1 ? (1 / marketPrice - 1) : 1;
+  const kellyFraction = edge > 0 ? (b * estimatedProb - (1 - estimatedProb)) / b : 0;
+  const halfKelly = Math.max(0, kellyFraction * 0.5);
+
+  // Risk level
+  let riskLevel: string;
+  if (Math.abs(edge) < 0.03) riskLevel = "low";
+  else if (Math.abs(edge) < 0.10) riskLevel = "medium";
+  else riskLevel = "high";
+
+  const liquidityRisk = volume24h < 5000 ? "high" : volume24h < 20000 ? "medium" : "low";
+
+  await storage.createRiskAssessment({
+    opportunityId,
+    riskLevel,
+    kellyFraction: Math.round(halfKelly * 10000) / 10000,
+    edge: Math.round(edge * 10000) / 10000,
+    notes: `Edge: ${(edge * 100).toFixed(2)}%, Half-Kelly: ${(halfKelly * 100).toFixed(2)}%, Ликвидность: ${liquidityRisk}, Объём: $${volume24h.toLocaleString()}`,
   });
 
-  await storage.addAuditEntry("исследование",
-    `Исследование завершено для #${opportunityId}: ${opp.title}`);
+  await storage.updateOpportunity(opportunityId, { pipelineStage: "risk_assessed" });
+}
 
-  return { success: true, message: "Research completed (placeholder)" };
+// ─── Batch Process Pipeline ─────────────────────────────────────
+
+/**
+ * Process all scanned opportunities through research + risk assessment.
+ */
+export async function processPipeline(): Promise<{
+  processed: number;
+  errors: number;
+}> {
+  const allOpps = await storage.getOpportunities();
+  const scanned = allOpps.filter(o => o.pipelineStage === "scanned");
+
+  let processed = 0;
+  let errors = 0;
+
+  for (const opp of scanned) {
+    try {
+      const result = await runResearch(opp.id);
+      if (result.success) {
+        processed++;
+      } else {
+        errors++;
+      }
+    } catch (err) {
+      console.error(`[Pipeline] Error processing #${opp.id}:`, err);
+      errors++;
+    }
+  }
+
+  await storage.addModelLog("PIPELINE_PROCESS", undefined,
+    JSON.stringify({ processed, errors, total: scanned.length }));
+
+  return { processed, errors };
 }
 
 // ─── Pipeline Dashboard Stats ────────────────────────────────────

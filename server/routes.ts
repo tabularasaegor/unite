@@ -13,6 +13,7 @@ import {
   scanMarkets,
   runResearch,
   getPipelineDashboard,
+  processPipeline,
 } from "./services/pipelineEngine";
 import { runBacktest } from "./services/backtestEngine";
 
@@ -581,11 +582,11 @@ export async function registerRoutes(
   // POST /api/micro/scheduler/start
   app.post("/api/micro/scheduler/start", async (_req: Request, res: Response) => {
     try {
-      startScheduler();
+      await startScheduler();
       return res.json({
         ok: true,
         message: "Планировщик запущен",
-        status: getSchedulerStatus(),
+        status: await getSchedulerStatus(),
       });
     } catch (err) {
       console.error("[Micro] Scheduler start error:", err);
@@ -596,11 +597,11 @@ export async function registerRoutes(
   // POST /api/micro/scheduler/stop
   app.post("/api/micro/scheduler/stop", async (_req: Request, res: Response) => {
     try {
-      stopScheduler();
+      await stopScheduler();
       return res.json({
         ok: true,
         message: "Планировщик остановлен",
-        status: getSchedulerStatus(),
+        status: await getSchedulerStatus(),
       });
     } catch (err) {
       console.error("[Micro] Scheduler stop error:", err);
@@ -611,7 +612,7 @@ export async function registerRoutes(
   // GET /api/micro/scheduler/status
   app.get("/api/micro/scheduler/status", async (_req: Request, res: Response) => {
     try {
-      return res.json(getSchedulerStatus());
+      return res.json(await getSchedulerStatus());
     } catch (err) {
       console.error("[Micro] Scheduler status error:", err);
       return res.status(500).json({ message: "Ошибка получения статуса" });
@@ -688,14 +689,35 @@ export async function registerRoutes(
   app.post("/api/pipeline/scan", async (_req: Request, res: Response) => {
     try {
       const result = await scanMarkets();
+      // Auto-process scanned opportunities through research + risk assessment
+      let pipelineResult = { processed: 0, errors: 0 };
+      if (result.added > 0) {
+        pipelineResult = await processPipeline();
+      }
       return res.json({
         ok: true,
-        message: `Сканирование завершено: найдено ${result.added} новых возможностей`,
+        message: `Сканирование: ${result.added} новых, исследовано: ${pipelineResult.processed}`,
         ...result,
+        pipeline: pipelineResult,
       });
     } catch (err) {
       console.error("[Pipeline] Scan error:", err);
       return res.status(500).json({ message: "Ошибка сканирования рынков" });
+    }
+  });
+
+  // POST /api/pipeline/process — process all scanned opportunities
+  app.post("/api/pipeline/process", async (_req: Request, res: Response) => {
+    try {
+      const result = await processPipeline();
+      return res.json({
+        ok: true,
+        message: `Обработано ${result.processed} возможностей`,
+        ...result,
+      });
+    } catch (err) {
+      console.error("[Pipeline] Process error:", err);
+      return res.status(500).json({ message: "Ошибка обработки пайплайна" });
     }
   });
 

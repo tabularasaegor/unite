@@ -543,6 +543,68 @@ export const storage = {
       .orderBy(desc(backtestResults.winRate));
   },
 
+  // ── Research Reports ──
+  async createResearchReport(data: {
+    opportunityId: number;
+    content: string;
+    agentModel?: string;
+  }) {
+    await db.insert(researchReports).values({
+      opportunityId: data.opportunityId,
+      agentType: data.agentModel || "pipeline-analyzer",
+      content: data.content,
+    });
+  },
+
+  async getResearchReports(opportunityId: number) {
+    return await db.select().from(researchReports)
+      .where(eq(researchReports.opportunityId, opportunityId))
+      .orderBy(desc(researchReports.createdAt));
+  },
+
+  // ── Probability Estimates ──
+  async createProbabilityEstimate(data: {
+    opportunityId: number;
+    yesProb: number;
+    noProb: number;
+    method?: string;
+  }) {
+    await db.insert(probabilityEstimates).values({
+      opportunityId: data.opportunityId,
+      modelName: data.method || "market-implied",
+      estimatedProbability: data.yesProb,
+      reasoning: `Yes: ${(data.yesProb * 100).toFixed(1)}%, No: ${(data.noProb * 100).toFixed(1)}%`,
+    });
+  },
+
+  async getProbabilityEstimates(opportunityId: number) {
+    return await db.select().from(probabilityEstimates)
+      .where(eq(probabilityEstimates.opportunityId, opportunityId))
+      .orderBy(desc(probabilityEstimates.createdAt));
+  },
+
+  // ── Risk Assessments ──
+  async createRiskAssessment(data: {
+    opportunityId: number;
+    riskLevel: string;
+    kellyFraction: number;
+    edge: number;
+    notes?: string;
+  }) {
+    await db.insert(riskAssessments).values({
+      opportunityId: data.opportunityId,
+      kellyFraction: data.kellyFraction,
+      riskScore: data.edge,
+      blockReason: data.notes || null,
+    });
+  },
+
+  async getRiskAssessments(opportunityId: number) {
+    return await db.select().from(riskAssessments)
+      .where(eq(riskAssessments.opportunityId, opportunityId))
+      .orderBy(desc(riskAssessments.createdAt));
+  },
+
   // ── Delete memory entry (for logout) ──
   async deleteMemory(category: string, key: string) {
     await db.delete(memoryStore).where(

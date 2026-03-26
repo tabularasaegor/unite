@@ -139,13 +139,13 @@ function computeEMA(prices: number[], period: number): number[] {
 
 function strategyContrarian(upPct: number, _downPct: number): StrategySignal {
   const deviation = Math.abs(upPct - 0.5);
-  if (deviation <= 0.03) {
+  if (deviation <= 0.005) {
     return { direction: "skip", confidence: 0.49, strategyName: "contrarian" };
   }
   // Bet against majority
   const direction: "up" | "down" = upPct > 0.5 ? "down" : "up";
-  const confidence = 0.5 + deviation * 0.3;
-  return { direction, confidence: Math.min(confidence, 0.70), strategyName: "contrarian" };
+  const confidence = 0.50 + deviation * 0.4;
+  return { direction, confidence: Math.min(confidence, 0.72), strategyName: "contrarian" };
 }
 
 async function strategyMomentum(asset: Asset, upTokenId: string): Promise<StrategySignal> {
@@ -241,12 +241,12 @@ async function strategyOrderBookImbalance(
     let direction: "up" | "down" | "skip" = "skip";
     let confidence = 0.49;
 
-    if (obi > 0.15) {
+    if (obi > 0.03) {
       direction = "up";
-      confidence = 0.50 + Math.abs(obi) * 0.2;
-    } else if (obi < -0.15) {
+      confidence = 0.51 + Math.abs(obi) * 0.35;
+    } else if (obi < -0.03) {
       direction = "down";
-      confidence = 0.50 + Math.abs(obi) * 0.2;
+      confidence = 0.51 + Math.abs(obi) * 0.35;
     }
 
     return {
@@ -263,7 +263,7 @@ function strategyAlternating(windowEnd: number): StrategySignal {
   const parity = Math.floor(windowEnd / 300) % 2;
   return {
     direction: parity === 0 ? "up" : "down",
-    confidence: 0.50,
+    confidence: 0.53,
     strategyName: "alternating",
   };
 }
@@ -289,9 +289,12 @@ async function selectStrategyByThompson(asset: Asset): Promise<string> {
   let bestSample = -1;
   let bestStrategy = "skip";
 
-  // Sample from "skip" arm — starts at Beta(1,1)
+  // Sample from "skip" arm — use very pessimistic prior Beta(1, 5) so skip almost never wins
+  // This ensures the engine actively trades rather than defaulting to skip
   const skipPerf = await storage.getOrCreateStrategyPerf("skip", asset);
-  const skipSample = sampleBeta(skipPerf.alphaWins, skipPerf.betaLosses);
+  const skipAlpha = Math.max(skipPerf.alphaWins, 1);
+  const skipBeta = Math.max(skipPerf.betaLosses, 5);
+  const skipSample = sampleBeta(skipAlpha, skipBeta);
 
   bestSample = skipSample;
   bestStrategy = "skip";
@@ -322,7 +325,11 @@ async function selectStrategyByThompson(asset: Asset): Promise<string> {
       continue;
     }
 
-    const sample = sampleBeta(perf.alphaWins, perf.betaLosses);
+    // Use slightly optimistic priors Beta(2, 1) for strategies with 0 trades
+    // to encourage exploration over skipping
+    const alpha = perf.totalTrades === 0 ? Math.max(perf.alphaWins, 2) : perf.alphaWins;
+    const beta = perf.totalTrades === 0 ? Math.max(perf.betaLosses, 1) : perf.betaLosses;
+    const sample = sampleBeta(alpha, beta);
     if (sample > bestSample) {
       bestSample = sample;
       bestStrategy = stratName;
@@ -422,8 +429,13 @@ async function runStrategy(
 async function processNewWindow() {
   const windowEnd = getCurrentWindowEnd();
 
-  // Don't process same window twice
-  if (windowState.lastProcessedWindowEnd === windowEnd) return;
+  // Don't process same window twice if we already opened at least one position
+  if (windowState.lastProcessedWindowEnd === windowEnd) {
+    // But allow retries within first 2.5 min if no position was opened this window
+    const openPositions = await storage.getPositions({ source: "micro", status: "open" });
+    const hasPositionThisWindow = openPositions.some(p => p.windowEnd === windowEnd);
+    if (hasPositionThisWindow) return;
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const timeIntoWindow = now - (windowEnd - 300);
@@ -614,7 +626,7 @@ async function settleClosedWindows() {
       await storage.updatePosition(pos.id, {
         status: "settled",
         realizedPnl: pnl,
-        closedAt: new Date().toISOString(),
+        closedAt: new Date(),
       });
 
       // Create settlement
