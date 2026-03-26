@@ -100,7 +100,7 @@ export default function RiskConsole() {
                   {pos.asset?.toUpperCase() ?? `#${pos.opportunityId}`}
                 </TableCell>
                 <TableCell>
-                  <StatusBadge status={pos.side === "yes" || pos.side === "Up" ? "Up" : "Down"} />
+                  <StatusBadge status={pos.side?.toLowerCase() === "yes" || pos.side?.toLowerCase() === "up" ? "Up" : "Down"} />
                 </TableCell>
                 <TableCell className="font-mono text-sm">${pos.size.toFixed(2)}</TableCell>
                 <TableCell className="font-mono text-sm">${pos.entryPrice.toFixed(4)}</TableCell>

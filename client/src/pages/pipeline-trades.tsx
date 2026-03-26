@@ -31,7 +31,7 @@ export default function PipelineTrades() {
                   <StatusBadge status={t.type} />
                 </TableCell>
                 <TableCell>
-                  <StatusBadge status={t.side === "yes" ? "Yes" : "No"} />
+                  <StatusBadge status={t.side?.toLowerCase() === "yes" || t.side?.toLowerCase() === "up" ? "Yes" : "No"} />
                 </TableCell>
                 <TableCell className="font-mono text-sm">${t.price.toFixed(4)}</TableCell>
                 <TableCell className="font-mono text-sm">${t.size.toFixed(2)}</TableCell>

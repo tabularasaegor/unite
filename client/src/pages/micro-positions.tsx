@@ -22,7 +22,7 @@ function PositionsTable({ positions, isLoading }: { positions: ActivePosition[];
             {pos.asset?.toUpperCase() ?? "—"}
           </TableCell>
           <TableCell>
-            <StatusBadge status={pos.side === "yes" || pos.side === "Up" ? "Up" : "Down"} />
+            <StatusBadge status={pos.side?.toLowerCase() === "yes" || pos.side?.toLowerCase() === "up" ? "Up" : "Down"} />
           </TableCell>
           <TableCell className="font-mono text-sm">${pos.entryPrice.toFixed(4)}</TableCell>
           <TableCell className="font-mono text-sm">${(pos.currentPrice ?? 0).toFixed(4)}</TableCell>
