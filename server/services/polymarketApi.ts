@@ -37,25 +37,24 @@ export function slugToTimestamp(slug: string): number {
 /**
  * Get current window end timestamp.
  * 
- * This returns the END time of the currently tradeable window.
- * If we're at 21:38, the next tradeable window starts at 21:40 and ends at 21:45.
- * getCurrentWindowEnd() returns 21:45 (1774561500).
- * The slug for this window uses 21:40 (the start): btc-updown-5m-1774561200
+ * Returns the END time of the window we are currently INSIDE.
+ * If we're at 22:42, we're inside window 22:40-22:45.
+ * getCurrentWindowEnd() returns 22:45 timestamp.
+ * The slug for this window uses 22:40 (the start): btc-updown-5m-{22:40}
  */
 export function getCurrentWindowEnd(): number {
   const t = Math.floor(Date.now() / 1000);
-  // Next 5-min boundary is the START of the next window
-  const nextWindowStart = Math.ceil(t / 300) * 300;
-  // The window ends 300s after it starts
-  return nextWindowStart + 300;
+  // floor → start of the current 5-min block; +300 → its end
+  return Math.floor(t / 300) * 300 + 300;
 }
 
 /**
  * Get current window start (= the slug timestamp for the current window).
+ * If we're at 22:42, returns 22:40 timestamp.
  */
 export function getCurrentWindowStart(): number {
   const t = Math.floor(Date.now() / 1000);
-  return Math.ceil(t / 300) * 300;
+  return Math.floor(t / 300) * 300;
 }
 
 /**

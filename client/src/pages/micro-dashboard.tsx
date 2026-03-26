@@ -182,7 +182,7 @@ export default function MicroDashboard() {
             </div>
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Clock className="h-4 w-4" />
-              <span>Следующее окно:</span>
+              <span>Закрытие окна:</span>
               <span className="font-mono font-medium text-foreground" data-testid="text-countdown">
                 {countdown}
               </span>
