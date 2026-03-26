@@ -1,17 +1,18 @@
 /**
- * Micro Engine — Adaptive Multi-Strategy 5-Minute Trading Engine v4
+ * Micro Engine — Adaptive Multi-Strategy 5-Minute Trading Engine v5
  *
  * Core of AlgoTrader. Uses Thompson Sampling (Multi-Armed Bandit)
- * to select from 6 strategies per asset per window, with Bayesian
+ * to select from top strategies per asset per window, with Bayesian
  * quality control, adaptive bet sizing, and automatic settlement.
  *
- * v4 Changes:
- * - Added "marketFollow" strategy as reliable fallback (follow majority opinion)
- * - Relaxed strategy skip thresholds so trades actually happen
- * - Improved window processing: guaranteed at least 1 trade attempt per window
- * - Better Thompson Sampling priors and skip arm handling
- * - Improved confidence formulas for higher WR
- * - Added detailed logging for every decision point
+ * v5 Changes (data-driven optimization):
+ * - REMOVED alternating strategy (1W/3L, PnL -$50.50 — worst performer)
+ * - marketFollow as primary strategy (3W/0L, PnL +$73.50 — best)
+ * - contrarian as secondary strategy (1W/0L, PnL +$25.51)
+ * - Stronger edge filter: skip when midpoint is 0.49-0.51 (no real edge)
+ * - Reduced bet size for unproven strategies (< 5 trades)
+ * - Aggressive Thompson Sampling priors based on live data
+ * - Tighter drawdown brake and faster cooldown response
  */
 
 import { storage } from "../storage";
@@ -45,23 +46,26 @@ interface WindowState {
 
 // ─── Constants ───────────────────────────────────────────────────
 
-const STRATEGY_NAMES = ["contrarian", "momentum", "meanReversion", "orderBookImbalance", "alternating", "marketFollow"] as const;
+// Removed "alternating" — proven worst strategy (1W/3L, PnL -$50.50)
+const STRATEGY_NAMES = ["contrarian", "momentum", "meanReversion", "orderBookImbalance", "marketFollow"] as const;
 type StrategyName = (typeof STRATEGY_NAMES)[number];
 
-const DISCOUNT_LAMBDA = 0.995;
-const BET_SIZE_WIN_DELTA = 0.1;
-const BET_SIZE_LOSS_DELTA = 0.2;
+const DISCOUNT_LAMBDA = 0.993; // Faster forgetting → adapts quicker
+const BET_SIZE_WIN_DELTA = 0.08;
+const BET_SIZE_LOSS_DELTA = 0.15;
 const BET_SIZE_MIN = 0.3;
-const BET_SIZE_MAX = 1.5;
+const BET_SIZE_MAX = 1.3;
 const MIN_BET = 3;
-const COOLDOWN_WR_THRESHOLD = 0.25;
-const COOLDOWN_LOOKBACK = 8;
+const COOLDOWN_WR_THRESHOLD = 0.30; // Stricter cooldown (was 0.25)
+const COOLDOWN_LOOKBACK = 6; // React faster to losing streaks (was 8)
 const COOLDOWN_DURATION_MS = 10 * 60 * 1000; // 10 min
 const DISABLE_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
 const CI_LOWER_THRESHOLD = 0.42;
 const SETTLEMENT_DELAY_SEC = 30;
 const FORCE_SETTLE_SEC = 900; // 15 min — Polymarket needs 5-10 min to resolve
-const MAX_TRADE_WINDOW_SEC = 180; // Trade within first 3 minutes (was 2.5)
+const MAX_TRADE_WINDOW_SEC = 180; // Trade within first 3 minutes
+const MIN_EDGE_MIDPOINT = 0.015; // Skip when midpoint is within 1.5% of 50/50 — no real edge
+const PROVEN_STRATEGY_THRESHOLD = 5; // Need at least 5 trades before full bet sizing
 
 // ─── Module State ────────────────────────────────────────────────
 
@@ -73,6 +77,9 @@ let windowState: WindowState = {
   pendingSettlement: new Set(),
   windowAttempts: new Map(),
 };
+
+// In-memory lock to prevent duplicate trades during concurrent ticks
+const tradedThisWindow: Set<string> = new Set(); // "asset:windowEnd"
 
 // Per-asset cooldowns: asset → cooldown expiry timestamp
 const assetCooldowns: Map<string, number> = new Map();
@@ -145,16 +152,17 @@ function computeEMA(prices: number[], period: number): number[] {
 /**
  * Contrarian: bet against the market majority.
  * When upPct is far from 0.5, bet the other way.
- * Relaxed: skip only when deviation ≤ 0.003 (nearly 50/50).
+ * Live data: 1W/0L, PnL +$25.51 — proven secondary strategy.
+ * Skip when deviation is tiny (no clear majority to fade).
  */
 function strategyContrarian(upPct: number, _downPct: number): StrategySignal {
   const deviation = Math.abs(upPct - 0.5);
-  if (deviation <= 0.003) {
+  if (deviation <= 0.005) {
     return { direction: "skip", confidence: 0.49, strategyName: "contrarian" };
   }
   const direction: "up" | "down" = upPct > 0.5 ? "down" : "up";
   // Higher deviation → higher confidence in contrarian bet
-  const confidence = 0.52 + deviation * 0.5;
+  const confidence = 0.53 + deviation * 0.55;
   return { direction, confidence: Math.min(confidence, 0.75), strategyName: "contrarian" };
 }
 
@@ -285,23 +293,13 @@ async function strategyOrderBookImbalance(
   }
 }
 
-/**
- * Alternating: simple parity-based strategy.
- * Slight edge from market maker patterns.
- */
-function strategyAlternating(windowEnd: number): StrategySignal {
-  const parity = Math.floor(windowEnd / 300) % 2;
-  return {
-    direction: parity === 0 ? "up" : "down",
-    confidence: 0.52,
-    strategyName: "alternating",
-  };
-}
+// alternating strategy REMOVED — 1W/3L, PnL -$50.50 in live trading
 
 /**
  * Market Follow: follow the majority market opinion.
  * This is the OPPOSITE of contrarian — bet WITH the crowd.
  * On 5-min markets, the majority is often right.
+ * Live data: 3W/0L, PnL +$73.50 — BEST strategy.
  * This strategy NEVER skips (always produces a signal).
  */
 function strategyMarketFollow(upPct: number, downPct: number): StrategySignal {
@@ -309,10 +307,11 @@ function strategyMarketFollow(upPct: number, downPct: number): StrategySignal {
   // Follow the majority
   const direction: "up" | "down" = upPct >= 0.5 ? "up" : "down";
   // Higher deviation → higher confidence (crowd is more certain)
-  const confidence = 0.52 + deviation * 0.35;
+  // Boosted confidence for proven strategy
+  const confidence = 0.53 + deviation * 0.45;
   return {
     direction,
-    confidence: Math.min(confidence, 0.70),
+    confidence: Math.min(confidence, 0.75),
     strategyName: "marketFollow",
   };
 }
@@ -367,15 +366,26 @@ async function selectStrategyByThompson(asset: Asset): Promise<string> {
       continue;
     }
 
-    // Optimistic priors for new strategies: Beta(3, 1) — encourages exploration
+    // Data-driven priors based on live performance:
+    // - marketFollow: 3W/0L → strong prior Beta(4, 1)
+    // - contrarian: 1W/0L → good prior Beta(3, 1)
+    // - Others: neutral prior Beta(2, 2) until proven
     let alpha: number, beta: number;
     if (perf.totalTrades === 0) {
-      alpha = 3;
-      beta = 1;
+      // Assign priors based on live data track record
+      if (stratName === "marketFollow") {
+        alpha = 4; beta = 1; // Proven best strategy
+      } else if (stratName === "contrarian") {
+        alpha = 3; beta = 1; // Proven secondary
+      } else {
+        alpha = 2; beta = 2; // Neutral until proven
+      }
     } else if (perf.totalTrades < 5) {
-      // Blend optimistic prior with actual data
-      alpha = 2 + perf.wins;
-      beta = 1 + perf.losses;
+      // Blend prior with actual data
+      const priorAlpha = stratName === "marketFollow" ? 3 : stratName === "contrarian" ? 2 : 1;
+      const priorBeta = stratName === "marketFollow" ? 0.5 : 1;
+      alpha = priorAlpha + perf.wins;
+      beta = priorBeta + perf.losses;
     } else {
       alpha = perf.alphaWins;
       beta = perf.betaLosses;
@@ -410,13 +420,21 @@ async function setBetSizeMultiplier(val: number) {
   await storage.setMemory("micro_state", "betSizeMultiplier", clamped.toString());
 }
 
-async function computeBetSize(confidence: number, maxBet: number): Promise<number> {
+async function computeBetSize(confidence: number, maxBet: number, strategyName?: string, asset?: string): Promise<number> {
   const edge = confidence - 0.5;
   let basePct: number;
   if (edge < 0.02) basePct = 0.25;
   else if (edge < 0.05) basePct = 0.50;
   else if (edge < 0.10) basePct = 0.75;
   else basePct = 1.0;
+
+  // Reduce bet size for unproven strategies (< PROVEN_STRATEGY_THRESHOLD trades)
+  if (strategyName && asset) {
+    const perf = await storage.getOrCreateStrategyPerf(strategyName, asset);
+    if (perf.totalTrades < PROVEN_STRATEGY_THRESHOLD) {
+      basePct *= 0.5; // Half size until strategy proves itself
+    }
+  }
 
   const multiplier = await getBetSizeMultiplier();
   const size = maxBet * basePct * multiplier;
@@ -476,8 +494,7 @@ async function runStrategy(
       return await strategyMeanReversion(asset, event.upTokenId);
     case "orderBookImbalance":
       return await strategyOrderBookImbalance(event.upTokenId, event.downTokenId);
-    case "alternating":
-      return strategyAlternating(event.windowEnd);
+    // alternating removed — worst performer in live data
     case "marketFollow":
       return strategyMarketFollow(upPct, downPct);
     default:
@@ -502,9 +519,15 @@ async function processNewWindow() {
   const attempts = windowState.windowAttempts.get(windowEnd) || 0;
   windowState.windowAttempts.set(windowEnd, attempts + 1);
 
-  // Clean up old window attempts (keep only current and previous)
+  // Clean up old window attempts and trade locks (keep only current and previous)
   for (const [we] of windowState.windowAttempts) {
     if (we < windowEnd - 300) windowState.windowAttempts.delete(we);
+  }
+  // Clean up trade locks for old windows
+  for (const key of tradedThisWindow) {
+    const parts = key.split(':');
+    const we = parseInt(parts[1]);
+    if (we < windowEnd - 300) tradedThisWindow.delete(key);
   }
 
   const assets = await getEnabledAssets();
@@ -528,12 +551,20 @@ async function processNewWindow() {
       // Check if we already have ANY position for this window+asset (open OR settled)
       // Use SLUG as the definitive check to prevent duplicates even if windowEnd values differ
       const slug = `${asset}-updown-5m-${windowStart}`;
+      const tradeKey = `${asset}:${windowEnd}`;
+
+      // In-memory dedup (prevents race between concurrent tick calls)
+      if (tradedThisWindow.has(tradeKey)) continue;
+
       const openPos = await storage.getPositions({ source: "micro", status: "open" });
       const settledPos = await storage.getPositions({ source: "micro", status: "settled" });
       const alreadyTraded = [...openPos, ...settledPos].some(
         p => p.asset === asset && (p.slug === slug || p.windowEnd === windowEnd)
       );
-      if (alreadyTraded) continue;
+      if (alreadyTraded) {
+        tradedThisWindow.add(tradeKey); // Cache the result
+        continue;
+      }
 
       // Fetch event
       const event = await fetchEventBySlug(slug);
@@ -556,6 +587,16 @@ async function processNewWindow() {
       const upPct = midpoints[event.upTokenId] || 0.5;
       const downPct = midpoints[event.downTokenId] || 0.5;
 
+      // Edge filter: skip when midpoint is too close to 50/50 (no real edge)
+      const midpointEdge = Math.abs(upPct - 0.5);
+      if (midpointEdge < MIN_EDGE_MIDPOINT) {
+        if (attempts <= 1) {
+          await storage.addModelLog("NO_EDGE", asset,
+            `Midpoint ${upPct.toFixed(4)}/${downPct.toFixed(4)} too close to 50/50 (edge=${(midpointEdge*100).toFixed(2)}% < ${MIN_EDGE_MIDPOINT*100}%)`);
+        }
+        continue;
+      }
+
       // Thompson Sampling: select strategy
       const selectedStrategy = await selectStrategyByThompson(asset);
 
@@ -567,6 +608,7 @@ async function processNewWindow() {
           if (fallbackSignal.confidence >= threshold) {
             await storage.addModelLog("FALLBACK_MARKET_FOLLOW", asset,
               `Thompson selected SKIP but falling back to marketFollow (attempt ${attempts + 1})`);
+            tradedThisWindow.add(tradeKey);
             await openTrade(asset, event, fallbackSignal, upPct, downPct, maxBet, slug, windowEnd);
             anyTradeOpened = true;
             continue;
@@ -587,6 +629,7 @@ async function processNewWindow() {
           if (fallbackSignal.confidence >= threshold) {
             await storage.addModelLog("FALLBACK_AFTER_SKIP", asset,
               `${selectedStrategy} returned skip, falling back to marketFollow`);
+            tradedThisWindow.add(tradeKey);
             await openTrade(asset, event, fallbackSignal, upPct, downPct, maxBet, slug, windowEnd);
             anyTradeOpened = true;
             continue;
@@ -604,6 +647,7 @@ async function processNewWindow() {
       }
 
       // Open the trade
+      tradedThisWindow.add(tradeKey); // Mark BEFORE opening to prevent races
       await openTrade(asset, event, signal, upPct, downPct, maxBet, slug, windowEnd);
       anyTradeOpened = true;
 
@@ -631,7 +675,7 @@ async function openTrade(
   slug: string,
   windowEnd: number
 ) {
-  const betSize = await computeBetSize(signal.confidence, maxBet);
+  const betSize = await computeBetSize(signal.confidence, maxBet, signal.strategyName, asset);
 
   // Determine entry price
   const entryPrice = signal.direction === "up" ? upPct : downPct;
