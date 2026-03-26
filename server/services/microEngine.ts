@@ -801,6 +801,66 @@ export function calibrateFromHistory() {
   console.log("[MicroEngine] Calibration complete.");
 }
 
+// ─── Apply Backtest Priors to Thompson Sampling ──────────────
+
+/**
+ * Takes backtest results and sets Thompson Sampling priors.
+ * Backtest WR is converted to informative Beta priors using
+ * scaled pseudo-counts: alpha = 1 + wins*scale, beta = 1 + losses*scale.
+ * Scale factor 0.3 gives the backtest ~30% weight of real data.
+ * Applied to ALL 4 assets equally (backtest is asset-agnostic).
+ */
+export function applyBacktestPriors(
+  results: { strategyName: string; winRate: number; totalTrades: number; wins: number; losses: number }[]
+) {
+  const PRIOR_SCALE = 0.3; // How much to weight backtest vs real experience
+  const assets: Asset[] = ["btc", "eth", "sol", "xrp"];
+
+  // Strategy name mapping: backtest uses same names as micro engine
+  const microStrategyNames = new Set<string>(STRATEGY_NAMES);
+
+  for (const result of results) {
+    // Only apply priors for strategies that exist in the micro engine
+    if (!microStrategyNames.has(result.strategyName)) continue;
+
+    const scaledWins = Math.max(0.5, result.wins * PRIOR_SCALE);
+    const scaledLosses = Math.max(0.5, result.losses * PRIOR_SCALE);
+    const newAlpha = 1 + scaledWins;
+    const newBeta = 1 + scaledLosses;
+
+    for (const asset of assets) {
+      const perf = storage.getOrCreateStrategyPerf(result.strategyName, asset);
+
+      // Only apply priors if there are fewer than 20 real trades
+      // (once enough real data exists, backtest priors become irrelevant)
+      if (perf.totalTrades >= 20) {
+        console.log(
+          `[MicroEngine] Skipping backtest prior for ${result.strategyName}/${asset}: ${perf.totalTrades} real trades exist`
+        );
+        continue;
+      }
+
+      storage.updateStrategyPerf(perf.id, {
+        alphaWins: newAlpha + (perf.totalTrades > 0 ? perf.wins : 0),
+        betaLosses: newBeta + (perf.totalTrades > 0 ? perf.losses : 0),
+      });
+
+      console.log(
+        `[MicroEngine] Applied backtest prior for ${result.strategyName}/${asset}: ` +
+        `alpha=${(newAlpha + (perf.totalTrades > 0 ? perf.wins : 0)).toFixed(2)}, ` +
+        `beta=${(newBeta + (perf.totalTrades > 0 ? perf.losses : 0)).toFixed(2)} ` +
+        `(backtest WR: ${(result.winRate * 100).toFixed(1)}%)`
+      );
+    }
+  }
+
+  storage.addModelLog(
+    "PRIORS_APPLIED",
+    undefined,
+    `Backtest priors applied for ${results.filter(r => microStrategyNames.has(r.strategyName)).length} strategies`
+  );
+}
+
 // ─── Main Tick (called every 30s by scheduler) ───────────────────
 
 export async function runMicroTick() {

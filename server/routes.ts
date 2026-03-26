@@ -7,6 +7,7 @@ import {
   stopScheduler,
   getSchedulerStatus,
   calibrateFromHistory,
+  applyBacktestPriors,
 } from "./services/microEngine";
 import {
   scanMarkets,
@@ -31,6 +32,20 @@ const DEFAULT_CONFIG: Record<string, string> = {
   micro_assets: "btc,eth,sol,xrp",
   confidence_threshold: "0.52",
 };
+
+// API key config keys — values are masked in GET /api/config
+const API_KEY_FIELDS = [
+  "api_key_openai",
+  "api_key_anthropic",
+  "poly_private_key",
+  "poly_funder_address",
+  "poly_signature_type",
+];
+
+function maskSecret(value: string): string {
+  if (!value || value.length <= 8) return "••••••••";
+  return value.slice(0, 4) + "••••••••" + value.slice(-4);
+}
 
 // ─── Auth Helpers ────────────────────────────────────────────────
 
@@ -293,10 +308,94 @@ export async function registerRoutes(
         configMap[item.key] = item.value;
       }
 
+      // Mask API keys in response — never send secrets to the frontend
+      for (const key of API_KEY_FIELDS) {
+        if (configMap[key]) {
+          configMap[key] = maskSecret(configMap[key]);
+        }
+      }
+
       return res.json(configMap);
     } catch (err) {
       console.error("[Config] Get error:", err);
       return res.status(500).json({ message: "Ошибка загрузки конфигурации" });
+    }
+  });
+
+  // GET /api/config/api-keys — returns which keys are set (boolean flags)
+  app.get("/api/config/api-keys", async (_req: Request, res: Response) => {
+    try {
+      const keys: Record<string, { set: boolean; masked: string }> = {};
+      for (const key of API_KEY_FIELDS) {
+        const val = storage.getConfig(key);
+        keys[key] = {
+          set: !!val && val.length > 0,
+          masked: val ? maskSecret(val) : "",
+        };
+      }
+      return res.json(keys);
+    } catch (err) {
+      console.error("[Config] API keys check error:", err);
+      return res.status(500).json({ message: "Ошибка чтения API ключей" });
+    }
+  });
+
+  // GET /api/system/warnings — returns list of warnings about missing configuration
+  app.get("/api/system/warnings", async (_req: Request, res: Response) => {
+    try {
+      const warnings: { id: string; severity: "error" | "warning" | "info"; message: string }[] = [];
+
+      const openaiKey = storage.getConfig("api_key_openai");
+      const anthropicKey = storage.getConfig("api_key_anthropic");
+      const polyKey = storage.getConfig("poly_private_key");
+      const polyAddress = storage.getConfig("poly_funder_address");
+      const paperTrading = storage.getConfig("paper_trading") ?? "true";
+
+      if (!openaiKey) {
+        warnings.push({
+          id: "no_openai_key",
+          severity: "error",
+          message: "OpenAI API ключ не указан — AI-анализ (пайплайн, исследование) не будет работать",
+        });
+      }
+      if (!anthropicKey) {
+        warnings.push({
+          id: "no_anthropic_key",
+          severity: "warning",
+          message: "Anthropic API ключ не указан — резервная AI-модель недоступна",
+        });
+      }
+      if (!polyKey) {
+        warnings.push({
+          id: "no_poly_key",
+          severity: paperTrading === "true" ? "warning" : "error",
+          message: paperTrading === "true"
+            ? "Polymarket приватный ключ не указан — live-торговля невозможна (paper trading активен)"
+            : "Polymarket приватный ключ не указан — live-торговля невозможна!",
+        });
+      }
+      if (!polyAddress && polyKey) {
+        warnings.push({
+          id: "no_poly_address",
+          severity: "error",
+          message: "Polymarket адрес кошелька не указан — невозможно подписывать ордера",
+        });
+      }
+
+      // Check if backtest has been run
+      const backtestResults = storage.getLatestBacktestResults();
+      if (backtestResults.length === 0) {
+        warnings.push({
+          id: "no_backtest",
+          severity: "info",
+          message: "Бэктест не запущен — Thompson Sampling стартует с плоских приоров. Рекомендуется запустить бэктест для инициализации модели.",
+        });
+      }
+
+      return res.json({ warnings });
+    } catch (err) {
+      console.error("[System] Warnings error:", err);
+      return res.status(500).json({ message: "Ошибка проверки системы" });
     }
   });
 
@@ -311,7 +410,10 @@ export async function registerRoutes(
       }
 
       storage.setConfig(key, String(value));
-      storage.addAuditEntry("настройки", `${key} = ${value}`, (req as any).userId);
+
+      // Mask secrets in audit log
+      const auditValue = API_KEY_FIELDS.includes(key) ? maskSecret(String(value)) : String(value);
+      storage.addAuditEntry("настройки", `${key} = ${auditValue}`, (req as any).userId);
 
       return res.json({ ok: true, key, value: String(value) });
     } catch (err) {
@@ -579,10 +681,45 @@ export async function registerRoutes(
       const { windows } = req.body || {};
       const numWindows = Math.max(100, Math.min(10000, windows || 2000));
       const result = runBacktest(numWindows);
-      return res.json(result);
+
+      // Auto-apply backtest results as Thompson Sampling priors
+      applyBacktestPriors(result.results);
+      storage.addAuditEntry(
+        "бэктест",
+        `Бэктест ${numWindows} окон завершён, лучшая модель: ${result.bestModel} (${((result.results[0]?.winRate || 0) * 100).toFixed(1)}%), приоры Thompson Sampling обновлены`,
+        (req as any).userId
+      );
+
+      return res.json({ ...result, priorsApplied: true });
     } catch (err) {
       console.error("[Backtest] Run error:", err);
       return res.status(500).json({ message: "Ошибка запуска бэктеста" });
+    }
+  });
+
+  // POST /api/backtest/apply-priors — re-apply latest backtest to Thompson Sampling
+  app.post("/api/backtest/apply-priors", async (req: Request, res: Response) => {
+    try {
+      const backtestResults = storage.getLatestBacktestResults();
+      if (backtestResults.length === 0) {
+        return res.status(404).json({ message: "Нет результатов бэктеста" });
+      }
+
+      const parsed = backtestResults.map((r) => ({
+        strategyName: r.strategyName,
+        winRate: r.winRate,
+        totalTrades: r.totalTrades,
+        wins: r.wins,
+        losses: r.losses,
+      }));
+
+      applyBacktestPriors(parsed);
+      storage.addAuditEntry("бэктест", "Приоры Thompson Sampling переприменены из последнего бэктеста", (req as any).userId);
+
+      return res.json({ ok: true, applied: parsed.length });
+    } catch (err) {
+      console.error("[Backtest] Apply priors error:", err);
+      return res.status(500).json({ message: "Ошибка применения приоров" });
     }
   });
 
