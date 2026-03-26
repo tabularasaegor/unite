@@ -1,11 +1,3 @@
+# Only add native build deps for better-sqlite3, let Nixpacks auto-detect Node.js
 [phases.setup]
-nixPkgs = ["python3", "gcc", "gnumake", "pkg-config"]
-
-[phases.install]
-cmds = ["npm install --build-from-source"]
-
-[phases.build]
-cmds = ["npm run build"]
-
-[start]
-cmd = "NODE_ENV=production node dist/index.cjs"
+nixPkgs = ["...", "python3", "gcc", "gnumake", "pkg-config"]
