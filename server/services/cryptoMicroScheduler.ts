@@ -45,11 +45,77 @@ interface AssetCalibration {
   upLosses: number;
   downWins: number;
   downLosses: number;
-  lastResults: Array<{ direction: string; won: boolean; pnl: number; ts: number }>;
+  lastResults: Array<{ direction: string; won: boolean; pnl: number; ts: number; strategy?: string; hour?: number }>;
   avgEdgeRealized: number;
 }
 
 const calibration: Record<string, AssetCalibration> = {};
+
+// --- Learning Matrix: per-asset per-direction per-hour weight ---
+// Learns from all historical data which (asset, direction, hour) combos work best
+interface LearningWeight {
+  trades: number;
+  wins: number;
+  pnl: number;
+  weight: number; // 0.0 to 2.0, 1.0 = neutral
+}
+const learningMatrix: Record<string, LearningWeight> = {};
+
+function getLearningKey(asset: string, direction: string, hour?: number): string {
+  return hour !== undefined ? `${asset}|${direction}|${hour}` : `${asset}|${direction}`;
+}
+
+function getLearningWeight(asset: string, direction: string, hour: number): number {
+  // Combine asset+direction weight with asset+direction+hour weight
+  const adKey = getLearningKey(asset, direction);
+  const adhKey = getLearningKey(asset, direction, hour);
+  const ad = learningMatrix[adKey];
+  const adh = learningMatrix[adhKey];
+  // Base weight from asset+direction (most data)
+  let w = ad && ad.trades >= 3 ? ad.weight : 1.0;
+  // Hour-specific adjustment (if enough data)
+  if (adh && adh.trades >= 3) {
+    w = w * 0.6 + adh.weight * 0.4; // Blend: 60% base, 40% hourly
+  }
+  return w;
+}
+
+function updateLearningMatrix(asset: string, direction: string, hour: number, won: boolean, pnl: number) {
+  for (const key of [getLearningKey(asset, direction), getLearningKey(asset, direction, hour)]) {
+    if (!learningMatrix[key]) learningMatrix[key] = { trades: 0, wins: 0, pnl: 0, weight: 1.0 };
+    const lw = learningMatrix[key];
+    lw.trades++;
+    if (won) lw.wins++;
+    lw.pnl += pnl;
+    // Weight = WR-based: <40% WR → penalize, >60% WR → boost
+    const wr = lw.trades > 0 ? lw.wins / lw.trades : 0.5;
+    lw.weight = Math.max(0.1, Math.min(2.0, 0.5 + wr * 1.5));
+  }
+}
+
+// --- Strategy Performance Tracker ---
+interface StrategyPerf { trades: number; wins: number; pnl: number; recentResults: boolean[]; }
+const strategyPerf: Record<string, StrategyPerf> = {};
+
+function getStrategyPerf(strategy: string): StrategyPerf {
+  if (!strategyPerf[strategy]) strategyPerf[strategy] = { trades: 0, wins: 0, pnl: 0, recentResults: [] };
+  return strategyPerf[strategy];
+}
+
+function updateStrategyPerf(strategy: string, won: boolean, pnl: number) {
+  const sp = getStrategyPerf(strategy);
+  sp.trades++;
+  if (won) sp.wins++;
+  sp.pnl += pnl;
+  sp.recentResults.push(won);
+  if (sp.recentResults.length > 20) sp.recentResults.shift();
+}
+
+function getStrategyRecentWR(strategy: string): number {
+  const sp = getStrategyPerf(strategy);
+  if (sp.recentResults.length < 3) return 0.5;
+  return sp.recentResults.filter(w => w).length / sp.recentResults.length;
+}
 
 // --- Adaptive regime tracking ---
 interface WindowResult { ts: number; wins: number; losses: number; totalPnl: number; }
@@ -65,14 +131,14 @@ const modelLog: Array<{ ts: string; event: string; detail: string }> = [];
 function logModelChange(event: string, detail: string) {
   const entry = { ts: new Date().toISOString(), event, detail };
   modelLog.push(entry);
-  if (modelLog.length > 100) modelLog.shift();
+  if (modelLog.length > 200) modelLog.splice(0, modelLog.length - 200);
   log(`MODEL: ${event} — ${detail}`, "micro");
   // Persist model log to DB
   try {
     storage.upsertMemory({
       category: "micro_model_log",
       key: "log",
-      value: JSON.stringify(modelLog.slice(-100)),
+      value: JSON.stringify(modelLog.slice(-200)),
       confidence: 1,
       createdAt: new Date().toISOString(),
     });
@@ -136,11 +202,43 @@ export function getModelLog() {
       const logMem = storage.getMemory("micro_model_log", "log");
       if (logMem.length > 0) {
         const saved = JSON.parse(logMem[0].value);
-        if (Array.isArray(saved)) modelLog.push(...saved.slice(-100));
+        if (Array.isArray(saved)) modelLog.push(...saved.slice(-200));
       }
     } catch {}
   }
-  return modelLog.slice(-50);
+  return modelLog.slice(-100);
+}
+
+export function getLearningMatrixSummary() {
+  const summary: Array<{ key: string; trades: number; wins: number; winRate: number; pnl: number; weight: number }> = [];
+  for (const [key, lw] of Object.entries(learningMatrix)) {
+    if (lw.trades >= 1) {
+      summary.push({
+        key,
+        trades: lw.trades,
+        wins: lw.wins,
+        winRate: lw.trades > 0 ? Math.round(lw.wins / lw.trades * 100) : 0,
+        pnl: Math.round(lw.pnl * 100) / 100,
+        weight: Math.round(lw.weight * 100) / 100,
+      });
+    }
+  }
+  return summary.sort((a, b) => b.weight - a.weight);
+}
+
+export function getStrategyPerfSummary() {
+  const summary: Array<{ strategy: string; trades: number; wins: number; winRate: number; recentWR: number; pnl: number }> = [];
+  for (const [strategy, sp] of Object.entries(strategyPerf)) {
+    summary.push({
+      strategy,
+      trades: sp.trades,
+      wins: sp.wins,
+      winRate: sp.trades > 0 ? Math.round(sp.wins / sp.trades * 100) : 0,
+      recentWR: Math.round(getStrategyRecentWR(strategy) * 100),
+      pnl: Math.round(sp.pnl * 100) / 100,
+    });
+  }
+  return summary;
 }
 
 function getCalibration(asset: string): AssetCalibration {
@@ -335,7 +433,8 @@ function auditCalibrationOnStartup(): void {
 }
 
 /**
- * Rebuild calibration from full DB trade history (self-contained).
+ * Rebuild calibration, learning matrix, strategy perf, and model log
+ * from full DB trade history. Self-contained, no external dependencies.
  */
 function rebuildCalibrationFromHistory(): void {
   try {
@@ -349,12 +448,27 @@ function rebuildCalibrationFromHistory(): void {
 
     const assetMap: Record<string, string> = { bitcoin: "btc", ethereum: "eth", solana: "sol", xrp: "xrp" };
     const sorted = [...microClosed].sort((a, b) => (a.closedAt || "").localeCompare(b.closedAt || ""));
-    let totalW = 0, totalL = 0, totalPnl = 0;
+    let totalW = 0, totalL = 0, totalPnlAcc = 0;
 
-    // Reset calibration from scratch
+    // Reset all state from scratch
     for (const asset of ALL_ASSETS) {
       calibration[asset] = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, upWins: 0, upLosses: 0, downWins: 0, downLosses: 0, lastResults: [], avgEdgeRealized: 0 };
     }
+    // Clear learning matrix and strategy perf
+    Object.keys(learningMatrix).forEach(k => delete learningMatrix[k]);
+    Object.keys(strategyPerf).forEach(k => delete strategyPerf[k]);
+
+    // Also load opportunity descriptions to extract strategy info
+    const oppDescriptions: Record<number, string> = {};
+    try {
+      const opps = storage.getActivePositions("closed"); // positions have opportunityId
+      for (const pos of sorted) {
+        try {
+          const opp = storage.getOpportunity(pos.opportunityId);
+          if (opp) oppDescriptions[pos.id] = opp.description || "";
+        } catch {}
+      }
+    } catch {}
 
     for (const pos of sorted) {
       const titleLower = (pos.title || "").toLowerCase();
@@ -366,16 +480,31 @@ function rebuildCalibrationFromHistory(): void {
       const won = (pos.unrealizedPnl || 0) > 0;
       const pnl = pos.unrealizedPnl || 0;
       const direction = pos.side === "YES" ? "Up" : "Down";
+      const openedAt = pos.openedAt || pos.closedAt || "";
+      const hour = new Date(openedAt).getUTCHours();
 
-      cal.totalTrades++; cal.totalPnl += pnl; totalPnl += pnl;
+      // Detect strategy from description
+      const desc = oppDescriptions[pos.id] || "";
+      let strategy = "unknown";
+      if (desc.includes("CONTRARIAN")) strategy = "contrarian";
+      else if (desc.includes("CALIBRATION")) strategy = "calibration";
+      else if (desc.includes("ALTERNATE")) strategy = "alternate";
+
+      cal.totalTrades++; cal.totalPnl += pnl; totalPnlAcc += pnl;
       if (won) { cal.wins++; totalW++; if (direction === "Up") cal.upWins++; else cal.downWins++; }
       else { cal.losses++; totalL++; if (direction === "Up") cal.upLosses++; else cal.downLosses++; }
-      cal.lastResults.push({ direction, won, pnl, ts: new Date(pos.closedAt || "").getTime() || Date.now() });
+      cal.lastResults.push({ direction, won, pnl, ts: new Date(pos.closedAt || "").getTime() || Date.now(), strategy, hour });
       if (cal.lastResults.length > 50) cal.lastResults.shift();
       cal.avgEdgeRealized = cal.totalPnl / Math.max(cal.totalTrades, 1);
+
+      // Update learning matrix
+      updateLearningMatrix(asset, direction, hour, won, pnl);
+
+      // Update strategy perf
+      updateStrategyPerf(strategy, won, pnl);
     }
 
-    // Persist to memory
+    // Persist calibration to memory
     for (const [asset, cal] of Object.entries(calibration)) {
       if (cal.totalTrades > 0) {
         storage.upsertMemory({ category: "micro_calibration", key: asset, value: JSON.stringify(cal), confidence: cal.wins / cal.totalTrades, createdAt: new Date().toISOString() });
@@ -384,12 +513,60 @@ function rebuildCalibrationFromHistory(): void {
     calibrationLoaded = true;
 
     const total = totalW + totalL;
-    logModelChange("CALIBRATION_REBUILD",
-      `${total} trades: ${totalW}W/${totalL}L (${total > 0 ? Math.round(totalW/total*100) : 0}%) P&L=$${Math.round(totalPnl*100)/100} | ` +
-      Object.entries(calibration).filter(([,c]) => c.totalTrades > 0).map(([a, c]) =>
-        `${a.toUpperCase()}: ${c.wins}W/${c.losses}L (${Math.round(c.wins/c.totalTrades*100)}%) Up:${c.upWins}/${c.upWins+c.upLosses} Down:${c.downWins}/${c.downWins+c.downLosses}`
-      ).join(" | ")
+    logModelChange("REBUILD",
+      `${total} сделок: ${totalW}W/${totalL}L (${total > 0 ? Math.round(totalW/total*100) : 0}%) P&L=$${Math.round(totalPnlAcc*100)/100}`
     );
+
+    // Log learning matrix insights
+    const matrixEntries = Object.entries(learningMatrix)
+      .filter(([k, lw]) => !k.includes("|") || k.split("|").length === 2) // asset|direction only
+      .filter(([, lw]) => lw.trades >= 3)
+      .sort(([, a], [, b]) => b.weight - a.weight);
+    
+    if (matrixEntries.length > 0) {
+      const best = matrixEntries.slice(0, 3).map(([k, lw]) => `${k.toUpperCase()}:${Math.round(lw.wins/lw.trades*100)}%w=${lw.weight.toFixed(2)}`).join(" ");
+      const worst = matrixEntries.slice(-3).map(([k, lw]) => `${k.toUpperCase()}:${Math.round(lw.wins/lw.trades*100)}%w=${lw.weight.toFixed(2)}`).join(" ");
+      logModelChange("ОБУЧЕНИЕ", `Лучшие: ${best} | Худшие: ${worst}`);
+    }
+
+    // Log strategy performance
+    const stratSummary = Object.entries(strategyPerf)
+      .filter(([, sp]) => sp.trades > 0)
+      .map(([s, sp]) => `${s}: ${sp.wins}/${sp.trades} (${Math.round(sp.wins/sp.trades*100)}%) $${sp.pnl.toFixed(0)}`)
+      .join(" | ");
+    if (stratSummary) {
+      logModelChange("СТРАТЕГИИ", stratSummary);
+    }
+
+    // Log per-asset calibration
+    Object.entries(calibration).filter(([, c]) => c.totalTrades > 0).forEach(([a, c]) => {
+      const wr = Math.round(c.wins / c.totalTrades * 100);
+      const upWR = (c.upWins + c.upLosses) > 0 ? Math.round(c.upWins / (c.upWins + c.upLosses) * 100) : 0;
+      const downWR = (c.downWins + c.downLosses) > 0 ? Math.round(c.downWins / (c.downWins + c.downLosses) * 100) : 0;
+      const recent5 = c.lastResults.slice(-5).map(r => r.won ? "✓" : "✗").join("");
+      logModelChange("КАЛИБРОВКА", `${a.toUpperCase()}: ${c.wins}W/${c.losses}L (${wr}%) Up:${upWR}% Down:${downWR}% [${recent5}] P&L=$${c.totalPnl.toFixed(2)}`);
+    });
+
+    // Log hourly insights
+    const hourlyMap: Record<number, { trades: number; wins: number; pnl: number }> = {};
+    for (const [key, lw] of Object.entries(learningMatrix)) {
+      const parts = key.split("|");
+      if (parts.length === 3) { // asset|direction|hour
+        const h = parseInt(parts[2]);
+        if (!hourlyMap[h]) hourlyMap[h] = { trades: 0, wins: 0, pnl: 0 };
+        hourlyMap[h].trades += lw.trades;
+        hourlyMap[h].wins += lw.wins;
+        hourlyMap[h].pnl += lw.pnl;
+      }
+    }
+    const hourSummary = Object.entries(hourlyMap)
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([h, d]) => `${h}:00=${Math.round(d.wins/d.trades*100)}%(${d.trades})`)
+      .join(" ");
+    if (hourSummary) {
+      logModelChange("ЧАСЫ", hourSummary);
+    }
+
   } catch (err) {
     log(`Calibration rebuild error: ${err}`, "micro");
     loadCalibrationFromMemory();
@@ -433,22 +610,30 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
 }
 
 /**
- * PROVEN 3-TIER STRATEGY (87.5% peak WR reference)
+ * ADAPTIVE 3-TIER STRATEGY with Learning Matrix
  * 
+ * The model learns from ALL historical trades and adapts:
+ * - Learning Matrix weights per (asset, direction, hour) — penalize bad combos, boost good ones
+ * - Strategy performance tracking — contrarian/calibration/alternating each have tracked WR
+ * - Contrarian: safe zone 3-15% deviation only (no extreme bets)
+ * - Calibration: rolling window with anti-bias gate
+ * - Each decision is fully logged for transparency
+ *
  * Priority order:
- * 1. CONTRARIAN (>3% deviation from 50/50) — bet AGAINST majority
- * 2. CALIBRATION (>5 trades per asset) — use rolling WR for Up vs Down
+ * 1. CONTRARIAN (3-15% deviation from 50/50) — bet AGAINST majority
+ * 2. CALIBRATION (>5 trades per asset, learning-enhanced) — use rolling WR + learning weights
  * 3. ALTERNATING (cold start) — alternate by window parity to avoid bias
  * 
  * AI is ONLY for validation (agree/disagree), NEVER chooses direction.
- * ML weights from historical data used ONLY for bet sizing, not direction.
  */
 async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
   direction: "Up" | "Down";
   confidence: number;
   reasoning: string;
+  strategy: string;
 }> {
   const cal = getCalibration(asset);
+  const currentHour = new Date().getUTCHours();
   
   let direction: "Up" | "Down";
   let confidence: number;
@@ -458,97 +643,149 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   const upPrice = market.upPrice;
   const deviation = Math.abs(upPrice - 0.5);
 
-  // === TIER 1: CONTRARIAN (priority — highest WR historically) ===
-  // When market deviates >3% from 50/50, bet AGAINST the majority
-  if (deviation > 0.03) {
+  // Get learning weights for both directions at current hour
+  const upWeight = getLearningWeight(asset, "Up", currentHour);
+  const downWeight = getLearningWeight(asset, "Down", currentHour);
+
+  // === TIER 1: CONTRARIAN (3-15% deviation — safe zone only) ===
+  // Historical data shows extreme deviations (>65%) cause large losses
+  // Contrarian only works in the 53-65% range
+  const contrarianRecentWR = getStrategyRecentWR("contrarian");
+  if (deviation > 0.03 && deviation < 0.15) {
     direction = upPrice > 0.53 ? "Down" : "Up";
-    confidence = 0.50 + deviation * 0.3;
-    reasoning = `CONTRARIAN: market ${upPrice > 0.53 ? "Up" : "Down"} at ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}%, betting against`;
+    // Base confidence from deviation, but modulate by learning weight
+    const dirWeight = direction === "Up" ? upWeight : downWeight;
+    confidence = 0.50 + deviation * 0.25 * dirWeight;
+    
+    // If contrarian has been performing badly (recent WR < 40%), reduce confidence
+    if (contrarianRecentWR < 0.40 && getStrategyPerf("contrarian").trades >= 5) {
+      confidence *= 0.85;
+      reasoning = `CONTRARIAN: ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}% → ${direction} (w=${dirWeight.toFixed(2)}) [⚠️ WR=${(contrarianRecentWR*100).toFixed(0)}%]`;
+    } else {
+      reasoning = `CONTRARIAN: ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}% → ${direction} (w=${dirWeight.toFixed(2)})`;
+    }
     strategy = "contrarian";
   }
-  // === TIER 2: CALIBRATION (>5 trades — ROLLING window, anti-bias) ===
-  // Uses last 20 results. BOTH directions must have >= 5 samples and 
-  // each direction must represent >= 30% of the window to be valid.
-  // This prevents feedback loops where one direction dominates.
+  // === TIER 2: CALIBRATION (>5 trades, learning-enhanced) ===
   else if (cal.totalTrades >= 5) {
     const recentN = cal.lastResults.slice(-20);
     const recentUp = recentN.filter(r => r.direction === "Up");
     const recentDown = recentN.filter(r => r.direction === "Down");
     const total = recentN.length;
     
-    // Anti-bias gate: both directions need >= 5 samples AND >= 30% representation
-    const upRatio = total > 0 ? recentUp.length / total : 0;
-    const downRatio = total > 0 ? recentDown.length / total : 0;
-    const hasBalancedData = recentUp.length >= 5 && recentDown.length >= 5 && upRatio >= 0.30 && downRatio >= 0.30;
+    // Anti-bias gate: both need >= 5 samples AND >= 30% representation
+    const hasBalancedData = recentUp.length >= 5 && recentDown.length >= 5 
+      && (recentUp.length / total) >= 0.30 && (recentDown.length / total) >= 0.30;
     
     if (hasBalancedData) {
       const upWR = recentUp.filter(r => r.won).length / recentUp.length;
       const downWR = recentDown.filter(r => r.won).length / recentDown.length;
       
-      // Need >10% WR difference to make a directional call
-      if (upWR > downWR + 0.10) {
+      // Learning-enhanced: blend WR with learning weights
+      const upScore = upWR * 0.6 + (upWeight / 2.0) * 0.4;
+      const downScore = downWR * 0.6 + (downWeight / 2.0) * 0.4;
+      
+      if (upScore > downScore + 0.08) {
         direction = "Up";
-        confidence = 0.50 + (upWR - 0.5) * 0.15;
-        reasoning = `CALIBRATION: ${asset.toUpperCase()} Up WR=${(upWR*100).toFixed(0)}% > Down ${(downWR*100).toFixed(0)}% (${recentUp.length}/${recentDown.length} samples)`;
-      } else if (downWR > upWR + 0.10) {
+        confidence = 0.50 + (upScore - 0.5) * 0.2;
+        reasoning = `CALIBRATION: ${asset.toUpperCase()} Up=${(upWR*100).toFixed(0)}%×w${upWeight.toFixed(2)} > Down=${(downWR*100).toFixed(0)}%×w${downWeight.toFixed(2)}`;
+      } else if (downScore > upScore + 0.08) {
         direction = "Down";
-        confidence = 0.50 + (downWR - 0.5) * 0.15;
-        reasoning = `CALIBRATION: ${asset.toUpperCase()} Down WR=${(downWR*100).toFixed(0)}% > Up ${(upWR*100).toFixed(0)}% (${recentDown.length}/${recentUp.length} samples)`;
+        confidence = 0.50 + (downScore - 0.5) * 0.2;
+        reasoning = `CALIBRATION: ${asset.toUpperCase()} Down=${(downWR*100).toFixed(0)}%×w${downWeight.toFixed(2)} > Up=${(upWR*100).toFixed(0)}%×w${upWeight.toFixed(2)}`;
       } else {
-        // Balanced WRs — alternate by window parity
+        // Balanced — use learning weights as tiebreaker, else parity
+        if (Math.abs(upWeight - downWeight) > 0.3) {
+          direction = upWeight > downWeight ? "Up" : "Down";
+          confidence = 0.52;
+          reasoning = `CALIBRATION: баланс, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
+        } else {
+          const windowParity = (market.windowStart / 300) % 2 === 0;
+          direction = windowParity ? "Up" : "Down";
+          confidence = 0.52;
+          reasoning = `CALIBRATION: баланс, паритет → ${direction}`;
+        }
+      }
+    } else {
+      // Imbalanced — use learning weights if available, else parity
+      if (upWeight !== 1.0 || downWeight !== 1.0) {
+        direction = upWeight > downWeight ? "Up" : "Down";
+        confidence = 0.52;
+        reasoning = `CALIBRATION: дисбаланс, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
+      } else {
         const windowParity = (market.windowStart / 300) % 2 === 0;
         direction = windowParity ? "Up" : "Down";
         confidence = 0.52;
-        reasoning = `CALIBRATION: equal (Up ${(upWR*100).toFixed(0)}% vs Down ${(downWR*100).toFixed(0)}%), parity → ${direction}`;
+        reasoning = `CALIBRATION: дисбаланс (Up:${recentUp.length} Down:${recentDown.length}), паритет → ${direction}`;
       }
-    } else {
-      // Imbalanced sample — data is biased, fall back to alternating
-      const windowParity = (market.windowStart / 300) % 2 === 0;
-      direction = windowParity ? "Up" : "Down";
-      confidence = 0.52;
-      reasoning = `CALIBRATION: imbalanced data (Up:${recentUp.length} Down:${recentDown.length}), parity → ${direction}`;
     }
     strategy = "calibration";
   }
-  // === TIER 3: ALTERNATING (cold start — avoids always-Up bias) ===
+  // === TIER 3: ALTERNATING (cold start) ===
   else {
-    const windowParity = (market.windowStart / 300) % 2 === 0;
-    direction = windowParity ? "Up" : "Down";
-    confidence = 0.52;
-    reasoning = `ALTERNATE: no data, window parity → ${direction}`;
+    // Even in cold start, check learning weights
+    if (upWeight !== 1.0 || downWeight !== 1.0) {
+      direction = upWeight > downWeight ? "Up" : "Down";
+      confidence = 0.52;
+      reasoning = `ALTERNATE: мало данных, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
+    } else {
+      const windowParity = (market.windowStart / 300) % 2 === 0;
+      direction = windowParity ? "Up" : "Down";
+      confidence = 0.52;
+      reasoning = `ALTERNATE: нет данных, паритет → ${direction}`;
+    }
     strategy = "alternate";
+  }
+
+  // === LEARNING WEIGHT GATE: skip if learned weight is very low ===
+  const chosenWeight = direction === "Up" ? upWeight : downWeight;
+  if (chosenWeight < 0.4 && cal.totalTrades >= 10) {
+    // Very bad historical performance for this combo — flip or skip
+    const otherDir = direction === "Up" ? "Down" : "Up";
+    const otherWeight = direction === "Up" ? downWeight : upWeight;
+    if (otherWeight > chosenWeight + 0.3) {
+      logModelChange("ОБУЧЕНИЕ_ФЛИП", `${asset.toUpperCase()} ${direction} w=${chosenWeight.toFixed(2)} → ${otherDir} w=${otherWeight.toFixed(2)}`);
+      direction = otherDir as "Up" | "Down";
+      confidence = 0.51;
+      reasoning += ` [ФЛИП: ${otherDir} w=${otherWeight.toFixed(2)}]`;
+    }
   }
 
   // Clamp confidence
   confidence = Math.min(0.62, Math.max(0.51, confidence));
 
   // === AI VALIDATION ONLY (never chooses direction) ===
+  let aiVerdict = "";
   try {
     const { default: OpenAI } = await import("openai");
     const client = new OpenAI();
 
-    const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%. My signal: ${direction} (${strategy}). Agree/disagree? Reply JSON: {"agree":true/false,"confidence_adj":-0.02 to +0.03}`;
+    const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%. My signal: ${direction} (${strategy}). Learning weight: ${chosenWeight.toFixed(2)}. Agree/disagree? Reply JSON: {"agree":true/false,"confidence_adj":-0.02 to +0.03}`;
 
     const response = await client.responses.create({ model: "gpt-5", input: prompt });
     const text = response.output_text || "";
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      // AI ONLY adjusts confidence, NEVER changes direction
       if (parsed.confidence_adj) {
         confidence = Math.min(0.62, Math.max(0.51, confidence + parsed.confidence_adj));
         if (!parsed.agree) {
-          reasoning += " [AI disagrees]";
-          // If AI disagrees, reduce confidence but keep direction
+          reasoning += " [AI✗]";
           confidence = Math.max(0.51, confidence - 0.02);
+          aiVerdict = "disagree";
+        } else {
+          aiVerdict = "agree";
         }
       }
     }
   } catch {
-    // AI unavailable — strategy signal stands as-is
+    aiVerdict = "unavailable";
   }
 
-  return { direction, confidence, reasoning };
+  // Log the decision
+  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% w=${chosenWeight.toFixed(2)} ai=${aiVerdict} | ${reasoning}`);
+
+  return { direction, confidence, reasoning, strategy };
 }
 
 // --- Execute micro-trade ---
@@ -752,9 +989,22 @@ async function settleMicroTrades(): Promise<number> {
       // Update calibration
       updateCalibration(asset, direction, wasCorrect, realizedPnl);
 
+      // Update learning matrix (per-asset, per-direction, per-hour)
+      const settleHour = new Date(pos.openedAt || "").getUTCHours();
+      updateLearningMatrix(asset, direction, settleHour, wasCorrect, realizedPnl);
+
+      // Update strategy performance
+      const oppDesc = opp.description || "";
+      let settleStrategy = "unknown";
+      if (oppDesc.includes("CONTRARIAN")) settleStrategy = "contrarian";
+      else if (oppDesc.includes("CALIBRATION")) settleStrategy = "calibration";
+      else if (oppDesc.includes("ALTERNATE")) settleStrategy = "alternate";
+      updateStrategyPerf(settleStrategy, wasCorrect, realizedPnl);
+
       const icon = wasCorrect ? "✓" : "✗";
       const cal = getCalibration(asset);
-      log(`⚡ SETTLED ${icon}: ${asset.toUpperCase()} ${direction} → ${outcome}, PnL: $${realizedPnl.toFixed(2)} | Win rate: ${(cal.wins/cal.totalTrades*100).toFixed(0)}% (${cal.wins}/${cal.totalTrades})`, "micro");
+      const lw = getLearningWeight(asset, direction, settleHour);
+      logModelChange("СЕТЛМЕНТ", `${icon} ${asset.toUpperCase()} ${direction} [${settleStrategy}] PnL=$${realizedPnl.toFixed(2)} WR=${(cal.wins/cal.totalTrades*100).toFixed(0)}%(${cal.wins}/${cal.totalTrades}) w=${lw.toFixed(2)}`);
 
     } catch {}
   }
@@ -796,7 +1046,7 @@ async function runMicroCycle(): Promise<void> {
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
 
     // Collect all analyses first, then diversify
-    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string }> = [];
+    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string }> = [];
 
     for (const asset of enabledAssets) {
       if (shouldSkipAsset(asset)) {

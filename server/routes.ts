@@ -6,7 +6,7 @@ import { runMarketScan, getLastScanResult, isScanRunning } from "./services/mark
 import { researchOpportunity } from "./services/researchSwarm";
 import { estimateProbability } from "./services/probabilityEngine";
 import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
-import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog } from "./services/cryptoMicroScheduler";
+import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog, getLearningMatrixSummary, getStrategyPerfSummary } from "./services/cryptoMicroScheduler";
 import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
@@ -433,6 +433,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/micro/model-log", (_req, res) => {
     res.json(getModelLog());
+  });
+
+  app.get("/api/micro/learning-matrix", (_req, res) => {
+    res.json(getLearningMatrixSummary());
+  });
+
+  app.get("/api/micro/strategy-perf", (_req, res) => {
+    res.json(getStrategyPerfSummary());
   });
 
   app.post("/api/micro/stop", (_req, res) => {

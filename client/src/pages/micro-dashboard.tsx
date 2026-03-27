@@ -107,6 +107,16 @@ export default function MicroDashboard() {
     refetchInterval: 10000,
   });
 
+  const { data: learningMatrix } = useQuery({
+    queryKey: ["/api/micro/learning-matrix"],
+    refetchInterval: 30000,
+  });
+
+  const { data: strategyPerfData } = useQuery({
+    queryKey: ["/api/micro/strategy-perf"],
+    refetchInterval: 30000,
+  });
+
   const isFetching = fetchingStats || fetchingExec || fetchingPos;
   const refreshAll = () => { refetchStats(); refetchExec(); refetchPos(); };
 
@@ -201,24 +211,90 @@ export default function MicroDashboard() {
       {/* Row 2: Scheduler Controls */}
       <MicroSchedulerControls />
 
+      {/* Learning: Strategy Performance + Learning Matrix */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Эффективность стратегий</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {(strategyPerfData as any[] || []).length > 0 ? (
+              <div className="space-y-2">
+                {(strategyPerfData as any[] || []).map((sp: any) => (
+                  <div key={sp.strategy} className="flex items-center justify-between text-xs">
+                    <span className="font-mono font-semibold">{sp.strategy}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-muted-foreground">{sp.wins}/{sp.trades}</span>
+                      <span className={`font-mono tabular-nums font-medium ${sp.winRate >= 60 ? "text-green-500" : sp.winRate < 45 ? "text-red-500" : ""}`}>{sp.winRate}%</span>
+                      <span className={`font-mono tabular-nums text-[10px] ${sp.recentWR >= 60 ? "text-green-500" : sp.recentWR < 45 ? "text-red-500" : "text-muted-foreground"}`}>(посл.{sp.recentWR}%)</span>
+                      <span className={`font-mono tabular-nums ${sp.pnl >= 0 ? "text-green-500" : "text-red-500"}`}>${sp.pnl}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground text-center py-2">Нет данных</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-sm font-medium">Матрица обучения (веса)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {(learningMatrix as any[] || []).length > 0 ? (
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {(learningMatrix as any[] || []).filter((lw: any) => !lw.key.includes("|") || lw.key.split("|").length === 2).map((lw: any) => {
+                  const parts = lw.key.split("|");
+                  const label = `${parts[0]?.toUpperCase()} ${parts[1]}`;
+                  const barWidth = Math.min(100, Math.max(5, lw.weight * 50));
+                  return (
+                    <div key={lw.key} className="flex items-center gap-2 text-xs">
+                      <span className="font-mono w-16 shrink-0">{label}</span>
+                      <div className="flex-1 bg-muted rounded-full h-2 overflow-hidden">
+                        <div
+                          className={`h-full rounded-full ${lw.weight >= 1.2 ? "bg-green-500" : lw.weight < 0.7 ? "bg-red-500" : "bg-muted-foreground/50"}`}
+                          style={{ width: `${barWidth}%` }}
+                        />
+                      </div>
+                      <span className="font-mono tabular-nums w-8 text-right">{lw.weight}</span>
+                      <span className="text-muted-foreground w-12 text-right">{lw.winRate}%({lw.trades})</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground text-center py-2">Нет данных</p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
       {/* Model Log */}
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium">Лог модели</CardTitle>
+          <CardTitle className="text-sm font-medium">Лог модели ({(modelLog as any[] || []).length})</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="max-h-48 overflow-y-auto space-y-1">
+          <div className="max-h-64 overflow-y-auto space-y-1">
             {(modelLog as any[] || []).slice().reverse().map((entry: any, i: number) => {
-              const color = entry.event.includes("LOSS") ? "text-red-500"
-                : entry.event.includes("RECOVERY") ? "text-green-500"
-                : entry.event.includes("DRAWDOWN") ? "text-orange-500"
-                : entry.event.includes("COOLDOWN") ? "text-yellow-500"
+              const ev = entry.event || "";
+              const color = ev.includes("LOSS") || ev.includes("✗") ? "text-red-500"
+                : ev.includes("WIN") || ev.includes("RECOVERY") || ev.includes("✓") ? "text-green-500"
+                : ev.includes("DRAWDOWN") ? "text-orange-500"
+                : ev.includes("COOLDOWN") ? "text-yellow-500"
+                : ev.includes("РЕШЕНИЕ") ? "text-blue-400"
+                : ev.includes("СЕТЛМЕНТ") ? (entry.detail?.includes("✓") ? "text-green-500" : "text-red-500")
+                : ev.includes("ОБУЧЕНИЕ") ? "text-purple-400"
+                : ev.includes("КАЛИБРОВКА") || ev.includes("REBUILD") ? "text-cyan-400"
+                : ev.includes("СТРАТЕГИИ") ? "text-amber-400"
                 : "text-muted-foreground";
               return (
                 <div key={i} className="flex items-start gap-2 text-xs py-1 border-b border-border/20">
-                  <span className="text-muted-foreground shrink-0">{new Date(entry.ts).toLocaleTimeString("ru-RU")}</span>
-                  <span className={`font-mono font-semibold shrink-0 ${color}`}>{entry.event}</span>
-                  <span className="text-muted-foreground truncate">{entry.detail}</span>
+                  <span className="text-muted-foreground shrink-0 w-14">{new Date(entry.ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                  <span className={`font-mono font-semibold shrink-0 min-w-[80px] ${color}`}>{ev}</span>
+                  <span className="text-muted-foreground break-all">{entry.detail}</span>
                 </div>
               );
             })}
