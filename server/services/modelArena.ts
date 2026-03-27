@@ -177,12 +177,13 @@ function modelTAMeanReversion(candles: Candle[], upPrice: number): ModelPredicti
   const bb = calcBollingerBands(closes, 20);
   const rsi = calcRSI(closes, 14);
   
-  let direction: "Up" | "Down" = "Up";
-  let confidence = 0.52;
+  // Default from last candle — no inherent UP bias
+  const lastCandle = candles[candles.length - 1];
+  let direction: "Up" | "Down" = lastCandle && lastCandle.close > lastCandle.open ? "Up" : "Down";
+  let confidence = 0.51;
   const reasons: string[] = [];
 
   if (bb) {
-    const lastClose = closes[closes.length - 1];
     if (bb.pb < 0.20) {
       // Price near lower band → expect reversion Up
       direction = "Up";
@@ -194,6 +195,7 @@ function modelTAMeanReversion(candles: Candle[], upPrice: number): ModelPredicti
       confidence = 0.55 + (bb.pb - 0.80) * 0.5;
       reasons.push(`BB%B=${bb.pb.toFixed(2)}>0.8→revert↓`);
     } else {
+      // Mid-band: follow recent momentum instead of defaulting Up
       reasons.push(`BB%B=${bb.pb.toFixed(2)}~mid`);
     }
   }
@@ -300,8 +302,8 @@ function modelRegimeDetector(candles: Candle[], upPrice: number): ModelPredictio
   const atr = calcATR(candles, 14);
   const reasons: string[] = [];
   
-  let direction: "Up" | "Down" = "Up";
-  let confidence = 0.52;
+  let direction: "Up" | "Down" = "Down"; // NO default bias — last candle decides
+  let confidence = 0.51;
 
   const isTrending = adx !== null && adx > 25;
   const isRanging = adx !== null && adx < 20;
@@ -311,6 +313,12 @@ function modelRegimeDetector(candles: Candle[], upPrice: number): ModelPredictio
     const avgClose = closes.reduce((a,b)=>a+b) / closes.length;
     const volPct = (atr / avgClose) * 100;
     reasons.push(`vol=${volPct.toFixed(2)}%`);
+  }
+
+  // Default direction from last candle close vs open
+  const lastCandle = candles[candles.length - 1];
+  if (lastCandle) {
+    direction = lastCandle.close > lastCandle.open ? "Up" : "Down";
   }
 
   if (isTrending) {
@@ -326,15 +334,14 @@ function modelRegimeDetector(candles: Candle[], upPrice: number): ModelPredictio
     // Ranging → mean revert
     const bb = calcBollingerBands(closes, 20);
     if (bb) {
-      direction = bb.pb < 0.40 ? "Up" : bb.pb > 0.60 ? "Down" : "Up";
+      direction = bb.pb < 0.40 ? "Up" : bb.pb > 0.60 ? "Down" : direction;
       confidence = 0.55;
       reasons.push(`range→revert_${direction}`);
     }
   } else {
-    // Mixed → use base rate
-    direction = "Up";
-    confidence = 0.53;
-    reasons.push(`mixed→base_rate`);
+    // Mixed → use last candle direction, low confidence
+    confidence = 0.51;
+    reasons.push(`mixed→lastCandle_${direction}`);
   }
 
   return {
@@ -470,7 +477,16 @@ export async function runModelArena(
   
   if (deviation > 0.15) { blocked = true; blockReason = `девиация ${(deviation*100).toFixed(0)}%`; }
   else if (liquidity < 500) { blocked = true; blockReason = `ликвидность $${liquidity.toFixed(0)}`; }
-  // No edge/disagreement blocking — always trade, size adjusts risk
+  else if (edge < 0.005) { blocked = true; blockReason = `нет edge ${(edge*100).toFixed(1)}%`; }
+  
+  // Block when models have no consensus: all 5 vote same way → strong, 3-2 split → check edge
+  const upVotes = predictions.filter(p => p.direction === "Up").length;
+  const downVotes = predictions.filter(p => p.direction === "Down").length;
+  const consensus = Math.max(upVotes, downVotes);
+  if (consensus <= 2 && edge < 0.02) {
+    blocked = true;
+    blockReason = `нет консенсуса ${upVotes}/${downVotes}`;
+  }
 
   // Build reasoning
   const modelVotes = predictions.map(p => {

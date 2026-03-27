@@ -750,11 +750,12 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   let blocked = false;
   if (deviation > 0.15) blocked = true; // only extreme (>65/35)
   if (market.liquidity < 500) blocked = true;
+  if (edge < 0.005) blocked = true; // don't trade with no real edge
 
   // Kelly
   const price = direction === "Up" ? upPrice : downPrice;
   const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
-  const kellyFraction = kellyFull * 0.30; // Conservative Kelly — limit downside risk
+  const kellyFraction = kellyFull * 0.25; // Conservative Kelly — limit downside risk
   const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
   const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
@@ -775,14 +776,15 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   
   const price = direction === "Up" ? market.upPrice : market.downPrice;
   
-  // Kelly-based sizing: bankroll × kelly_fraction × asset_risk
-  // Hard cap at $20 per trade to limit downside
-  const kellySize = microBankroll * riskMultiplier;
+  // Kelly-based sizing: bankroll × kelly_fraction × asset_risk × regime_multiplier
+  // HARD CAP $20 per trade — NEVER exceeded regardless of kelly/bankroll
+  const kellyClamp = Math.min(riskMultiplier, 0.08); // Kelly capped at 8% of bankroll
+  const kellySize = microBankroll * kellyClamp;
   const asset = market.asset;
   const assetRisk = getAssetRiskMultiplier(asset);
-  const rawSize = kellySize * assetRisk;
-  const maxPerTrade = Math.min(20, microMaxBet); // $20 hard cap
-  const size = Math.max(3, Math.min(rawSize, maxPerTrade, microBankroll * 0.08));
+  const rawSize = kellySize * assetRisk * betSizeMultiplier;
+  const ABSOLUTE_MAX = 20; // $20 hard ceiling
+  const size = Math.max(3, Math.min(rawSize, ABSOLUTE_MAX));
   
   log(`Micro: ${asset} ${direction} kelly=${(riskMultiplier*100).toFixed(1)}% assetRisk=${assetRisk.toFixed(2)} → $${size.toFixed(2)}`, "micro");
 

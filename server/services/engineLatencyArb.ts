@@ -76,40 +76,49 @@ export async function runLatencyArbitrage(asset: string, upPrice: number, liquid
   let confidence = 0.50;
   
   // Stronger movement → higher confidence
+  // Engine C has 62% WR historically — trust its signals more
   const absPctChange = Math.abs(priceChange) * 100;
   
-  if (absPctChange > 0.10) {
-    confidence = 0.54;
+  if (absPctChange > 0.15) {
+    confidence = 0.58;
+    reasons.push(`strong Δ=${(priceChange*100).toFixed(3)}%`);
+  } else if (absPctChange > 0.08) {
+    confidence = 0.55;
     reasons.push(`spot Δ=${(priceChange*100).toFixed(3)}%`);
-  }
-  if (absPctChange > 0.05) {
-    confidence = Math.max(confidence, 0.52);
+  } else if (absPctChange > 0.03) {
+    confidence = 0.53;
     reasons.push(`trend=${direction}`);
   }
   
   // Volume spike amplifies signal
   if (volSpike > 1.5) {
-    confidence += 0.02;
+    confidence += 0.03;
     reasons.push(`vol×${volSpike.toFixed(1)}`);
   }
   
   // Disagreement with Polymarket odds = latency opportunity
   const polyDirection = upPrice > 0.51 ? "Up" : upPrice < 0.49 ? "Down" : "neutral";
   if (polyDirection !== "neutral" && polyDirection !== direction) {
-    confidence += 0.03; // Polymarket hasn't caught up
+    confidence += 0.04; // Polymarket hasn't caught up — strong signal
     reasons.push(`latency:spot≠poly`);
   }
   
-  // Block if no real movement
-  const blocked = absPctChange < 0.02;
+  // 1-min momentum alignment: if last 1min candle agrees with 3min move, stronger signal
+  if (Math.sign(lastChange) === Math.sign(priceChange) && Math.abs(lastChange) * 100 > 0.03) {
+    confidence += 0.02;
+    reasons.push(`1min✓`);
+  }
   
-  // Kelly
+  // Block only when truly no movement
+  const blocked = absPctChange < 0.015;
+  
+  // Kelly — larger sizing for best engine
   const edge = Math.max(0, confidence - 0.50);
-  const kellyFraction = edge > 0 ? edge * 0.50 : 0; // Simple edge-based
+  const kellyFraction = edge > 0 ? edge * 0.70 : 0; // Higher Kelly for proven engine
 
   return {
     direction,
-    confidence: Math.min(0.65, confidence),
+    confidence: Math.min(0.70, confidence),
     priceChange: priceChange * 100,
     reasoning: `LATENCY: ${reasons.join(' ')} Δ=${(priceChange*100).toFixed(3)}%`,
     blocked,

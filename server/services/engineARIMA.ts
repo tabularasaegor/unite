@@ -75,27 +75,33 @@ export async function runARIMAPredict(asset: string, upPrice: number, liquidity:
     
     // Confidence based on magnitude of predicted move
     const absPct = Math.abs(pctChange);
-    let confidence = 0.52; // base ARIMA confidence (57% WR from backtest)
-    if (absPct > 0.1) confidence = 0.54;
-    if (absPct > 0.2) confidence = 0.56;
+    let confidence = 0.51; // conservative base
+    if (absPct > 0.05) confidence = 0.53;
+    if (absPct > 0.10) confidence = 0.55;
+    if (absPct > 0.20) confidence = 0.57;
     
     // Ensemble with market price signal
     const marketDir = upPrice > 0.51 ? "Up" : upPrice < 0.49 ? "Down" : "neutral";
     if (marketDir === direction) {
       confidence += 0.02; // agreement bonus
+    } else if (marketDir !== "neutral" && marketDir !== direction) {
+      confidence -= 0.02; // disagreement penalty
     }
     
+    // BLOCK weak signals: ARIMA prediction too small to be meaningful
+    const blocked = absPct < 0.03;
+    
     const edge = Math.max(0, confidence - 0.50);
-    const kellyFraction = edge * 0.50;
+    const kellyFraction = edge * 0.40; // more conservative than before
     
     const reasoning = `ARIMA(3,1,1): ${lastPrice.toFixed(2)}→${predictedPrice.toFixed(2)} (Δ${pctChange > 0 ? '+' : ''}${pctChange.toFixed(3)}%) ${marketDir === direction ? '✓market' : ''}`;
     
     return {
       direction,
-      confidence: Math.min(0.62, confidence),
+      confidence: Math.min(0.60, confidence),
       predictedChange: pctChange,
       reasoning,
-      blocked: false,
+      blocked,
       kellyFraction,
     };
   } catch (err: any) {
