@@ -81,24 +81,26 @@ function detectAsset(title: string): string {
   return "BTC";
 }
 
-export default function MicroDashboard() {
+export default function MicroDashboard({ engine }: { engine?: string }) {
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
+  const engParam = engine ? `engine=${engine}` : "";
+  const engSep = engine ? "&" : "";
 
   const { data: stats, refetch: refetchStats, isFetching: fetchingStats } = useQuery({
-    queryKey: ["/api/micro/stats"],
-    queryFn: () => apiRequest("GET", "/api/micro/stats").then(r => r.json()),
+    queryKey: ["/api/micro/stats", engine || "all"],
+    queryFn: () => apiRequest("GET", `/api/micro/stats${engine ? '?engine=' + engine : ''}`).then(r => r.json()),
     refetchInterval: 30000,
   });
 
   const { data: executions, refetch: refetchExec, isFetching: fetchingExec } = useQuery({
-    queryKey: ["/api/executions", "micro"],
-    queryFn: () => apiRequest("GET", "/api/executions?type=micro").then(r => r.json()),
+    queryKey: ["/api/executions", "micro", engine || "all"],
+    queryFn: () => apiRequest("GET", `/api/executions?type=micro${engine ? '&engine=' + engine : ''}`).then(r => r.json()),
     refetchInterval: 30000,
   });
 
   const { data: positions, refetch: refetchPos, isFetching: fetchingPos } = useQuery({
-    queryKey: ["/api/positions", "micro", "open"],
-    queryFn: () => apiRequest("GET", "/api/positions?type=micro&status=open").then(r => r.json()),
+    queryKey: ["/api/positions", "micro", "open", engine || "all"],
+    queryFn: () => apiRequest("GET", `/api/positions?type=micro&status=open${engine ? '&engine=' + engine : ''}`).then(r => r.json()),
     refetchInterval: 30000,
   });
 
@@ -146,9 +148,9 @@ export default function MicroDashboard() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold flex items-center gap-2">
-            <Zap className="h-5 w-5 text-amber-500" /> Крипто 5-мин
+            <Zap className="h-5 w-5 text-amber-500" /> {engine === "A" ? "Арена (5 TA-моделей)" : engine === "B" ? "Bayesian Edge" : "Крипто 5-мин"}
           </h2>
-          <p className="text-sm text-muted-foreground">Микро-торговля BTC/ETH/SOL/XRP — 5-минутные рынки</p>
+          <p className="text-sm text-muted-foreground">{engine ? `Модель ${engine} — BTC/ETH/SOL/XRP` : "Микро-торговля BTC/ETH/SOL/XRP — 5-минутные рынки"}</p>
         </div>
         <Button variant="outline" size="sm" onClick={refreshAll} disabled={isFetching} className="gap-1.5">
           <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`} />

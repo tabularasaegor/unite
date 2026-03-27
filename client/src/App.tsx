@@ -17,7 +17,7 @@ import Settlements from "@/pages/settlements";
 import PostMortems from "@/pages/post-mortems";
 import AuditLogPage from "@/pages/audit-log";
 import SettingsPage from "@/pages/settings";
-import MicroDashboard from "@/pages/micro-dashboard";
+import MicroEngines from "@/pages/micro-engines";
 import MicroPositions from "@/pages/micro-positions";
 import MicroTrades from "@/pages/micro-trades";
 import MicroSettlements from "@/pages/micro-settlements";
@@ -70,7 +70,7 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
         <Route path="/micro/positions" component={MicroPositions} />
         <Route path="/micro/trades" component={MicroTrades} />
         <Route path="/micro/settlements" component={MicroSettlements} />
-        <Route path="/micro" component={MicroDashboard} />
+        <Route path="/micro" component={MicroEngines} />
         <Route component={NotFound} />
       </Switch>
       </main>

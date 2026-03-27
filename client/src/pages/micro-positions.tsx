@@ -8,7 +8,13 @@ import { useToast } from "@/hooks/use-toast";
 import { X, ExternalLink, Zap, RefreshCw } from "lucide-react";
 
 function cleanTitle(title: string) {
-  return title.replace(/^\[5m\]\s*/, "");
+  return title.replace(/^\[5m(-[AB])?\]\s*/, "");
+}
+
+function getEngineTag(title: string): string {
+  if (title.startsWith("[5m-A]")) return "A";
+  if (title.startsWith("[5m-B]")) return "B";
+  return "";
 }
 
 export default function MicroPositions() {

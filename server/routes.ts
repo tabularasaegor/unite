@@ -12,6 +12,11 @@ import { executeOpportunity, closePosition, updatePositionPrices } from "./servi
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 
+// Helper: match all micro-trade titles [5m], [5m-A], [5m-B]
+function isMicro(title: string | null | undefined): boolean {
+  return !!title && (title.startsWith("[5m]") || title.startsWith("[5m-"));
+}
+
 // --- Authentication ---
 // Built-in users + registered users stored in DB via memoryStore
 const BUILTIN_USERS: Record<string, string> = {
@@ -330,8 +335,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         endDate: opp?.endDate || null,
       };
     });
-    if (type === "micro") return res.json(enriched.filter(p => p.title.startsWith("[5m]")));
-    if (type === "regular") return res.json(enriched.filter(p => !p.title.startsWith("[5m]")));
+    if (type === "micro") {
+      const eng = req.query.engine as string;
+      if (eng === "A") return res.json(enriched.filter(p => p.title?.startsWith("[5m-A]")));
+      if (eng === "B") return res.json(enriched.filter(p => p.title?.startsWith("[5m-B]")));
+      return res.json(enriched.filter(p => isMicro(p.title)));
+    }
+    if (type === "regular") return res.json(enriched.filter(p => !isMicro(p.title)));
     res.json(enriched);
   });
 
@@ -367,8 +377,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         positionStatus: position?.status || null,
       };
     });
-    if (type === "micro") return res.json(enriched.filter(e => (e.title || "").startsWith("[5m]")));
-    if (type === "regular") return res.json(enriched.filter(e => !(e.title || "").startsWith("[5m]")));
+    if (type === "micro") return res.json(enriched.filter(e => isMicro(e.title)));
+    if (type === "regular") return res.json(enriched.filter(e => !isMicro(e.title)));
     res.json(enriched);
   });
 
@@ -394,8 +404,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         executionId: execution?.id || null,
       };
     });
-    if (type === "micro") return res.json(enriched.filter(s => (s.title || "").startsWith("[5m]")));
-    if (type === "regular") return res.json(enriched.filter(s => !(s.title || "").startsWith("[5m]")));
+    if (type === "micro") return res.json(enriched.filter(s => isMicro(s.title)));
+    if (type === "regular") return res.json(enriched.filter(s => !isMicro(s.title)));
     res.json(enriched);
   });
 
@@ -473,7 +483,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (!p.title) return false;
         if (engine === "A") return p.title.startsWith("[5m-A]");
         if (engine === "B") return p.title.startsWith("[5m-B]");
-        return p.title.startsWith("[5m]") || p.title.startsWith("[5m-");
+        return isMicro(p.title);
       });
       const closedMicro = microPositions.filter(p => p.status === "closed");
       const openMicro = microPositions.filter(p => p.status === "open");
@@ -481,7 +491,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const allExec = storage.getExecutions();
       const microExec = allExec.filter(e => {
         const opp = storage.getOpportunity(e.opportunityId);
-        return opp?.title?.startsWith("[5m]");
+        return isMicro(opp?.title);
       });
 
       // Per-asset stats
@@ -645,7 +655,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/micro/dashboard", (_req, res) => {
     const allPositions = storage.getActivePositions();
-    const microPositions = allPositions.filter(p => p.title?.startsWith("[5m]") || p.title?.startsWith("[5m-"));
+    const microPositions = allPositions.filter(p => isMicro(p.title));
     const openMicro = microPositions.filter(p => p.status === "open");
     const closedMicro = microPositions.filter(p => p.status === "closed");
     const totalPnl = closedMicro.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
@@ -655,7 +665,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const allExec = storage.getExecutions();
     const microExec = allExec.filter(e => {
       const opp = storage.getOpportunity(e.opportunityId);
-      return opp?.title?.startsWith("[5m]");
+      return isMicro(opp?.title);
     });
 
     res.json({
@@ -690,12 +700,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const stats = storage.getDashboardStats();
     // Exclude micro ([5m]) positions from main dashboard stats
     const allPositions = storage.getActivePositions();
-    const regularOpen = allPositions.filter(p => p.status === "open" && !p.title.startsWith("[5m]"));
-    const microOpenCount = allPositions.filter(p => p.status === "open" && p.title.startsWith("[5m]")).length;
+    const regularOpen = allPositions.filter(p => p.status === "open" && !isMicro(p.title));
+    const microOpenCount = allPositions.filter(p => p.status === "open" && isMicro(p.title)).length;
     res.json({
       ...stats,
       activePositions: stats.activePositions - microOpenCount,
-      totalTrades: stats.totalTrades - allPositions.filter(p => p.title.startsWith("[5m]")).length,
+      totalTrades: stats.totalTrades - allPositions.filter(p => isMicro(p.title)).length,
     });
   });
 
