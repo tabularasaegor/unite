@@ -1,32 +1,59 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { Play, Square, Zap } from "lucide-react";
+import { Play, Square, Zap, Power } from "lucide-react";
 import MicroDashboard from "./micro-dashboard";
 
-function EngineControl({ engine, label }: { engine: string; label: string }) {
+const ENGINE_META: Record<string, { label: string; color: string }> = {
+  A: { label: "Арена", color: "bg-blue-500" },
+  B: { label: "Байес", color: "bg-purple-500" },
+  C: { label: "Latency", color: "bg-amber-500" },
+  D: { label: "ARIMA", color: "bg-emerald-500" },
+};
+
+function EngineToggle({ engineId, enabled, schedulerActive }: { engineId: string; enabled: boolean; schedulerActive: boolean }) {
   const { toast } = useToast();
-  const { data: status } = useQuery({
-    queryKey: ["/api/micro/status"],
-    refetchInterval: 10000,
-  });
+  const meta = ENGINE_META[engineId] || { label: engineId, color: "bg-gray-500" };
 
-  const schedulerActive = (status as any)?.active;
-
-  const toggleEngine = useMutation({
-    mutationFn: (enabled: boolean) =>
-      apiRequest("POST", "/api/micro/engine", { engine, enabled }),
+  const toggle = useMutation({
+    mutationFn: () => apiRequest("POST", "/api/micro/engine", { engine: engineId, enabled: !enabled }),
     onSuccess: () => {
-      toast({ title: `Модель ${engine} обновлена` });
+      toast({ title: `${meta.label} ${!enabled ? "включена" : "выключена"}` });
       queryClient.invalidateQueries({ queryKey: ["/api/micro/status"] });
     },
   });
 
-  const startScheduler = useMutation({
+  return (
+    <Button
+      size="sm"
+      variant={enabled ? "default" : "outline"}
+      className={`h-7 text-xs gap-1.5 ${enabled ? "" : "opacity-50"}`}
+      onClick={() => toggle.mutate()}
+      disabled={toggle.isPending}
+    >
+      <div className={`w-2 h-2 rounded-full ${enabled ? meta.color : "bg-gray-400"}`} />
+      {meta.label}
+      <span className="text-[10px] opacity-70">{enabled ? "ON" : "OFF"}</span>
+    </Button>
+  );
+}
+
+function SchedulerBar() {
+  const { toast } = useToast();
+  const { data: status } = useQuery({
+    queryKey: ["/api/micro/status"],
+    refetchInterval: 5000,
+  });
+
+  const s = status as any;
+  const active = s?.active;
+  const engines = s?.engines || { A: true, B: true, C: true, D: true };
+
+  const start = useMutation({
     mutationFn: () => apiRequest("POST", "/api/micro/start"),
     onSuccess: () => {
       toast({ title: "Планировщик запущен" });
@@ -34,7 +61,7 @@ function EngineControl({ engine, label }: { engine: string; label: string }) {
     },
   });
 
-  const stopScheduler = useMutation({
+  const stop = useMutation({
     mutationFn: () => apiRequest("POST", "/api/micro/stop"),
     onSuccess: () => {
       toast({ title: "Планировщик остановлен" });
@@ -42,25 +69,30 @@ function EngineControl({ engine, label }: { engine: string; label: string }) {
     },
   });
 
-  // Read engine enabled state from status
-  const engineKey = `engine_${engine.toLowerCase()}_enabled`;
-  const isEnabled = true; // default on
-
   return (
-    <div className="flex items-center gap-3 px-4 py-2 border-b border-border/30">
-      <Badge variant={schedulerActive ? "default" : "secondary"} className="gap-1">
-        <div className={`w-1.5 h-1.5 rounded-full ${schedulerActive ? "bg-green-400" : "bg-gray-400"}`} />
-        {schedulerActive ? "Активен" : "Остановлен"}
+    <div className="flex items-center gap-2 px-4 py-2 border-b border-border/30 flex-wrap">
+      <Badge variant={active ? "default" : "secondary"} className="gap-1 shrink-0">
+        <div className={`w-1.5 h-1.5 rounded-full ${active ? "bg-green-400 animate-pulse" : "bg-gray-400"}`} />
+        {active ? "Активен" : "Стоп"}
       </Badge>
-      <span className="text-xs text-muted-foreground">{label}</span>
+
+      {/* Per-engine toggles */}
+      <div className="flex items-center gap-1">
+        {(["A", "B", "C", "D"] as const).map(id => (
+          <EngineToggle key={id} engineId={id} enabled={engines[id] ?? true} schedulerActive={active} />
+        ))}
+      </div>
+
       <div className="flex-1" />
-      {!schedulerActive ? (
-        <Button size="sm" variant="default" className="h-7 text-xs gap-1" onClick={() => startScheduler.mutate()}>
-          <Play className="h-3 w-3" /> Запустить всё
+
+      {/* Global start/stop */}
+      {!active ? (
+        <Button size="sm" variant="default" className="h-7 text-xs gap-1" onClick={() => start.mutate()} disabled={start.isPending}>
+          <Play className="h-3 w-3" /> Запустить
         </Button>
       ) : (
-        <Button size="sm" variant="destructive" className="h-7 text-xs gap-1" onClick={() => stopScheduler.mutate()}>
-          <Square className="h-3 w-3" /> Остановить всё
+        <Button size="sm" variant="destructive" className="h-7 text-xs gap-1" onClick={() => stop.mutate()} disabled={stop.isPending}>
+          <Square className="h-3 w-3" /> Стоп
         </Button>
       )}
     </div>
@@ -69,15 +101,7 @@ function EngineControl({ engine, label }: { engine: string; label: string }) {
 
 export default function MicroEngines() {
   const [engineTab, setEngineTab] = useState("all");
-  const [tfTab, setTfTab] = useState(""); // "" = all timeframes
-
-  const engineLabels: Record<string, string> = {
-    all: "Все модели",
-    A: "Arena — 5 TA-моделей",
-    B: "Bayesian Edge — adaptive base rate",
-    C: "Latency Arbitrage — спот vs Polymarket",
-    D: "ARIMA(3,1,1) — статпрогноз",
-  };
+  const [tfTab, setTfTab] = useState("");
 
   const currentEngine = engineTab === "all" ? undefined : engineTab;
   const currentTf = tfTab || undefined;
@@ -89,7 +113,7 @@ export default function MicroEngines() {
           <Zap className="h-5 w-5 text-amber-500" />
           <h2 className="text-lg font-semibold">Крипто торговля</h2>
         </div>
-        {/* Row 1: Engine tabs */}
+        {/* Row 1: Engine filter */}
         <Tabs value={engineTab} onValueChange={setEngineTab}>
           <TabsList className="grid w-full max-w-xl grid-cols-5">
             <TabsTrigger value="all" className="text-xs">Все</TabsTrigger>
@@ -99,7 +123,7 @@ export default function MicroEngines() {
             <TabsTrigger value="D" className="text-xs">ARIMA</TabsTrigger>
           </TabsList>
         </Tabs>
-        {/* Row 2: Timeframe tabs */}
+        {/* Row 2: Timeframe filter */}
         <Tabs value={tfTab} onValueChange={setTfTab}>
           <TabsList className="grid w-full max-w-xs grid-cols-4">
             <TabsTrigger value="" className="text-xs">Все TF</TabsTrigger>
@@ -110,7 +134,10 @@ export default function MicroEngines() {
         </Tabs>
       </div>
 
-      <EngineControl engine={engineTab === "all" ? "ALL" : engineTab} label={engineLabels[engineTab] || ""} />
+      {/* Scheduler + engine toggles */}
+      <SchedulerBar />
+
+      {/* Dashboard filtered by selected engine + timeframe */}
       <MicroDashboard engine={currentEngine} timeframe={currentTf} />
     </div>
   );

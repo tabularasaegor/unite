@@ -1133,6 +1133,12 @@ export function getMicroStatus() {
     microBankroll: parseFloat(storage.getConfig("micro_bankroll") || "200"),
     microMaxBet: parseFloat(storage.getConfig("micro_max_bet") || "20"),
     calibration: calSummary,
+    engines: {
+      A: storage.getConfig("engine_a_enabled") !== "false",
+      B: storage.getConfig("engine_b_enabled") !== "false",
+      C: storage.getConfig("engine_c_enabled") !== "false",
+      D: storage.getConfig("engine_d_enabled") !== "false",
+    },
     regime: {
       betSizeMultiplier: Math.round(betSizeMultiplier * 100) / 100,
       consecutiveLossWindows,
