@@ -12,6 +12,7 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
+import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, type ModelPrediction } from "./modelArena";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
@@ -605,6 +606,8 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
 }
 
 /**
+ * MODEL ARENA — Соревновательная система 5 моделей
+ * 
  * EDGE-BASED PROBABILITY MODEL
  * 
  * Методология:
@@ -626,151 +629,29 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   strategy: string;
   aiVerdict: string;
   learningWeight: number;
+  modelPredictions?: any[];
 }> {
   const cal = getCalibration(asset);
-  const upPrice = market.upPrice;
-  const downPrice = 1 - upPrice;
-  const deviation = Math.abs(upPrice - 0.5);
-  const reasons: string[] = [];
+  const upWR = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : 0.56;
 
-  // =============================================
-  // 1. IMPLIED PROBABILITY (from market price)
-  // =============================================
-  const impliedProbUp = upPrice;
-  const impliedProbDown = downPrice;
+  // Run the model arena (5 competing models)
+  const arena = await runModelArena(asset, market.upPrice, market.liquidity, {
+    upWR,
+    totalTrades: cal.totalTrades,
+  });
 
-  // =============================================
-  // 2. TRUE PROBABILITY ESTIMATION
-  // =============================================
-  // Start with base rate from 186 historical trades
-  const BASE_RATE_UP = 0.56; // Up resolves 56% of the time
-  let trueProb = BASE_RATE_UP;
-  let totalWeight = 1.0;
+  // Log arena decision
+  logModelChange("АРЕНА", `${asset.toUpperCase()} ${arena.direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(arena.kellyFraction*100).toFixed(1)}% ${arena.blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8) + ':' + m.direction + '(' + (m.confidence*100).toFixed(0) + '%)').join(' ')}`);
 
-  // --- Signal 1: Market microstructure ---
-  // When market price > 0.50, Up resolved 62% (strong signal)
-  // When market price < 0.50, Down resolved 48% (weak signal)
-  if (upPrice > 0.51) {
-    // Market leans Up — historical data shows 62% Up resolution
-    const marketSignal = 0.62;
-    trueProb = (trueProb * totalWeight + marketSignal * 1.5) / (totalWeight + 1.5);
-    totalWeight += 1.5;
-    reasons.push(`Рынок:Up ${(upPrice*100).toFixed(0)}%→P=${(marketSignal*100).toFixed(0)}%`);
-  } else if (upPrice < 0.49) {
-    // Market leans Down — but only 48% Down resolution (weak)
-    const marketSignal = 0.48;
-    trueProb = (trueProb * totalWeight + (1 - marketSignal) * 0.8) / (totalWeight + 0.8);
-    totalWeight += 0.8;
-    reasons.push(`Рынок:Down ${(downPrice*100).toFixed(0)}%→P(Up)=${((1-marketSignal)*100).toFixed(0)}%`);
-  } else {
-    reasons.push(`Рынок:нейтральный`);
-  }
-
-  // --- Signal 2: Per-asset historical calibration ---
-  if (cal.totalTrades >= 10) {
-    const assetUpRate = (cal.upWins + cal.upLosses) > 0
-      ? cal.upWins / (cal.upWins + cal.upLosses) : BASE_RATE_UP;
-    // Shrink towards base rate (Bayesian smoothing)
-    const smoothedRate = (assetUpRate * cal.totalTrades + BASE_RATE_UP * 20) / (cal.totalTrades + 20);
-    trueProb = (trueProb * totalWeight + smoothedRate * 1.0) / (totalWeight + 1.0);
-    totalWeight += 1.0;
-    reasons.push(`${asset.toUpperCase()}:UpWR=${(assetUpRate*100).toFixed(0)}%→${(smoothedRate*100).toFixed(0)}%`);
-  }
-
-  // --- Signal 3: Window correlation (90% correlated) ---
-  // Recent window results from other assets inform this window
-  // Use last settled results as proxy for current regime
-  const recentResults = cal.lastResults.slice(-5);
-  if (recentResults.length >= 3) {
-    const recentUpRate = recentResults.filter(r => r.direction === "Up" && r.won).length 
-      + recentResults.filter(r => r.direction === "Down" && !r.won).length;
-    const recentRate = recentUpRate / recentResults.length;
-    // Light weight — momentum signal, not strong
-    trueProb = (trueProb * totalWeight + recentRate * 0.5) / (totalWeight + 0.5);
-    totalWeight += 0.5;
-    reasons.push(`Моментум:${(recentRate*100).toFixed(0)}%`);
-  }
-
-  // --- Uncertainty penalty ---
-  // Low liquidity → shrink towards 50%
-  if (market.liquidity < 2000) {
-    trueProb = trueProb * 0.7 + 0.5 * 0.3;
-    reasons.push(`Ликвидность:$${market.liquidity.toFixed(0)}→штраф`);
-  }
-
-  // Clamp true probability
-  trueProb = Math.max(0.35, Math.min(0.65, trueProb));
-  const trueProbDown = 1 - trueProb;
-
-  // =============================================
-  // 3. EDGE CALCULATION
-  // =============================================
-  const edgeUp = trueProb - impliedProbUp;       // edge for buying Up
-  const edgeDown = trueProbDown - impliedProbDown; // edge for buying Down
-
-  let direction: "Up" | "Down";
-  let edge: number;
-  let strategy: string;
-
-  if (edgeUp > edgeDown && edgeUp > 0) {
-    direction = "Up";
-    edge = edgeUp;
-    strategy = "edge_up";
-  } else if (edgeDown > edgeUp && edgeDown > 0) {
-    direction = "Down";
-    edge = edgeDown;
-    strategy = "edge_down";
-  } else {
-    // No edge — default to Up (56% base rate)
-    direction = "Up";
-    edge = Math.max(0, edgeUp);
-    strategy = "base_rate";
-  }
-
-  // =============================================
-  // 4. TRADE BLOCKING (even if edge > 0)
-  // =============================================
-  let blocked = false;
-  let blockReason = "";
-
-  // Block: extreme deviation (market strongly one-sided)
-  if (deviation > 0.10) {
-    blocked = true;
-    blockReason = `девиация ${(deviation*100).toFixed(0)}%>10%`;
-  }
-  // Block: edge too small (<1%)
-  if (edge < 0.01 && !blocked) {
-    blocked = true;
-    blockReason = `edge ${(edge*100).toFixed(1)}%<1%`;
-  }
-  // Block: low liquidity
-  if (market.liquidity < 1000 && !blocked) {
-    blocked = true;
-    blockReason = `ликвидность $${market.liquidity.toFixed(0)}<$1000`;
-  }
-
-  // =============================================
-  // 5. POSITION SIZING (fractional Kelly)
-  // =============================================
-  // Kelly fraction = edge / (odds - 1), for binary: edge / (1/price - 1)
-  // Conservative: use 1/4 Kelly
-  const price = direction === "Up" ? impliedProbUp : impliedProbDown;
-  const odds = 1 / price; // payout per $1
-  const kellyFull = edge > 0 ? edge / (odds - 1) : 0;
-  const kellyFraction = kellyFull * 0.25; // 1/4 Kelly
-  const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
-
-  const reasoning = [
-    `P(Up)=${(trueProb*100).toFixed(1)}% impl=${(impliedProbUp*100).toFixed(1)}%`,
-    `edge=${direction}${(edge*100).toFixed(1)}%`,
-    `kelly=${(kellyFraction*100).toFixed(1)}%`,
-    blocked ? `БЛОК:${blockReason}` : "",
-    reasons.join(" ")
-  ].filter(Boolean).join(" | ");
-
-  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] edge=${(edge*100).toFixed(1)}% ${blocked ? 'БЛОК:'+blockReason : ''} | ${reasons.join(' ')}`);
-
-  return { direction, confidence, reasoning, strategy, aiVerdict: blocked ? "blocked" : "off", learningWeight: kellyFraction };
+  return {
+    direction: arena.direction,
+    confidence: arena.confidence,
+    reasoning: arena.reasoning,
+    strategy: arena.models.find(m => m.direction === arena.direction)?.modelName || "ensemble",
+    aiVerdict: arena.blocked ? "blocked" : "arena",
+    learningWeight: arena.kellyFraction,
+    modelPredictions: arena.models,
+  };
 }
 
 // --- Execute micro-trade ---
@@ -1018,7 +899,7 @@ async function runMicroCycle(): Promise<void> {
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
 
     // Collect all analyses first, then diversify
-    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string; aiVerdict: string; learningWeight: number }> = [];
+    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string; aiVerdict: string; learningWeight: number; modelPredictions?: any[] }> = [];
 
     for (const asset of enabledAssets) {
       const market = await fetchMicroMarket(asset);
@@ -1060,6 +941,7 @@ export function startMicroScheduler(): void {
   storage.setConfig("micro_scheduler_enabled", "true");
   initStateFromDB();
   loadCalibrationFromMemory();
+  loadArenaRatings();
   runMicroCycle();
   schedulerInterval = setInterval(() => runMicroCycle(), 60 * 1000);
   log("⚡ Micro-scheduler started (BTC/ETH/SOL/XRP 5-min markets)", "micro");

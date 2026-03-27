@@ -7,6 +7,7 @@ import { researchOpportunity } from "./services/researchSwarm";
 import { estimateProbability } from "./services/probabilityEngine";
 import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
 import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog, getLearningMatrixSummary, getStrategyPerfSummary } from "./services/cryptoMicroScheduler";
+import { getArenaStatus } from "./services/modelArena";
 import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
@@ -441,6 +442,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/micro/strategy-perf", (_req, res) => {
     res.json(getStrategyPerfSummary());
+  });
+
+  app.get("/api/micro/arena", (_req, res) => {
+    res.json(getArenaStatus());
   });
 
   app.post("/api/micro/stop", (_req, res) => {
