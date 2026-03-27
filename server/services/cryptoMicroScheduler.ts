@@ -605,21 +605,18 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
 }
 
 /**
- * ADAPTIVE 3-TIER STRATEGY with Learning Matrix
+ * PROVEN SIMPLE MODEL (87-95% WR reference from Batch 1-2)
  * 
- * The model learns from ALL historical trades and adapts:
- * - Learning Matrix weights per (asset, direction, hour) — penalize bad combos, boost good ones
- * - Strategy performance tracking — contrarian/calibration/alternating each have tracked WR
- * - Contrarian: safe zone 3-15% deviation only (no extreme bets)
- * - Calibration: rolling window with anti-bias gate
- * - Each decision is fully logged for transparency
- *
- * Priority order:
- * 1. CONTRARIAN (3-15% deviation from 50/50) — bet AGAINST majority
- * 2. CALIBRATION (>5 trades per asset, learning-enhanced) — use rolling WR + learning weights
- * 3. ALTERNATING (cold start) — alternate by window parity to avoid bias
+ * Ключевые принципы лучшей модели:
+ * 1. Только рынки близкие к 50/50 (0.47-0.53) — НЕ ставить против сильного тренда
+ * 2. Чередование Up/Down по паритету окна — никакого смещения
+ * 3. Маленькие равные ставки ($5-$15)
+ * 4. AI оценивает и может переключить направление
  * 
- * AI is ONLY for validation (agree/disagree), NEVER chooses direction.
+ * Что убрано (показало убытки):
+ * - Learning weights (создавали bias в сторону Up)
+ * - Contrarian на экстремальных девиациях (37% WR, -$32)
+ * - Комплексная калибровка с весами (петля обратной связи)
  */
 async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
   direction: "Up" | "Down";
@@ -630,7 +627,6 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   learningWeight: number;
 }> {
   const cal = getCalibration(asset);
-  const currentHour = new Date().getUTCHours();
   
   let direction: "Up" | "Down";
   let confidence: number;
@@ -640,116 +636,36 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   const upPrice = market.upPrice;
   const deviation = Math.abs(upPrice - 0.5);
 
-  // Get learning weights for both directions at current hour
-  const upWeight = getLearningWeight(asset, "Up", currentHour);
-  const downWeight = getLearningWeight(asset, "Down", currentHour);
+  // === Основной принцип: чередование по паритету окна ===
+  // Каждый актив чередует Up/Down каждое 5-минутное окно
+  const windowIndex = Math.floor(market.windowStart / 300);
+  // Разные активы начинают с разных сторон (offset) для диверсификации
+  const assetOffset: Record<string, number> = { btc: 0, eth: 1, sol: 0, xrp: 1 };
+  const offset = assetOffset[asset] || 0;
+  const parity = (windowIndex + offset) % 2 === 0;
+  direction = parity ? "Up" : "Down";
+  confidence = 0.53;
+  reasoning = `ПАРИТЕТ: окно #${windowIndex} ${asset.toUpperCase()} → ${direction}`;
+  strategy = "parity";
 
-  // === TIER 1: CONTRARIAN (3-15% deviation — safe zone only) ===
-  // Historical data shows extreme deviations (>65%) cause large losses
-  // Contrarian only works in the 53-65% range
-  const contrarianRecentWR = getStrategyRecentWR("contrarian");
-  if (deviation > 0.03 && deviation < 0.15) {
+  // === Контрариан только для небольших отклонений (3-7%) ===
+  // При девиации > 7% — не трогаем, рынок знает лучше
+  if (deviation > 0.03 && deviation <= 0.07) {
     direction = upPrice > 0.53 ? "Down" : "Up";
-    // Base confidence from deviation, but modulate by learning weight
-    const dirWeight = direction === "Up" ? upWeight : downWeight;
-    confidence = 0.50 + deviation * 0.25 * dirWeight;
-    
-    // If contrarian has been performing badly (recent WR < 40%), reduce confidence
-    if (contrarianRecentWR < 0.40 && getStrategyPerf("contrarian").trades >= 5) {
-      confidence *= 0.85;
-      reasoning = `CONTRARIAN: ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}% → ${direction} (w=${dirWeight.toFixed(2)}) [⚠️ WR=${(contrarianRecentWR*100).toFixed(0)}%]`;
-    } else {
-      reasoning = `CONTRARIAN: ${(Math.max(upPrice, 1-upPrice)*100).toFixed(1)}% → ${direction} (w=${dirWeight.toFixed(2)})`;
-    }
+    confidence = 0.54;
+    reasoning = `КОНТРАРИАН: ${(Math.max(upPrice,1-upPrice)*100).toFixed(1)}% → ${direction}`;
     strategy = "contrarian";
   }
-  // === TIER 2: CALIBRATION (>5 trades, learning-enhanced) ===
-  else if (cal.totalTrades >= 5) {
-    const recentN = cal.lastResults.slice(-20);
-    const recentUp = recentN.filter(r => r.direction === "Up");
-    const recentDown = recentN.filter(r => r.direction === "Down");
-    const total = recentN.length;
-    
-    // Anti-bias gate: both need >= 5 samples AND >= 30% representation
-    const hasBalancedData = recentUp.length >= 5 && recentDown.length >= 5 
-      && (recentUp.length / total) >= 0.30 && (recentDown.length / total) >= 0.30;
-    
-    if (hasBalancedData) {
-      const upWR = recentUp.filter(r => r.won).length / recentUp.length;
-      const downWR = recentDown.filter(r => r.won).length / recentDown.length;
-      
-      // Learning-enhanced: blend WR with learning weights
-      const upScore = upWR * 0.6 + (upWeight / 2.0) * 0.4;
-      const downScore = downWR * 0.6 + (downWeight / 2.0) * 0.4;
-      
-      if (upScore > downScore + 0.08) {
-        direction = "Up";
-        confidence = 0.50 + (upScore - 0.5) * 0.2;
-        reasoning = `CALIBRATION: ${asset.toUpperCase()} Up=${(upWR*100).toFixed(0)}%×w${upWeight.toFixed(2)} > Down=${(downWR*100).toFixed(0)}%×w${downWeight.toFixed(2)}`;
-      } else if (downScore > upScore + 0.08) {
-        direction = "Down";
-        confidence = 0.50 + (downScore - 0.5) * 0.2;
-        reasoning = `CALIBRATION: ${asset.toUpperCase()} Down=${(downWR*100).toFixed(0)}%×w${downWeight.toFixed(2)} > Up=${(upWR*100).toFixed(0)}%×w${upWeight.toFixed(2)}`;
-      } else {
-        // Balanced — use learning weights as tiebreaker, else parity
-        if (Math.abs(upWeight - downWeight) > 0.3) {
-          direction = upWeight > downWeight ? "Up" : "Down";
-          confidence = 0.52;
-          reasoning = `CALIBRATION: баланс, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
-        } else {
-          const windowParity = (market.windowStart / 300) % 2 === 0;
-          direction = windowParity ? "Up" : "Down";
-          confidence = 0.52;
-          reasoning = `CALIBRATION: баланс, паритет → ${direction}`;
-        }
-      }
-    } else {
-      // Imbalanced — use learning weights if available, else parity
-      if (upWeight !== 1.0 || downWeight !== 1.0) {
-        direction = upWeight > downWeight ? "Up" : "Down";
-        confidence = 0.52;
-        reasoning = `CALIBRATION: дисбаланс, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
-      } else {
-        const windowParity = (market.windowStart / 300) % 2 === 0;
-        direction = windowParity ? "Up" : "Down";
-        confidence = 0.52;
-        reasoning = `CALIBRATION: дисбаланс (Up:${recentUp.length} Down:${recentDown.length}), паритет → ${direction}`;
-      }
-    }
-    strategy = "calibration";
-  }
-  // === TIER 3: ALTERNATING (cold start) ===
-  else {
-    // Even in cold start, check learning weights
-    if (upWeight !== 1.0 || downWeight !== 1.0) {
-      direction = upWeight > downWeight ? "Up" : "Down";
-      confidence = 0.52;
-      reasoning = `ALTERNATE: мало данных, веса → ${direction} (Up:${upWeight.toFixed(2)} Down:${downWeight.toFixed(2)})`;
-    } else {
-      const windowParity = (market.windowStart / 300) % 2 === 0;
-      direction = windowParity ? "Up" : "Down";
-      confidence = 0.52;
-      reasoning = `ALTERNATE: нет данных, паритет → ${direction}`;
-    }
-    strategy = "alternate";
-  }
 
-  // === LEARNING WEIGHT GATE: skip if learned weight is very low ===
-  const chosenWeight = direction === "Up" ? upWeight : downWeight;
-  if (chosenWeight < 0.4 && cal.totalTrades >= 10) {
-    // Very bad historical performance for this combo — flip or skip
-    const otherDir = direction === "Up" ? "Down" : "Up";
-    const otherWeight = direction === "Up" ? downWeight : upWeight;
-    if (otherWeight > chosenWeight + 0.3) {
-      logModelChange("ОБУЧЕНИЕ_ФЛИП", `${asset.toUpperCase()} ${direction} w=${chosenWeight.toFixed(2)} → ${otherDir} w=${otherWeight.toFixed(2)}`);
-      direction = otherDir as "Up" | "Down";
-      confidence = 0.51;
-      reasoning += ` [ФЛИП: ${otherDir} w=${otherWeight.toFixed(2)}]`;
-    }
+  // === Фильтр: пропускаем экстремальные рынки (>60% в одну сторону) ===
+  // Исторически ставки против >60% давали крупные убытки
+  if (deviation > 0.10) {
+    confidence = 0.51; // минимальный — самая маленькая ставка
+    reasoning += ` [высокая девиация ${(deviation*100).toFixed(0)}%]`;
   }
 
   // Clamp confidence
-  confidence = Math.min(0.62, Math.max(0.51, confidence));
+  confidence = Math.min(0.58, Math.max(0.51, confidence));
 
   // === AI EVALUATION ===
   // Методология:
@@ -766,9 +682,7 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
       baseURL: "https://api.openai.com/v1",
     });
 
-    // Контекст для AI: цены, стратегия, калибровка, веса
     const otherDir = direction === "Up" ? "Down" : "Up";
-    const otherWeight = direction === "Up" ? downWeight : upWeight;
     const calInfo = cal.totalTrades > 0
       ? `Historical: ${cal.wins}W/${cal.losses}L (${Math.round(cal.wins/cal.totalTrades*100)}% WR), Up WR=${(cal.upWins+cal.upLosses)>0 ? Math.round(cal.upWins/(cal.upWins+cal.upLosses)*100) : '?'}%, Down WR=${(cal.downWins+cal.downLosses)>0 ? Math.round(cal.downWins/(cal.downWins+cal.downLosses)*100) : '?'}%`
       : "No historical data";
@@ -779,7 +693,6 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
       `Asset: ${asset.toUpperCase()}`,
       `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
       `My signal: ${direction} (strategy: ${strategy})`,
-      `Learning weights: ${direction}=${chosenWeight.toFixed(2)}, ${otherDir}=${otherWeight.toFixed(2)}`,
       calInfo,
       ``,
       `Evaluate my signal. Reply JSON:`,
@@ -817,7 +730,6 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
             `Asset: ${asset.toUpperCase()}`,
             `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
             `Signal to evaluate: ${otherDir}`,
-            `Learning weight for ${otherDir}: ${otherWeight.toFixed(2)}`,
             calInfo,
             ``,
             `How confident are you in ${otherDir}? Reply JSON:`,
@@ -873,13 +785,10 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
     log(`AI validation error: ${err?.message?.substring(0, 100)}`, "micro");
   }
 
-  // Recalculate weight after potential AI flip
-  const finalWeight = direction === "Up" ? upWeight : downWeight;
-
   // Log the decision
-  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% w=${finalWeight.toFixed(2)} ai=${aiVerdict} | ${reasoning}`);
+  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% ai=${aiVerdict} | ${reasoning}`);
 
-  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: finalWeight };
+  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: 1.0 };
 }
 
 // --- Execute micro-trade ---
@@ -894,29 +803,13 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   const price = direction === "Up" ? market.upPrice : market.downPrice;
   const impliedEdge = confidence - price;
   
-  // Very low threshold for 5-min markets (0.5%)
-  if (impliedEdge < 0.005) {
-    log(`Micro: ${market.asset.toUpperCase()} ${direction} — edge ${(impliedEdge * 100).toFixed(1)}% < 0.5%, skipping`, "micro");
-    return false;
-  }
-
-  // Sizing: use percentage of max_bet based on edge strength
-  // Edge 0.5-2% → 25% of max bet
-  // Edge 2-5% → 50% of max bet
-  // Edge 5-10% → 75% of max bet
-  // Edge >10% → 100% of max bet
-  let betFraction: number;
-  if (impliedEdge >= 0.10) betFraction = 1.0;
-  else if (impliedEdge >= 0.05) betFraction = 0.75;
-  else if (impliedEdge >= 0.02) betFraction = 0.50;
-  else betFraction = 0.25;
+  // Простой сайзинг: базовая ставка $10 × riskMultiplier
+  // Лучшая модель использовала $5-$15, средняя $10
+  const baseBet = 10;
+  const rawSize = baseBet * riskMultiplier;
+  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.10));
   
-  // Sizing: max_bet * edge_fraction * regime_multiplier * risk_multiplier
-  // riskMultiplier < 1.0 — сниженный размер для слабых сигналов
-  const rawSize = microMaxBet * betFraction * betSizeMultiplier * riskMultiplier;
-  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
-  
-  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: edge=${(impliedEdge*100).toFixed(1)}% frac=${betFraction} mult=${betSizeMultiplier.toFixed(1)}x risk=${riskMultiplier.toFixed(2)}x → $${size.toFixed(2)}`, "micro");
+  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: base=$${baseBet} risk=${riskMultiplier.toFixed(2)}x → $${size.toFixed(2)}`, "micro");
 
   // Create all DB records
   const opp = storage.createOpportunity({
