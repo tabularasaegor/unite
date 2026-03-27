@@ -762,7 +762,7 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
 
     const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%. My signal: ${direction} (${strategy}). Learning weight: ${chosenWeight.toFixed(2)}. Agree/disagree? Reply JSON: {"agree":true/false,"confidence_adj":-0.02 to +0.03}`;
 
-    const response = await client.responses.create({ model: "gpt-5", input: prompt });
+    const response = await client.responses.create({ model: "gpt5_mini", input: prompt });
     const text = response.output_text || "";
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
