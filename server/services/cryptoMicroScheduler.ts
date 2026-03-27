@@ -605,18 +605,19 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
 }
 
 /**
- * PROVEN SIMPLE MODEL (87-95% WR reference from Batch 1-2)
+ * EDGE-BASED PROBABILITY MODEL
  * 
- * Ключевые принципы лучшей модели:
- * 1. Только рынки близкие к 50/50 (0.47-0.53) — НЕ ставить против сильного тренда
- * 2. Чередование Up/Down по паритету окна — никакого смещения
- * 3. Маленькие равные ставки ($5-$15)
- * 4. AI оценивает и может переключить направление
- * 
- * Что убрано (показало убытки):
- * - Learning weights (создавали bias в сторону Up)
- * - Contrarian на экстремальных девиациях (37% WR, -$32)
- * - Комплексная калибровка с весами (петля обратной связи)
+ * Методология:
+ * 1. Implied probability = market price (Up price = P(Up))
+ * 2. True probability оценивается через:
+ *    - Market microstructure: отклонение от 50%, ликвидность, объём
+ *    - Historical base rate: Up резолвится в 56% случаев
+ *    - Window correlation: 90% окон все 4 актива идут в одном направлении
+ *    - Market signal: когда цена > 0.50, Up резолвится в 62%
+ *    - Uncertainty penalty: снижение при низкой ликвидности
+ * 3. Edge = true_probability - implied_probability
+ * 4. Position sizing: Kelly fraction с консервативным множителем
+ * 5. Trade blocking: девиация >10%, ликвидность <1000, edge <1%
  */
 async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
   direction: "Up" | "Down";
@@ -627,59 +628,149 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   learningWeight: number;
 }> {
   const cal = getCalibration(asset);
-  
+  const upPrice = market.upPrice;
+  const downPrice = 1 - upPrice;
+  const deviation = Math.abs(upPrice - 0.5);
+  const reasons: string[] = [];
+
+  // =============================================
+  // 1. IMPLIED PROBABILITY (from market price)
+  // =============================================
+  const impliedProbUp = upPrice;
+  const impliedProbDown = downPrice;
+
+  // =============================================
+  // 2. TRUE PROBABILITY ESTIMATION
+  // =============================================
+  // Start with base rate from 186 historical trades
+  const BASE_RATE_UP = 0.56; // Up resolves 56% of the time
+  let trueProb = BASE_RATE_UP;
+  let totalWeight = 1.0;
+
+  // --- Signal 1: Market microstructure ---
+  // When market price > 0.50, Up resolved 62% (strong signal)
+  // When market price < 0.50, Down resolved 48% (weak signal)
+  if (upPrice > 0.51) {
+    // Market leans Up — historical data shows 62% Up resolution
+    const marketSignal = 0.62;
+    trueProb = (trueProb * totalWeight + marketSignal * 1.5) / (totalWeight + 1.5);
+    totalWeight += 1.5;
+    reasons.push(`Рынок:Up ${(upPrice*100).toFixed(0)}%→P=${(marketSignal*100).toFixed(0)}%`);
+  } else if (upPrice < 0.49) {
+    // Market leans Down — but only 48% Down resolution (weak)
+    const marketSignal = 0.48;
+    trueProb = (trueProb * totalWeight + (1 - marketSignal) * 0.8) / (totalWeight + 0.8);
+    totalWeight += 0.8;
+    reasons.push(`Рынок:Down ${(downPrice*100).toFixed(0)}%→P(Up)=${((1-marketSignal)*100).toFixed(0)}%`);
+  } else {
+    reasons.push(`Рынок:нейтральный`);
+  }
+
+  // --- Signal 2: Per-asset historical calibration ---
+  if (cal.totalTrades >= 10) {
+    const assetUpRate = (cal.upWins + cal.upLosses) > 0
+      ? cal.upWins / (cal.upWins + cal.upLosses) : BASE_RATE_UP;
+    // Shrink towards base rate (Bayesian smoothing)
+    const smoothedRate = (assetUpRate * cal.totalTrades + BASE_RATE_UP * 20) / (cal.totalTrades + 20);
+    trueProb = (trueProb * totalWeight + smoothedRate * 1.0) / (totalWeight + 1.0);
+    totalWeight += 1.0;
+    reasons.push(`${asset.toUpperCase()}:UpWR=${(assetUpRate*100).toFixed(0)}%→${(smoothedRate*100).toFixed(0)}%`);
+  }
+
+  // --- Signal 3: Window correlation (90% correlated) ---
+  // Recent window results from other assets inform this window
+  // Use last settled results as proxy for current regime
+  const recentResults = cal.lastResults.slice(-5);
+  if (recentResults.length >= 3) {
+    const recentUpRate = recentResults.filter(r => r.direction === "Up" && r.won).length 
+      + recentResults.filter(r => r.direction === "Down" && !r.won).length;
+    const recentRate = recentUpRate / recentResults.length;
+    // Light weight — momentum signal, not strong
+    trueProb = (trueProb * totalWeight + recentRate * 0.5) / (totalWeight + 0.5);
+    totalWeight += 0.5;
+    reasons.push(`Моментум:${(recentRate*100).toFixed(0)}%`);
+  }
+
+  // --- Uncertainty penalty ---
+  // Low liquidity → shrink towards 50%
+  if (market.liquidity < 2000) {
+    trueProb = trueProb * 0.7 + 0.5 * 0.3;
+    reasons.push(`Ликвидность:$${market.liquidity.toFixed(0)}→штраф`);
+  }
+
+  // Clamp true probability
+  trueProb = Math.max(0.35, Math.min(0.65, trueProb));
+  const trueProbDown = 1 - trueProb;
+
+  // =============================================
+  // 3. EDGE CALCULATION
+  // =============================================
+  const edgeUp = trueProb - impliedProbUp;       // edge for buying Up
+  const edgeDown = trueProbDown - impliedProbDown; // edge for buying Down
+
   let direction: "Up" | "Down";
-  let confidence: number;
-  let reasoning: string;
+  let edge: number;
   let strategy: string;
 
-  const upPrice = market.upPrice;
-  const deviation = Math.abs(upPrice - 0.5);
-
-  // === Основной принцип: чередование по паритету окна ===
-  // Каждый актив чередует Up/Down каждое 5-минутное окно
-  const windowIndex = Math.floor(market.windowStart / 300);
-  // Разные активы начинают с разных сторон (offset) для диверсификации
-  const assetOffset: Record<string, number> = { btc: 0, eth: 1, sol: 0, xrp: 1 };
-  const offset = assetOffset[asset] || 0;
-  const parity = (windowIndex + offset) % 2 === 0;
-  direction = parity ? "Up" : "Down";
-  confidence = 0.53;
-  reasoning = `ПАРИТЕТ: окно #${windowIndex} ${asset.toUpperCase()} → ${direction}`;
-  strategy = "parity";
-
-  // === Контрариан только для небольших отклонений (3-7%) ===
-  // При девиации > 7% — не трогаем, рынок знает лучше
-  if (deviation > 0.03 && deviation <= 0.07) {
-    direction = upPrice > 0.53 ? "Down" : "Up";
-    confidence = 0.54;
-    reasoning = `КОНТРАРИАН: ${(Math.max(upPrice,1-upPrice)*100).toFixed(1)}% → ${direction}`;
-    strategy = "contrarian";
+  if (edgeUp > edgeDown && edgeUp > 0) {
+    direction = "Up";
+    edge = edgeUp;
+    strategy = "edge_up";
+  } else if (edgeDown > edgeUp && edgeDown > 0) {
+    direction = "Down";
+    edge = edgeDown;
+    strategy = "edge_down";
+  } else {
+    // No edge — default to Up (56% base rate)
+    direction = "Up";
+    edge = Math.max(0, edgeUp);
+    strategy = "base_rate";
   }
 
-  // === Фильтр: пропускаем экстремальные рынки (>60% в одну сторону) ===
-  // Исторически ставки против >60% давали крупные убытки
+  // =============================================
+  // 4. TRADE BLOCKING (even if edge > 0)
+  // =============================================
+  let blocked = false;
+  let blockReason = "";
+
+  // Block: extreme deviation (market strongly one-sided)
   if (deviation > 0.10) {
-    confidence = 0.51; // минимальный — самая маленькая ставка
-    reasoning += ` [высокая девиация ${(deviation*100).toFixed(0)}%]`;
+    blocked = true;
+    blockReason = `девиация ${(deviation*100).toFixed(0)}%>10%`;
+  }
+  // Block: edge too small (<1%)
+  if (edge < 0.01 && !blocked) {
+    blocked = true;
+    blockReason = `edge ${(edge*100).toFixed(1)}%<1%`;
+  }
+  // Block: low liquidity
+  if (market.liquidity < 1000 && !blocked) {
+    blocked = true;
+    blockReason = `ликвидность $${market.liquidity.toFixed(0)}<$1000`;
   }
 
-  // Clamp confidence
-  confidence = Math.min(0.58, Math.max(0.51, confidence));
+  // =============================================
+  // 5. POSITION SIZING (fractional Kelly)
+  // =============================================
+  // Kelly fraction = edge / (odds - 1), for binary: edge / (1/price - 1)
+  // Conservative: use 1/4 Kelly
+  const price = direction === "Up" ? impliedProbUp : impliedProbDown;
+  const odds = 1 / price; // payout per $1
+  const kellyFull = edge > 0 ? edge / (odds - 1) : 0;
+  const kellyFraction = kellyFull * 0.25; // 1/4 Kelly
+  const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
-  // === AI ОТКЛЮЧЕН ===
-  // Анализ показал: AI ухудшает результаты на 5-мин рынках:
-  // - AI Flip: 46% WR, -$18
-  // - AI Agree: 33% WR, -$10  
-  // - AI Disagree: 25% WR, -$60
-  // - Без AI: 42% WR (baseline паритета ~50%)
-  // Причина: LLM не имеет информации о движении цены в следующие 5 минут
-  const aiVerdict = "off";
+  const reasoning = [
+    `P(Up)=${(trueProb*100).toFixed(1)}% impl=${(impliedProbUp*100).toFixed(1)}%`,
+    `edge=${direction}${(edge*100).toFixed(1)}%`,
+    `kelly=${(kellyFraction*100).toFixed(1)}%`,
+    blocked ? `БЛОК:${blockReason}` : "",
+    reasons.join(" ")
+  ].filter(Boolean).join(" | ");
 
-  // Log the decision
-  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% | ${reasoning}`);
+  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] edge=${(edge*100).toFixed(1)}% ${blocked ? 'БЛОК:'+blockReason : ''} | ${reasons.join(' ')}`);
 
-  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: 1.0 };
+  return { direction, confidence, reasoning, strategy, aiVerdict: blocked ? "blocked" : "off", learningWeight: kellyFraction };
 }
 
 // --- Execute micro-trade ---
@@ -692,15 +783,17 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   const microMaxBet = parseFloat(storage.getConfig("micro_max_bet") || "20");
   
   const price = direction === "Up" ? market.upPrice : market.downPrice;
-  const impliedEdge = confidence - price;
   
-  // Простой сайзинг: базовая ставка $10 × riskMultiplier
-  // Лучшая модель использовала $5-$15, средняя $10
-  const baseBet = 10;
-  const rawSize = baseBet * riskMultiplier;
-  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.10));
+  // Kelly-based sizing: bankroll × kelly_fraction × asset_risk
+  // riskMultiplier = kelly fraction from analyzeWithCalibration
+  // Cap at $15 max (proven optimal range $5-$15)
+  const kellySize = microBankroll * riskMultiplier;
+  const asset = market.asset;
+  const assetRisk = getAssetRiskMultiplier(asset);
+  const rawSize = kellySize * assetRisk;
+  const size = Math.max(3, Math.min(rawSize, 15, microMaxBet, microBankroll * 0.08));
   
-  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: base=$${baseBet} risk=${riskMultiplier.toFixed(2)}x → $${size.toFixed(2)}`, "micro");
+  log(`Micro: ${asset} ${direction} kelly=${(riskMultiplier*100).toFixed(1)}% assetRisk=${assetRisk.toFixed(2)} → $${size.toFixed(2)}`, "micro");
 
   // Create all DB records
   const opp = storage.createOpportunity({
@@ -721,10 +814,10 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
     endDate: market.endDate,
     slug: market.slug,
     aiProbability: confidence,
-    edge: impliedEdge,
-    edgePercent: impliedEdge * 100,
+    edge: riskMultiplier,
+    edgePercent: riskMultiplier * 100,
     confidence: confidence > 0.58 ? "medium" : "low",
-    kellyFraction: impliedEdge * 0.15,
+    kellyFraction: riskMultiplier,
     recommendedSize: size,
     recommendedSide: direction === "Up" ? "YES" : "NO",
     status: "approved",
@@ -777,11 +870,11 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
     entityType: "execution",
     entityId: execution.id,
     actor: "agent:micro_scheduler",
-    details: JSON.stringify({ asset: market.asset, direction, confidence, size, price, edge: impliedEdge, paper: isPaperTrading }),
+    details: JSON.stringify({ asset: market.asset, direction, confidence, size, price, kelly: riskMultiplier, paper: isPaperTrading }),
     timestamp: new Date().toISOString(),
   });
 
-  log(`⚡ MICRO: ${market.asset.toUpperCase()} ${direction} $${size.toFixed(2)} @ ${(price * 100).toFixed(1)}% (edge: ${(impliedEdge * 100).toFixed(1)}%)`, "micro");
+  log(`⚡ MICRO: ${market.asset.toUpperCase()} ${direction} $${size.toFixed(2)} @ ${(price * 100).toFixed(1)}% kelly=${(riskMultiplier*100).toFixed(1)}%`, "micro");
   totalTrades++;
   return true;
 }
@@ -942,10 +1035,15 @@ async function runMicroCycle(): Promise<void> {
       analyses.push({ asset, market, ...analysis });
     }
 
-    // Execute trades — all 4 assets, размер зависит от риска актива
+    // Execute trades — skip blocked, use Kelly fraction for sizing
     for (const a of analyses) {
-      const riskMult = Math.max(0.3, getAssetRiskMultiplier(a.asset));
-      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, riskMult);
+      if (a.aiVerdict === "blocked") {
+        logModelChange("БЛОК", `${a.asset.toUpperCase()} ${a.direction} [${a.strategy}] | ${a.reasoning}`);
+        continue;
+      }
+      // learningWeight = kelly fraction from analysis
+      const kellyFrac = Math.max(0.01, a.learningWeight);
+      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, kellyFrac);
     }
 
     lastCycleAt = new Date().toISOString();
