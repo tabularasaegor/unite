@@ -79,26 +79,7 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
 }
 
 function App() {
-  const [authed, setAuthed] = useState(isAuthenticated());
-
-  const handleLogout = () => {
-    logout();
-    queryClient.clear();
-    setAuthed(false);
-  };
-
-  const handleLogin = () => {
-    queryClient.clear();
-    setAuthed(true);
-  };
-
-  if (!authed) {
-    return (
-      <ErrorBoundary>
-        <LoginPage onLogin={handleLogin} />
-      </ErrorBoundary>
-    );
-  }
+  const handleLogout = () => {};
 
   return (
     <ErrorBoundary>

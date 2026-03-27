@@ -147,15 +147,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ authenticated: !!token && isTokenValid(token) });
   });
 
-  // --- Auth middleware (simple token check) ---
-  app.use("/api", (req, res, next) => {
-    if (req.path.startsWith("/auth")) return next();
-    const token = req.headers.authorization?.replace("Bearer ", "");
-    if (!token || !isTokenValid(token)) {
-      return res.status(401).json({ error: "Требуется авторизация" });
-    }
-    next();
-  });
+  // --- Auth disabled ---
+  app.use("/api", (_req, _res, next) => next());
 
   // ============================================================================
   // PREDICTION MARKET PLATFORM — API Routes
@@ -337,8 +330,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     });
     if (type === "micro") {
       const eng = req.query.engine as string;
-      if (eng === "A") return res.json(enriched.filter(p => p.title?.startsWith("[5m-A]")));
-      if (eng === "B") return res.json(enriched.filter(p => p.title?.startsWith("[5m-B]")));
+      if (["A","B","C","D"].includes(eng)) return res.json(enriched.filter(p => p.title?.startsWith(`[5m-${eng}]`)));
       return res.json(enriched.filter(p => isMicro(p.title)));
     }
     if (type === "regular") return res.json(enriched.filter(p => !isMicro(p.title)));
@@ -458,14 +450,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(getArenaStatus());
   });
 
-  // Engine toggle: POST /api/micro/engine { engine: "A"|"B", enabled: true|false }
+  // Engine toggle: POST /api/micro/engine { engine: "A"|"B"|"C"|"D", enabled: true|false }
   app.post("/api/micro/engine", (req, res) => {
     const { engine, enabled } = req.body;
-    if (engine === "A" || engine === "B") {
+    if (["A", "B", "C", "D"].includes(engine)) {
       storage.setConfig(`engine_${engine.toLowerCase()}_enabled`, enabled ? "true" : "false");
       res.json({ engine, enabled, message: `Engine ${engine} ${enabled ? 'enabled' : 'disabled'}` });
     } else {
-      res.status(400).json({ error: "engine must be 'A' or 'B'" });
+      res.status(400).json({ error: "engine must be A, B, C, or D" });
     }
   });
 
@@ -481,8 +473,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const allPositions = storage.getActivePositions();
       const microPositions = allPositions.filter(p => {
         if (!p.title) return false;
-        if (engine === "A") return p.title.startsWith("[5m-A]");
-        if (engine === "B") return p.title.startsWith("[5m-B]");
+        if (["A","B","C","D"].includes(engine)) return p.title?.startsWith(`[5m-${engine}]`);
         return isMicro(p.title);
       });
       const closedMicro = microPositions.filter(p => p.status === "closed");

@@ -12,6 +12,8 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
+import { runLatencyArbitrage } from "./engineLatencyArb";
+import { runARIMAPredict } from "./engineARIMA";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -1001,8 +1003,10 @@ async function runMicroCycle(): Promise<void> {
 
     // Get enabled assets and engines
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
-    const engineAEnabled = storage.getConfig("engine_a_enabled") !== "false"; // Arena (default ON)
-    const engineBEnabled = storage.getConfig("engine_b_enabled") !== "false"; // Bayesian (default ON)
+    const engineAEnabled = storage.getConfig("engine_a_enabled") !== "false";
+    const engineBEnabled = storage.getConfig("engine_b_enabled") !== "false";
+    const engineCEnabled = storage.getConfig("engine_c_enabled") !== "false";
+    const engineDEnabled = storage.getConfig("engine_d_enabled") !== "false";
 
     for (const asset of enabledAssets) {
       const market = await fetchMicroMarket(asset);
@@ -1041,6 +1045,40 @@ async function runMicroCycle(): Promise<void> {
             }
           } catch (err) {
             log(`Engine B error for ${asset}: ${err}`, "micro");
+          }
+        }
+      }
+
+      // === ENGINE C: Latency Arbitrage ===
+      if (engineCEnabled) {
+        const alreadyTraded = storage.getOpportunityByExternalId(`micro-C-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-C-${market.slug}-Down`);
+        if (!alreadyTraded) {
+          try {
+            const result = await runLatencyArbitrage(asset, market.upPrice, market.liquidity);
+            logModelChange("LATENCY", `${asset.toUpperCase()} ${result.direction} Δ=${result.priceChange.toFixed(3)}% conf=${(result.confidence*100).toFixed(0)}%`);
+            if (!result.blocked) {
+              const kelly = Math.max(0.01, result.kellyFraction);
+              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "C");
+            }
+          } catch (err) {
+            log(`Engine C error for ${asset}: ${err}`, "micro");
+          }
+        }
+      }
+
+      // === ENGINE D: ARIMA Prediction ===
+      if (engineDEnabled) {
+        const alreadyTraded = storage.getOpportunityByExternalId(`micro-D-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-D-${market.slug}-Down`);
+        if (!alreadyTraded) {
+          try {
+            const result = await runARIMAPredict(asset, market.upPrice, market.liquidity);
+            logModelChange("ARIMA", `${asset.toUpperCase()} ${result.direction} Δ=${result.predictedChange.toFixed(3)}% conf=${(result.confidence*100).toFixed(0)}%`);
+            if (!result.blocked) {
+              const kelly = Math.max(0.01, result.kellyFraction);
+              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "D");
+            }
+          } catch (err) {
+            log(`Engine D error for ${asset}: ${err}`, "micro");
           }
         }
       }

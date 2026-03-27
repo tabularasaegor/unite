@@ -78,15 +78,17 @@ export default function MicroEngines() {
             <Zap className="h-5 w-5 text-amber-500" />
             <h2 className="text-lg font-semibold">Крипто 5-мин</h2>
           </div>
-          <TabsList className="grid w-full max-w-md grid-cols-3">
-            <TabsTrigger value="all" className="text-xs">Все модели</TabsTrigger>
-            <TabsTrigger value="A" className="text-xs">🏟 Арена (A)</TabsTrigger>
-            <TabsTrigger value="B" className="text-xs">📊 Байес (B)</TabsTrigger>
+          <TabsList className="grid w-full max-w-xl grid-cols-5">
+            <TabsTrigger value="all" className="text-xs">Все</TabsTrigger>
+            <TabsTrigger value="A" className="text-xs">Арена</TabsTrigger>
+            <TabsTrigger value="B" className="text-xs">Байес</TabsTrigger>
+            <TabsTrigger value="C" className="text-xs">Latency</TabsTrigger>
+            <TabsTrigger value="D" className="text-xs">ARIMA</TabsTrigger>
           </TabsList>
         </div>
 
         <TabsContent value="all" className="flex-1 m-0">
-          <EngineControl engine="ALL" label="Обе модели" />
+          <EngineControl engine="ALL" label="Все 4 модели" />
           <MicroDashboard />
         </TabsContent>
 
@@ -96,8 +98,18 @@ export default function MicroEngines() {
         </TabsContent>
 
         <TabsContent value="B" className="flex-1 m-0">
-          <EngineControl engine="B" label="Bayesian Edge — base rate + market signal + calibration" />
+          <EngineControl engine="B" label="Bayesian Edge — adaptive base rate + калибровка" />
           <MicroDashboard engine="B" />
+        </TabsContent>
+
+        <TabsContent value="C" className="flex-1 m-0">
+          <EngineControl engine="C" label="Latency Arbitrage — спотовый опережает Polymarket" />
+          <MicroDashboard engine="C" />
+        </TabsContent>
+
+        <TabsContent value="D" className="flex-1 m-0">
+          <EngineControl engine="D" label="ARIMA(3,1,1) — статистическое прогнозирование" />
+          <MicroDashboard engine="D" />
         </TabsContent>
       </Tabs>
     </div>
