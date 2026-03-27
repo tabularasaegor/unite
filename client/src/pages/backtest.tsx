@@ -15,6 +15,8 @@ import {
   Loader2,
   Target,
   Activity,
+  Rocket,
+  RefreshCw,
 } from "lucide-react";
 import {
   LineChart,
@@ -68,7 +70,7 @@ const strategyLabels: Record<string, string> = {
   momentum: "Моментум",
   meanReversion: "Возврат к среднему",
   orderBookImbalance: "Дисбаланс стакана",
-  alternating: "Чередование",
+  marketFollow: "Следование за рынком",
   majorityVote: "Голосование большинства",
   confidenceWeighted: "Взвеш. по уверенности",
   top2Thompson: "Топ-2 Томпсона",
@@ -80,7 +82,7 @@ const strategyColors: Record<string, string> = {
   momentum: "#3b82f6",
   meanReversion: "#8b5cf6",
   orderBookImbalance: "#06b6d4",
-  alternating: "#6b7280",
+  marketFollow: "#22c55e",
   majorityVote: "#10b981",
   confidenceWeighted: "#ec4899",
   top2Thompson: "#f97316",
@@ -134,6 +136,26 @@ export default function BacktestPage() {
     },
   });
 
+  const applyAndStartMutation = useMutation({
+    mutationFn: async () => {
+      await apiRequest("POST", "/api/backtest/apply-priors");
+      await apiRequest("POST", "/api/micro/scheduler/start");
+    },
+    onSuccess: () => {
+      toast({
+        title: "Торговля запущена",
+        description: `Лучшая модель из бэктеста применена, планировщик запущен`,
+      });
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Ошибка запуска",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+
   const data = cachedData;
   const results = data?.results || [];
   const bestModel = data?.bestModel;
@@ -158,23 +180,55 @@ export default function BacktestPage() {
         title="Бэктестинг"
         subtitle="Сравнение стратегий на синтетических данных (GBM + Орнштейна-Уленбека)"
         actions={
-          <Button
-            onClick={() => runMutation.mutate()}
-            disabled={runMutation.isPending}
-            data-testid="button-run-backtest"
-          >
-            {runMutation.isPending ? (
-              <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                Выполняется...
-              </>
-            ) : (
-              <>
-                <Play className="h-4 w-4 mr-2" />
-                Запустить бэктест
-              </>
+          <div className="flex gap-2">
+            {hasResults && (
+              <Button
+                onClick={() => applyAndStartMutation.mutate()}
+                disabled={applyAndStartMutation.isPending}
+                variant="default"
+                className="bg-emerald-600 hover:bg-emerald-700"
+                data-testid="button-apply-and-start"
+              >
+                {applyAndStartMutation.isPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Запуск...
+                  </>
+                ) : (
+                  <>
+                    <Rocket className="h-4 w-4 mr-2" />
+                    Запустить лучшую модель
+                  </>
+                )}
+              </Button>
             )}
-          </Button>
+            <Button
+              onClick={() => runMutation.mutate()}
+              disabled={runMutation.isPending}
+              variant="outline"
+              data-testid="button-run-backtest"
+            >
+              {runMutation.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Выполняется...
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4 mr-2" />
+                  Запустить бэктест
+                </>
+              )}
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => queryClient.invalidateQueries({ queryKey: ["/api/backtest/results"] })}
+              data-testid="button-refresh"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+          </div>
         }
       />
 
@@ -571,8 +625,8 @@ const strategyDescriptions = [
     isEnsemble: false,
   },
   {
-    key: "alternating",
-    description: "Простое чередование up/down по чётности окна",
+    key: "marketFollow",
+    description: "Следует за большинством рынка — ставит в направлении доминирующего мнения",
     isEnsemble: false,
   },
   {

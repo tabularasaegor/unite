@@ -1,8 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
+import { queryClient } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TableCell, TableRow } from "@/components/ui/table";
 import { DataTable, StatusBadge, PnLDisplay, PageHeader, formatDate } from "@/components/shared";
+import { RefreshCw } from "lucide-react";
 import type { ActivePosition } from "@shared/schema";
 
 const headers = ["ID", "Актив", "Направление", "Вход", "Текущая", "Размер", "P&L", "Стратегия", "Статус", "Время"];
@@ -28,7 +31,13 @@ function PositionsTable({ positions, isLoading }: { positions: ActivePosition[];
           <TableCell className="font-mono text-sm">${(pos.currentPrice ?? 0).toFixed(4)}</TableCell>
           <TableCell className="font-mono text-sm">${pos.size.toFixed(2)}</TableCell>
           <TableCell>
-            <PnLDisplay value={pos.status === "open" ? pos.unrealizedPnl : pos.realizedPnl} />
+            {pos.status === "open" ? (
+              <span className="font-mono text-xs text-muted-foreground" title="Ожидание расчёта">
+                ±${pos.size.toFixed(0)}
+              </span>
+            ) : (
+              <PnLDisplay value={pos.realizedPnl} />
+            )}
           </TableCell>
           <TableCell className="text-xs text-muted-foreground">{pos.strategyUsed ?? "—"}</TableCell>
           <TableCell>
@@ -53,7 +62,21 @@ export default function MicroPositions() {
 
   return (
     <div>
-      <PageHeader title="Микро-позиции" subtitle="Позиции крипто 5-минутной торговли" />
+      <PageHeader
+        title="Микро-позиции"
+        subtitle="Позиции крипто 5-минутной торговли"
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => queryClient.invalidateQueries({ queryKey: ["/api/positions?source=micro"] })}
+            data-testid="button-refresh"
+          >
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Обновить
+          </Button>
+        }
+      />
       <Card>
         <CardContent className="pt-6">
           <Tabs defaultValue="open">

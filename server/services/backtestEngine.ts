@@ -1,13 +1,13 @@
 /**
- * Backtest Engine v4 — Simulates all 6 micro-engine strategies + ensemble approaches
+ * Backtest Engine v5 — Simulates all 5 micro-engine strategies + ensemble approaches
  * on synthetic GBM+OU price data to compare model performance.
  *
- * v4 Changes:
- * - Added "marketFollow" strategy
- * - Strategy thresholds match microEngine v4 exactly
- * - Improved synthetic data generation (more realistic market microstructure)
- * - Better ensemble methods
- * - More robust statistical analysis
+ * v5 Changes:
+ * - Removed "alternating" strategy (dropped in live engine v5)
+ * - PnL formula now exactly matches live microEngine (betSize * (1/entryPrice - 1))
+ * - Clamping matches live: reject entryPrice <= 0.01 or >= 0.99
+ * - Fixed synthetic data: upPct is now independent of outcome (no look-ahead bias)
+ * - Updated contrarian and marketFollow confidence formulas to match v5 live engine
  */
 
 import crypto from "crypto";
@@ -102,12 +102,16 @@ function generatePriceData(numWindows: number): WindowData[] {
       priceHistory.push(allPrices[h * stepsPerWindow]);
     }
 
-    // Generate realistic market probability (upPct)
-    // In real markets, upPct hovers near 0.50 with slight signal
-    const priceChange = (endPrice - startPrice) / startPrice;
-    const signal = priceChange * 15;
-    const noise = randn() * 0.06;
-    const upPct = Math.max(0.20, Math.min(0.80, 0.5 + signal + noise));
+    // Generate market probability (upPct) — INDEPENDENT of actual outcome
+    // In real 5-min Polymarket, upPct hovers around 0.50 with slight noise
+    // NO look-ahead bias: we do NOT use endPrice to compute upPct
+    const baseNoise = randn() * 0.04;
+    // Slight momentum from recent price history (no look-ahead)
+    const recentReturn = priceHistory.length >= 2
+      ? (priceHistory[priceHistory.length-1] - priceHistory[priceHistory.length-2]) / priceHistory[priceHistory.length-2]
+      : 0;
+    const momentumSignal = recentReturn * 8; // weak signal from past, not future
+    const upPct = Math.max(0.30, Math.min(0.70, 0.5 + baseNoise + momentumSignal));
 
     // Order book imbalance: loosely correlated with actual direction
     const obiSignal = (priceWentUp ? 0.03 : -0.03);
@@ -165,11 +169,11 @@ interface StrategySignal {
 
 function strategyContrarian(w: WindowData): StrategySignal {
   const deviation = Math.abs(w.upPct - 0.5);
-  if (deviation <= 0.003) {
+  if (deviation <= 0.005) {  // was 0.003 in v4
     return { direction: "skip", confidence: 0.49 };
   }
   const direction: "up" | "down" = w.upPct > 0.5 ? "down" : "up";
-  const confidence = 0.52 + deviation * 0.5;
+  const confidence = 0.53 + deviation * 0.55;  // was 0.52 + deviation * 0.5
   return { direction, confidence: Math.min(confidence, 0.75) };
 }
 
@@ -248,21 +252,14 @@ function strategyOrderBookImbalance(w: WindowData): StrategySignal {
   return { direction, confidence: Math.min(confidence, 0.73) };
 }
 
-function strategyAlternating(w: WindowData): StrategySignal {
-  const parity = w.index % 2;
-  return {
-    direction: parity === 0 ? "up" : "down",
-    confidence: 0.52,
-  };
-}
-
 function strategyMarketFollow(w: WindowData): StrategySignal {
   const deviation = Math.abs(w.upPct - 0.5);
   const direction: "up" | "down" = w.upPct >= 0.5 ? "up" : "down";
-  const confidence = 0.52 + deviation * 0.35;
+  // Boosted confidence matching v5 live engine
+  const confidence = 0.53 + deviation * 0.45;
   return {
     direction,
-    confidence: Math.min(confidence, 0.70),
+    confidence: Math.min(confidence, 0.75),
   };
 }
 
@@ -271,7 +268,7 @@ function strategyMarketFollow(w: WindowData): StrategySignal {
 function evaluateTrade(
   signal: StrategySignal,
   w: WindowData,
-  betSize: number = 10
+  betSize: number = 20  // Match live default max_bet
 ): TradeResult {
   if (signal.direction === "skip") {
     return { direction: "skip", confidence: signal.confidence, won: false, pnl: 0 };
@@ -280,12 +277,17 @@ function evaluateTrade(
   const predictedUp = signal.direction === "up";
   const won = predictedUp === w.priceWentUp;
 
+  // Entry price = the probability of the side we're betting on (same as live)
   const entryPrice = predictedUp ? w.upPct : w.downPct;
-  const clampedEntry = Math.max(0.1, Math.min(0.9, entryPrice));
+  // Clamp same as live — reject extremes
+  if (entryPrice <= 0.01 || entryPrice >= 0.99) {
+    return { direction: signal.direction, confidence: signal.confidence, won: false, pnl: 0 };
+  }
 
   let pnl: number;
   if (won) {
-    pnl = betSize * ((1 - clampedEntry) / clampedEntry);
+    // Exact match with live: size * (1/entryPrice - 1)
+    pnl = betSize * (1 / entryPrice - 1);
   } else {
     pnl = -betSize;
   }
@@ -378,7 +380,6 @@ const individualStrategies: { name: string; fn: StrategyFn }[] = [
   { name: "momentum", fn: strategyMomentum },
   { name: "meanReversion", fn: strategyMeanReversion },
   { name: "orderBookImbalance", fn: strategyOrderBookImbalance },
-  { name: "alternating", fn: strategyAlternating },
   { name: "marketFollow", fn: strategyMarketFollow },
 ];
 

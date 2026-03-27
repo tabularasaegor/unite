@@ -12,6 +12,7 @@ import {
   Play,
   Square,
   Clock,
+  RefreshCw,
 } from "lucide-react";
 import {
   BarChart,
@@ -116,6 +117,20 @@ export default function MicroDashboard() {
       <PageHeader
         title="Крипто 5-мин"
         subtitle="Автоматическая торговля 5-минутными Up/Down рынками"
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              queryClient.invalidateQueries({ queryKey: ["/api/micro/stats"] });
+              queryClient.invalidateQueries({ queryKey: ["/api/micro/logs"] });
+            }}
+            data-testid="button-refresh"
+          >
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Обновить
+          </Button>
+        }
       />
 
       {/* KPI Cards */}
