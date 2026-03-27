@@ -23,7 +23,10 @@
 
 import { log } from "../index";
 import { storage } from "../storage";
-import { getRollingBaseRate } from "./cryptoMicroScheduler";
+
+// Injected from cryptoMicroScheduler to avoid circular dependency
+let _getRollingBaseRate: () => number = () => 0.50;
+export function setBaseRateProvider(fn: () => number) { _getRollingBaseRate = fn; }
 
 // ============================================================
 // PRICE DATA FETCHING
@@ -213,7 +216,7 @@ function modelTAMeanReversion(candles: Candle[], upPrice: number): ModelPredicti
 // Historical: price > 0.50 → Up resolves 62%
 function modelOrderbookImbalance(candles: Candle[], upPrice: number): ModelPrediction {
   const deviation = upPrice - 0.5;
-  const baseRate = getRollingBaseRate();
+  const baseRate = _getRollingBaseRate();
   const reasons: string[] = [];
   let direction: "Up" | "Down";
   let confidence: number;
@@ -246,7 +249,7 @@ function modelOrderbookImbalance(candles: Candle[], upPrice: number): ModelPredi
 // --- Model 4: BAYESIAN BASE ---
 // Pure Bayesian update from base rate + market signal + asset calibration
 function modelBayesianBase(candles: Candle[], upPrice: number, assetCalibration: { upWR: number; totalTrades: number }): ModelPrediction {
-  const BASE_RATE = getRollingBaseRate();
+  const BASE_RATE = _getRollingBaseRate();
   let prob = BASE_RATE;
   let weight = 1.0;
   const reasons: string[] = [`base=${(BASE_RATE*100).toFixed(0)}%`];
@@ -465,16 +468,9 @@ export async function runModelArena(
   let blockReason = "";
   const deviation = Math.abs(upPrice - 0.5);
   
-  if (deviation > 0.12) { blocked = true; blockReason = `девиация ${(deviation*100).toFixed(0)}%`; }
-  else if (edge < 0.005) { blocked = true; blockReason = `edge ${(edge*100).toFixed(1)}%<0.5%`; }
-  else if (liquidity < 800) { blocked = true; blockReason = `ликвидность $${liquidity.toFixed(0)}`; }
-  // Model disagreement: if models are split 50/50, reduce confidence
-  const upModels = predictions.filter(p => p.direction === "Up").length;
-  const downModels = predictions.length - upModels;
-  if (Math.abs(upModels - downModels) <= 1 && edge < 0.02) {
-    blocked = true;
-    blockReason = `разногласие моделей ${upModels}↑/${downModels}↓`;
-  }
+  if (deviation > 0.15) { blocked = true; blockReason = `девиация ${(deviation*100).toFixed(0)}%`; }
+  else if (liquidity < 500) { blocked = true; blockReason = `ликвидность $${liquidity.toFixed(0)}`; }
+  // No edge/disagreement blocking — always trade, size adjusts risk
 
   // Build reasoning
   const modelVotes = predictions.map(p => {

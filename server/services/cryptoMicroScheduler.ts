@@ -12,7 +12,7 @@
 import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
-import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, type ModelPrediction } from "./modelArena";
+import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 // Match all micro-trade titles: [5m], [5m-A], [5m-B]
@@ -21,33 +21,25 @@ function isMicroTrade(title: string | null | undefined): boolean {
 }
 
 // Rolling base rate from last N resolutions (replaces hardcoded 0.56)
-// Returns probability of Up resolution based on recent data
-let cachedRollingBaseRate = 0.50;
-let baseRateLastCalc = 0;
-
 export function getRollingBaseRate(): number {
-  // Cache for 60s
-  if (Date.now() - baseRateLastCalc < 60000) return cachedRollingBaseRate;
-  baseRateLastCalc = Date.now();
-  
   try {
+    // getActivePositions("closed") returns ordered by openedAt DESC (newest first)
     const allPos = storage.getActivePositions("closed");
     const micro = allPos.filter(p => isMicroTrade(p.title));
-    // Use last 40 trades for rolling window
-    const recent = micro.slice(-40);
-    if (recent.length < 10) { cachedRollingBaseRate = 0.50; return 0.50; }
+    const recent = micro.slice(0, 30); // FIRST 30 = newest 30 (DESC order)
+    if (recent.length < 5) return 0.50;
     
     let upResolved = 0;
     for (const r of recent) {
-      // Determine if resolved Up: YES won OR NO lost
       const won = (r.unrealizedPnl || 0) > 0;
       if ((r.side === "YES" && won) || (r.side === "NO" && !won)) upResolved++;
     }
-    cachedRollingBaseRate = Math.max(0.30, Math.min(0.70, upResolved / recent.length));
+    const rate = upResolved / recent.length;
+    log(`Rolling base rate: ${upResolved}/${recent.length} = ${(rate*100).toFixed(0)}% Up`, "micro");
+    return Math.max(0.30, Math.min(0.70, rate));
   } catch {
-    cachedRollingBaseRate = 0.50;
+    return 0.50;
   }
-  return cachedRollingBaseRate;
 }
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
 type CryptoAsset = string;
@@ -212,16 +204,15 @@ function recordWindowResult(wins: number, losses: number, pnl: number) {
   }
 }
 
-// Returns risk multiplier for asset based on recent performance (no blocking)
+// Returns risk multiplier for asset based on recent performance
 function getAssetRiskMultiplier(asset: string): number {
   const cal = getCalibration(asset);
   const recent = cal.lastResults.slice(-5);
   if (recent.length < 5) return 1.0;
   const recentWR = recent.filter(r => r.won).length / recent.length;
-  // WR < 30% → минимальная ставка, WR 30-50% → сниженная, WR > 50% → полная
-  if (recentWR < 0.20) return 0.2;
-  if (recentWR < 0.40) return 0.4;
-  if (recentWR < 0.50) return 0.6;
+  // Gentle reduction: min 0.5x to keep trades meaningful
+  if (recentWR < 0.30) return 0.5;
+  if (recentWR < 0.50) return 0.7;
   return 1.0;
 }
 
@@ -751,9 +742,8 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
 
   // Blocking
   let blocked = false;
-  if (deviation > 0.10) blocked = true;
-  if (edge < 0.01) blocked = true;
-  if (market.liquidity < 1000) blocked = true;
+  if (deviation > 0.15) blocked = true; // only extreme (>65/35)
+  if (market.liquidity < 500) blocked = true;
 
   // Kelly
   const price = direction === "Up" ? upPrice : downPrice;
@@ -1068,6 +1058,7 @@ async function runMicroCycle(): Promise<void> {
 export function startMicroScheduler(): void {
   if (schedulerInterval) clearInterval(schedulerInterval);
   storage.setConfig("micro_scheduler_enabled", "true");
+  setBaseRateProvider(getRollingBaseRate); // inject into arena to avoid circular dep
   initStateFromDB();
   loadCalibrationFromMemory();
   loadArenaRatings();
