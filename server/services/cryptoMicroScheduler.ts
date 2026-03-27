@@ -15,6 +15,10 @@ import { fetchPrice } from "./polymarket";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, type ModelPrediction } from "./modelArena";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
+// Match all micro-trade titles: [5m], [5m-A], [5m-B]
+function isMicroTrade(title: string | null | undefined): boolean {
+  return !!title && (title.startsWith("[5m]") || title.startsWith("[5m-"));
+}
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
 type CryptoAsset = string;
 
@@ -307,7 +311,7 @@ function initStateFromDB(): void {
 
   try {
     const allPositions = storage.getActivePositions();
-    const microClosed = allPositions.filter(p => p.title?.startsWith("[5m]") && p.status === "closed");
+    const microClosed = allPositions.filter(p => isMicroTrade(p.title) && p.status === "closed");
 
     if (microClosed.length === 0) return;
 
@@ -435,7 +439,7 @@ function auditCalibrationOnStartup(): void {
 function rebuildCalibrationFromHistory(): void {
   try {
     const allPositions = storage.getActivePositions("closed");
-    const microClosed = allPositions.filter(p => p.title?.startsWith("[5m]"));
+    const microClosed = allPositions.filter(p => isMicroTrade(p.title));
     
     if (microClosed.length === 0) {
       loadCalibrationFromMemory();
@@ -622,40 +626,111 @@ async function fetchMicroMarket(asset: string): Promise<MicroMarket | null> {
  * 4. Position sizing: Kelly fraction с консервативным множителем
  * 5. Trade blocking: девиация >10%, ликвидность <1000, edge <1%
  */
-async function analyzeWithCalibration(asset: string, market: MicroMarket): Promise<{
+interface EngineResult {
   direction: "Up" | "Down";
   confidence: number;
   reasoning: string;
   strategy: string;
-  aiVerdict: string;
-  learningWeight: number;
-  modelPredictions?: any[];
-}> {
+  blocked: boolean;
+  kellyFraction: number;
+  modelTag: string; // "A" (arena) or "B" (bayesian)
+}
+
+// === ENGINE A: Model Arena (5 competing TA/ML models) ===
+async function engineArena(asset: string, market: MicroMarket): Promise<EngineResult> {
   const cal = getCalibration(asset);
   const upWR = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : 0.56;
 
-  // Run the model arena (5 competing models)
   const arena = await runModelArena(asset, market.upPrice, market.liquidity, {
-    upWR,
-    totalTrades: cal.totalTrades,
+    upWR, totalTrades: cal.totalTrades,
   });
 
-  // Log arena decision
-  logModelChange("АРЕНА", `${asset.toUpperCase()} ${arena.direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(arena.kellyFraction*100).toFixed(1)}% ${arena.blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8) + ':' + m.direction + '(' + (m.confidence*100).toFixed(0) + '%)').join(' ')}`);
+  logModelChange("АРЕНА", `${asset.toUpperCase()} ${arena.direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(arena.kellyFraction*100).toFixed(1)}% ${arena.blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8)+':'+m.direction).join(' ')}`);
 
   return {
     direction: arena.direction,
     confidence: arena.confidence,
     reasoning: arena.reasoning,
-    strategy: arena.models.find(m => m.direction === arena.direction)?.modelName || "ensemble",
-    aiVerdict: arena.blocked ? "blocked" : "arena",
-    learningWeight: arena.kellyFraction,
-    modelPredictions: arena.models,
+    strategy: "arena",
+    blocked: arena.blocked,
+    kellyFraction: arena.kellyFraction,
+    modelTag: "A",
   };
 }
 
+// === ENGINE B: Bayesian Edge Model (from commit 5aee0a1) ===
+function engineBayesian(asset: string, market: MicroMarket): EngineResult {
+  const cal = getCalibration(asset);
+  const upPrice = market.upPrice;
+  const downPrice = 1 - upPrice;
+  const deviation = Math.abs(upPrice - 0.5);
+  const reasons: string[] = [];
+
+  const BASE_RATE_UP = 0.56;
+  let trueProb = BASE_RATE_UP;
+  let totalWeight = 1.0;
+
+  // Market microstructure signal
+  if (upPrice > 0.51) {
+    trueProb = (trueProb * totalWeight + 0.62 * 1.5) / (totalWeight + 1.5);
+    totalWeight += 1.5;
+    reasons.push(`Рынок:Up${(upPrice*100).toFixed(0)}%`);
+  } else if (upPrice < 0.49) {
+    trueProb = (trueProb * totalWeight + 0.52 * 0.8) / (totalWeight + 0.8);
+    totalWeight += 0.8;
+    reasons.push(`Рынок:Down${(downPrice*100).toFixed(0)}%`);
+  }
+
+  // Per-asset calibration
+  if (cal.totalTrades >= 10) {
+    const assetUpRate = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : BASE_RATE_UP;
+    const smoothed = (assetUpRate * cal.totalTrades + BASE_RATE_UP * 20) / (cal.totalTrades + 20);
+    trueProb = (trueProb * totalWeight + smoothed * 1.0) / (totalWeight + 1.0);
+    totalWeight += 1.0;
+    reasons.push(`${asset.toUpperCase()}:${(smoothed*100).toFixed(0)}%`);
+  }
+
+  // Momentum
+  const recentResults = cal.lastResults.slice(-5);
+  if (recentResults.length >= 3) {
+    const recentUpRate = (recentResults.filter(r => r.direction === "Up" && r.won).length
+      + recentResults.filter(r => r.direction === "Down" && !r.won).length) / recentResults.length;
+    trueProb = (trueProb * totalWeight + recentUpRate * 0.5) / (totalWeight + 0.5);
+    totalWeight += 0.5;
+  }
+
+  // Uncertainty penalty
+  if (market.liquidity < 2000) trueProb = trueProb * 0.7 + 0.5 * 0.3;
+  trueProb = Math.max(0.35, Math.min(0.65, trueProb));
+
+  // Edge
+  const edgeUp = trueProb - upPrice;
+  const edgeDown = (1 - trueProb) - downPrice;
+  let direction: "Up" | "Down" = edgeUp >= edgeDown ? "Up" : "Down";
+  let edge = direction === "Up" ? edgeUp : edgeDown;
+  if (edge < 0) { direction = "Up"; edge = Math.max(0, edgeUp); }
+
+  // Blocking
+  let blocked = false;
+  if (deviation > 0.10) blocked = true;
+  if (edge < 0.01) blocked = true;
+  if (market.liquidity < 1000) blocked = true;
+
+  // Kelly
+  const price = direction === "Up" ? upPrice : downPrice;
+  const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
+  const kellyFraction = kellyFull * 0.25;
+  const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
+
+  const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
+  logModelChange("БАЙЕС", `${asset.toUpperCase()} ${direction} edge=${(edge*100).toFixed(1)}% ${blocked ? 'БЛОК' : ''} | ${reasons.join(' ')}`);
+
+  return { direction, confidence, reasoning, strategy: "bayesian", blocked, kellyFraction, modelTag: "B" };
+}
+
 // --- Execute micro-trade ---
-function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0): boolean {
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0, modelTag: string = ""): boolean {
+  const tag = modelTag ? `[5m-${modelTag}]` : "[5m]";
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
@@ -678,10 +753,10 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
 
   // Create all DB records
   const opp = storage.createOpportunity({
-    externalId: `micro-${market.slug}-${direction}`,
+    externalId: `micro-${modelTag}-${market.slug}-${direction}`,
     platform: "polymarket",
-    title: `[5m] ${market.title}`,
-    description: `5-min ${market.asset.toUpperCase()} prediction. AI: ${direction} (${(confidence * 100).toFixed(0)}%). ${reasoning}`,
+    title: `${tag} ${market.title}`,
+    description: `[${modelTag}] ${market.asset.toUpperCase()} ${direction} (${(confidence * 100).toFixed(0)}%). ${reasoning}`,
     category: "crypto",
     marketUrl: `https://polymarket.com/event/${market.slug}`,
     currentPrice: price,
@@ -726,7 +801,7 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
     opportunityId: opp.id,
     executionId: execution.id,
     platform: "polymarket",
-    title: `[5m] ${market.title}`,
+    title: `${tag} ${market.title}`,
     side: direction === "Up" ? "YES" : "NO",
     entryPrice: price,
     currentPrice: price,
@@ -763,7 +838,7 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
 // --- Settle expired trades and update calibration ---
 async function settleMicroTrades(): Promise<number> {
   const openPositions = storage.getActivePositions("open");
-  const microPositions = openPositions.filter(p => p.title.startsWith("[5m]"));
+  const microPositions = openPositions.filter(p => isMicroTrade(p.title));
   let settled = 0;
 
   for (const pos of microPositions) {
@@ -869,7 +944,7 @@ async function settleMicroTrades(): Promise<number> {
     let batchWins = 0, batchLosses = 0, batchPnl = 0;
     // Use the last N settled positions
     const allPos = storage.getActivePositions("closed");
-    const recentClosed = allPos.filter(p => p.title?.startsWith("[5m]")).slice(-settled);
+    const recentClosed = allPos.filter(p => isMicroTrade(p.title)).slice(-settled);
     for (const p of recentClosed) {
       if ((p.unrealizedPnl || 0) > 0) batchWins++; else batchLosses++;
       batchPnl += p.unrealizedPnl || 0;
@@ -895,36 +970,51 @@ async function runMicroCycle(): Promise<void> {
       log(`Micro: settled ${settled} trades. Total P&L: $${totalPnl.toFixed(2)}`, "micro");
     }
 
-    // Get enabled assets
+    // Get enabled assets and engines
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
-
-    // Collect all analyses first, then diversify
-    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string; aiVerdict: string; learningWeight: number; modelPredictions?: any[] }> = [];
+    const engineAEnabled = storage.getConfig("engine_a_enabled") !== "false"; // Arena (default ON)
+    const engineBEnabled = storage.getConfig("engine_b_enabled") !== "false"; // Bayesian (default ON)
 
     for (const asset of enabledAssets) {
       const market = await fetchMicroMarket(asset);
       if (!market) continue;
-
-      if (storage.getOpportunityByExternalId(`micro-${market.slug}-Up`) || 
-          storage.getOpportunityByExternalId(`micro-${market.slug}-Down`)) continue;
-
-      // Min liquidity $500
       if (market.liquidity < 500) continue;
 
-      // AI analysis with calibration context
-      const analysis = await analyzeWithCalibration(asset, market);
-      analyses.push({ asset, market, ...analysis });
-    }
-
-    // Execute trades — skip blocked, use Kelly fraction for sizing
-    for (const a of analyses) {
-      if (a.aiVerdict === "blocked") {
-        logModelChange("БЛОК", `${a.asset.toUpperCase()} ${a.direction} [${a.strategy}] | ${a.reasoning}`);
-        continue;
+      // === ENGINE A: Model Arena ===
+      if (engineAEnabled) {
+        const alreadyTraded = storage.getOpportunityByExternalId(`micro-A-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-A-${market.slug}-Down`);
+        if (!alreadyTraded) {
+          try {
+            const result = await engineArena(asset, market);
+            if (result.blocked) {
+              logModelChange("БЛОК_A", `${asset.toUpperCase()} ${result.direction} | ${result.reasoning}`);
+            } else {
+              const kelly = Math.max(0.01, result.kellyFraction);
+              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "A");
+            }
+          } catch (err) {
+            log(`Engine A error for ${asset}: ${err}`, "micro");
+          }
+        }
       }
-      // learningWeight = kelly fraction from analysis
-      const kellyFrac = Math.max(0.01, a.learningWeight);
-      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, kellyFrac);
+
+      // === ENGINE B: Bayesian Edge ===
+      if (engineBEnabled) {
+        const alreadyTraded = storage.getOpportunityByExternalId(`micro-B-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-B-${market.slug}-Down`);
+        if (!alreadyTraded) {
+          try {
+            const result = engineBayesian(asset, market);
+            if (result.blocked) {
+              logModelChange("БЛОК_B", `${asset.toUpperCase()} ${result.direction} | ${result.reasoning}`);
+            } else {
+              const kelly = Math.max(0.01, result.kellyFraction);
+              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "B");
+            }
+          } catch (err) {
+            log(`Engine B error for ${asset}: ${err}`, "micro");
+          }
+        }
+      }
     }
 
     lastCycleAt = new Date().toISOString();

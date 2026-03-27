@@ -448,16 +448,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(getArenaStatus());
   });
 
+  // Engine toggle: POST /api/micro/engine { engine: "A"|"B", enabled: true|false }
+  app.post("/api/micro/engine", (req, res) => {
+    const { engine, enabled } = req.body;
+    if (engine === "A" || engine === "B") {
+      storage.setConfig(`engine_${engine.toLowerCase()}_enabled`, enabled ? "true" : "false");
+      res.json({ engine, enabled, message: `Engine ${engine} ${enabled ? 'enabled' : 'disabled'}` });
+    } else {
+      res.status(400).json({ error: "engine must be 'A' or 'B'" });
+    }
+  });
+
   app.post("/api/micro/stop", (_req, res) => {
     stopMicroScheduler();
     res.json({ stopped: true, ...getMicroStatus() });
   });
 
   // Detailed micro stats with per-asset breakdown, time series, averages
-  app.get("/api/micro/stats", (_req, res) => {
+  app.get("/api/micro/stats", (req, res) => {
     try {
+      const engine = (req.query.engine as string) || ""; // "A", "B", or "" for all
       const allPositions = storage.getActivePositions();
-      const microPositions = allPositions.filter(p => p.title?.startsWith("[5m]"));
+      const microPositions = allPositions.filter(p => {
+        if (!p.title) return false;
+        if (engine === "A") return p.title.startsWith("[5m-A]");
+        if (engine === "B") return p.title.startsWith("[5m-B]");
+        return p.title.startsWith("[5m]") || p.title.startsWith("[5m-");
+      });
       const closedMicro = microPositions.filter(p => p.status === "closed");
       const openMicro = microPositions.filter(p => p.status === "open");
 
@@ -628,7 +645,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/micro/dashboard", (_req, res) => {
     const allPositions = storage.getActivePositions();
-    const microPositions = allPositions.filter(p => p.title.startsWith("[5m]"));
+    const microPositions = allPositions.filter(p => p.title?.startsWith("[5m]") || p.title?.startsWith("[5m-"));
     const openMicro = microPositions.filter(p => p.status === "open");
     const closedMicro = microPositions.filter(p => p.status === "closed");
     const totalPnl = closedMicro.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
