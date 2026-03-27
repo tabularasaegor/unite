@@ -803,7 +803,7 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
 }
 
 // --- Execute micro-trade ---
-function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string): boolean {
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0): boolean {
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
@@ -821,7 +821,7 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   }
 
   // Sizing: use percentage of max_bet based on edge strength
-  // Edge 0.5-2% → 25% of max bet (min $5)
+  // Edge 0.5-2% → 25% of max bet
   // Edge 2-5% → 50% of max bet
   // Edge 5-10% → 75% of max bet
   // Edge >10% → 100% of max bet
@@ -831,11 +831,12 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   else if (impliedEdge >= 0.02) betFraction = 0.50;
   else betFraction = 0.25;
   
-  // Original proven sizing: max_bet * edge_fraction * regime_multiplier
-  const rawSize = microMaxBet * betFraction * betSizeMultiplier;
+  // Sizing: max_bet * edge_fraction * regime_multiplier * risk_multiplier
+  // riskMultiplier < 1.0 — сниженный размер для слабых сигналов
+  const rawSize = microMaxBet * betFraction * betSizeMultiplier * riskMultiplier;
   const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
   
-  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: edge=${(impliedEdge*100).toFixed(1)}% frac=${betFraction} mult=${betSizeMultiplier.toFixed(1)}x → $${size.toFixed(2)}`, "micro");
+  log(`Micro: ${market.asset.toUpperCase()} ${direction} sizing: edge=${(impliedEdge*100).toFixed(1)}% frac=${betFraction} mult=${betSizeMultiplier.toFixed(1)}x risk=${riskMultiplier.toFixed(2)}x → $${size.toFixed(2)}`, "micro");
 
   // Create all DB records
   const opp = storage.createOpportunity({
@@ -1082,37 +1083,35 @@ async function runMicroCycle(): Promise<void> {
       analyses.push({ asset, market, ...analysis });
     }
 
-    // Execute trades (no diversification — each asset decides independently per spec)
+    // Execute trades — all 4 assets always trade, but with risk-adjusted sizing
     for (const a of analyses) {
-      // === ALTERNATE RISK GATE ===
-      // alternate — стратегия без данных, исторически плохая. Блокируем если:
-      // 1) Нет подтверждения AI (недоступен/не согласен) И нет данных обучения
-      // 2) WR стратегии < 55% при >= 5 сделках
+      let riskMult = 1.0; // полный размер
+
+      // === RISK ADJUSTMENT: снижаем размер для слабых сигналов ===
+
+      // AI не согласен → снижаем
+      if (a.aiVerdict === "disagree") riskMult *= 0.5;
+      // AI недоступен → нет валидации, снижаем
+      if (a.aiVerdict === "unavailable" || a.aiVerdict === "no_json") riskMult *= 0.6;
+
+      // alternate стратегия — дополнительное снижение
       if (a.strategy === "alternate") {
         const altPerf = getStrategyPerf("alternate");
         const altWR = getStrategyRecentWR("alternate");
         const hasLearningData = a.learningWeight !== 1.0;
-        const aiConfirmed = a.aiVerdict === "agree";
-        const hasEnoughHistory = altPerf.trades >= 5;
-        const hasGoodWR = !hasEnoughHistory || altWR >= 0.55;
 
-        // Блок 1: нет ни AI ни данных — слепая ставка, пропуск
-        if (!hasLearningData && !aiConfirmed) {
-          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] нет данных (w=${a.learningWeight.toFixed(2)}) и AI=${a.aiVerdict} — слепая ставка, пропуск`);
-          continue;
-        }
-        // Блок 2: WR < 55% на истории — стратегия показала плохой результат
-        if (!hasGoodWR) {
-          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] WR=${(altWR*100).toFixed(0)}% < 55% (${altPerf.wins}/${altPerf.trades}) — плохая история`);
-          continue;
-        }
-        // Блок 3: AI не согласен и нет сильных весов обучения
-        if (a.aiVerdict === "disagree" && a.learningWeight < 1.3) {
-          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] AI против + слабый вес (w=${a.learningWeight.toFixed(2)}) — пропуск`);
-          continue;
-        }
+        // Нет данных обучения → минимальная ставка
+        if (!hasLearningData) riskMult *= 0.3;
+        // WR < 55% при >= 5 сделках → минимальная ставка
+        if (altPerf.trades >= 5 && altWR < 0.55) riskMult *= 0.3;
+
+        logModelChange("РИСК", `${a.asset.toUpperCase()} [alternate] w=${a.learningWeight.toFixed(2)} ai=${a.aiVerdict} altWR=${(altWR*100).toFixed(0)}% → risk=${riskMult.toFixed(2)}x`);
       }
-      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning);
+
+      // Общий минимум 0.15x, максимум 1.0x
+      riskMult = Math.max(0.15, Math.min(1.0, riskMult));
+
+      executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, riskMult);
     }
 
     lastCycleAt = new Date().toISOString();
