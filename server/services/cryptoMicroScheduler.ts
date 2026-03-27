@@ -667,126 +667,17 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   // Clamp confidence
   confidence = Math.min(0.58, Math.max(0.51, confidence));
 
-  // === AI EVALUATION ===
-  // Методология:
-  // 1. Отправляем AI полный контекст: цены, стратегия, исторические веса, калибровка
-  // 2. AI оценивает наше направление: agree/disagree + confidence_adj
-  // 3. При disagree — запрашиваем оценку противоположного направления
-  // 4. Если AI уверен в обратном (confidence >= 0.55) — переключаем направление
-  let aiVerdict = "";
-  try {
-    const { default: OpenAI } = await import("openai");
-    const userKey = storage.getConfig("openai_api_key") || process.env.OPENAI_API_KEY || "";
-    const client = new OpenAI({
-      apiKey: userKey,
-      baseURL: "https://api.openai.com/v1",
-    });
-
-    const otherDir = direction === "Up" ? "Down" : "Up";
-    const calInfo = cal.totalTrades > 0
-      ? `Historical: ${cal.wins}W/${cal.losses}L (${Math.round(cal.wins/cal.totalTrades*100)}% WR), Up WR=${(cal.upWins+cal.upLosses)>0 ? Math.round(cal.upWins/(cal.upWins+cal.upLosses)*100) : '?'}%, Down WR=${(cal.downWins+cal.downLosses)>0 ? Math.round(cal.downWins/(cal.downWins+cal.downLosses)*100) : '?'}%`
-      : "No historical data";
-
-    const systemMsg = `You are a 5-minute crypto prediction market analyst. You evaluate short-term Up/Down signals for BTC/ETH/SOL/XRP on Polymarket. These are binary markets that resolve in 5 minutes. Prices near 0.50 mean market is uncertain. Reply ONLY with valid JSON.`;
-
-    const prompt = [
-      `Asset: ${asset.toUpperCase()}`,
-      `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
-      `My signal: ${direction} (strategy: ${strategy})`,
-      calInfo,
-      ``,
-      `Evaluate my signal. Reply JSON:`,
-      `{"agree": true/false, "confidence": 0.50-0.65, "reasoning": "brief reason"}`
-    ].join("\n");
-
-    const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemMsg },
-        { role: "user", content: prompt },
-      ],
-      max_tokens: 100,
-      temperature: 0.2,
-    });
-    const text = response.choices?.[0]?.message?.content || "";
-    const jsonMatch = text.match(/\{[\s\S]*?\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      const aiConf = typeof parsed.confidence === "number" ? Math.min(0.65, Math.max(0.45, parsed.confidence)) : 0.52;
-      const aiReason = parsed.reasoning || "";
-
-      if (parsed.agree) {
-        // AI согласен — повышаем confidence
-        confidence = Math.min(0.62, Math.max(confidence, (confidence + aiConf) / 2));
-        aiVerdict = "agree";
-        reasoning += ` [AI✓ ${(aiConf*100).toFixed(0)}%]`;
-      } else {
-        // AI не согласен — оцениваем противоположное направление
-        logModelChange("AI_ОЦЕНКА", `${asset.toUpperCase()} ${direction} — AI против (${(aiConf*100).toFixed(0)}%): ${aiReason}`);
-
-        // Запрос 2: оценка противоположного
-        try {
-          const reversePrompt = [
-            `Asset: ${asset.toUpperCase()}`,
-            `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
-            `Signal to evaluate: ${otherDir}`,
-            calInfo,
-            ``,
-            `How confident are you in ${otherDir}? Reply JSON:`,
-            `{"confident": true/false, "confidence": 0.50-0.65, "reasoning": "brief reason"}`
-          ].join("\n");
-
-          const rev = await client.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-              { role: "system", content: systemMsg },
-              { role: "user", content: reversePrompt },
-            ],
-            max_tokens: 100,
-            temperature: 0.2,
-          });
-          const revText = rev.choices?.[0]?.message?.content || "";
-          const revMatch = revText.match(/\{[\s\S]*?\}/);
-          if (revMatch) {
-            const revParsed = JSON.parse(revMatch[0]);
-            const revConf = typeof revParsed.confidence === "number" ? Math.min(0.65, Math.max(0.45, revParsed.confidence)) : 0.50;
-            const revReason = revParsed.reasoning || "";
-
-            if (revParsed.confident && revConf >= 0.55) {
-              // AI уверен в обратном — переключаем
-              logModelChange("AI_ФЛИП", `${asset.toUpperCase()} ${direction}→${otherDir} AI conf=${(revConf*100).toFixed(0)}%: ${revReason}`);
-              direction = otherDir as "Up" | "Down";
-              confidence = Math.min(0.60, revConf);
-              reasoning += ` [AI→${otherDir} ${(revConf*100).toFixed(0)}%]`;
-              aiVerdict = "flip";
-            } else {
-              // AI не уверен и в обратном — оставляем но снижаем
-              confidence = Math.max(0.51, confidence - 0.02);
-              reasoning += ` [AI✗ ${(aiConf*100).toFixed(0)}%, rev=${(revConf*100).toFixed(0)}%]`;
-              aiVerdict = "disagree";
-            }
-          } else {
-            confidence = Math.max(0.51, confidence - 0.02);
-            reasoning += " [AI✗]";
-            aiVerdict = "disagree";
-          }
-        } catch {
-          // Второй запрос упал — просто disagree
-          confidence = Math.max(0.51, confidence - 0.02);
-          reasoning += " [AI✗]";
-          aiVerdict = "disagree";
-        }
-      }
-    } else {
-      aiVerdict = "no_json";
-    }
-  } catch (err: any) {
-    aiVerdict = "unavailable";
-    log(`AI validation error: ${err?.message?.substring(0, 100)}`, "micro");
-  }
+  // === AI ОТКЛЮЧЕН ===
+  // Анализ показал: AI ухудшает результаты на 5-мин рынках:
+  // - AI Flip: 46% WR, -$18
+  // - AI Agree: 33% WR, -$10  
+  // - AI Disagree: 25% WR, -$60
+  // - Без AI: 42% WR (baseline паритета ~50%)
+  // Причина: LLM не имеет информации о движении цены в следующие 5 минут
+  const aiVerdict = "off";
 
   // Log the decision
-  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% ai=${aiVerdict} | ${reasoning}`);
+  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% | ${reasoning}`);
 
   return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: 1.0 };
 }
@@ -1051,39 +942,9 @@ async function runMicroCycle(): Promise<void> {
       analyses.push({ asset, market, ...analysis });
     }
 
-    // Execute trades — all 4 assets always trade, but with risk-adjusted sizing
+    // Execute trades — all 4 assets, размер зависит от риска актива
     for (const a of analyses) {
-      let riskMult = 1.0;
-
-      // === RISK ADJUSTMENT ===
-
-      // Риск актива (последние 5 сделок)
-      riskMult *= getAssetRiskMultiplier(a.asset);
-
-      // AI не согласен (но не флипнул) → снижаем
-      if (a.aiVerdict === "disagree") riskMult *= 0.5;
-      // AI недоступен → нет валидации, снижаем
-      if (a.aiVerdict === "unavailable" || a.aiVerdict === "no_json") riskMult *= 0.6;
-      // AI флипнул направление → умеренный размер (новая гипотеза)
-      if (a.aiVerdict === "flip") riskMult *= 0.7;
-
-      // alternate стратегия — дополнительное снижение
-      if (a.strategy === "alternate") {
-        const altPerf = getStrategyPerf("alternate");
-        const altWR = getStrategyRecentWR("alternate");
-        const hasLearningData = a.learningWeight !== 1.0;
-
-        // Нет данных обучения → минимальная ставка
-        if (!hasLearningData) riskMult *= 0.3;
-        // WR < 55% при >= 5 сделках → минимальная ставка
-        if (altPerf.trades >= 5 && altWR < 0.55) riskMult *= 0.3;
-
-        logModelChange("РИСК", `${a.asset.toUpperCase()} [alternate] w=${a.learningWeight.toFixed(2)} ai=${a.aiVerdict} altWR=${(altWR*100).toFixed(0)}% → risk=${riskMult.toFixed(2)}x`);
-      }
-
-      // Общий минимум 0.15x, максимум 1.0x
-      riskMult = Math.max(0.15, Math.min(1.0, riskMult));
-
+      const riskMult = Math.max(0.3, getAssetRiskMultiplier(a.asset));
       executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning, riskMult);
     }
 
