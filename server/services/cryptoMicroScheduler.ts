@@ -631,6 +631,8 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   confidence: number;
   reasoning: string;
   strategy: string;
+  aiVerdict: string;
+  learningWeight: number;
 }> {
   const cal = getCalibration(asset);
   const currentHour = new Date().getUTCHours();
@@ -785,7 +787,7 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   // Log the decision
   logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% w=${chosenWeight.toFixed(2)} ai=${aiVerdict} | ${reasoning}`);
 
-  return { direction, confidence, reasoning, strategy };
+  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: chosenWeight };
 }
 
 // --- Execute micro-trade ---
@@ -1046,7 +1048,7 @@ async function runMicroCycle(): Promise<void> {
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
 
     // Collect all analyses first, then diversify
-    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string }> = [];
+    const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string; aiVerdict: string; learningWeight: number }> = [];
 
     for (const asset of enabledAssets) {
       if (shouldSkipAsset(asset)) {
@@ -1070,6 +1072,34 @@ async function runMicroCycle(): Promise<void> {
 
     // Execute trades (no diversification — each asset decides independently per spec)
     for (const a of analyses) {
+      // === ALTERNATE RISK GATE ===
+      // alternate — стратегия без данных, исторически плохая. Блокируем если:
+      // 1) Нет подтверждения AI (недоступен/не согласен) И нет данных обучения
+      // 2) WR стратегии < 55% при >= 5 сделках
+      if (a.strategy === "alternate") {
+        const altPerf = getStrategyPerf("alternate");
+        const altWR = getStrategyRecentWR("alternate");
+        const hasLearningData = a.learningWeight !== 1.0;
+        const aiConfirmed = a.aiVerdict === "agree";
+        const hasEnoughHistory = altPerf.trades >= 5;
+        const hasGoodWR = !hasEnoughHistory || altWR >= 0.55;
+
+        // Блок 1: нет ни AI ни данных — слепая ставка, пропуск
+        if (!hasLearningData && !aiConfirmed) {
+          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] нет данных (w=${a.learningWeight.toFixed(2)}) и AI=${a.aiVerdict} — слепая ставка, пропуск`);
+          continue;
+        }
+        // Блок 2: WR < 55% на истории — стратегия показала плохой результат
+        if (!hasGoodWR) {
+          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] WR=${(altWR*100).toFixed(0)}% < 55% (${altPerf.wins}/${altPerf.trades}) — плохая история`);
+          continue;
+        }
+        // Блок 3: AI не согласен и нет сильных весов обучения
+        if (a.aiVerdict === "disagree" && a.learningWeight < 1.3) {
+          logModelChange("БЛОК", `${a.asset.toUpperCase()} [alternate] AI против + слабый вес (w=${a.learningWeight.toFixed(2)}) — пропуск`);
+          continue;
+        }
+      }
       executeMicroTrade(a.market, a.direction, a.confidence, a.reasoning);
     }
 
