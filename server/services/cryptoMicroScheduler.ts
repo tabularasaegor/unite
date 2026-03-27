@@ -19,6 +19,36 @@ const GAMMA_API = "https://gamma-api.polymarket.com";
 function isMicroTrade(title: string | null | undefined): boolean {
   return !!title && (title.startsWith("[5m]") || title.startsWith("[5m-"));
 }
+
+// Rolling base rate from last N resolutions (replaces hardcoded 0.56)
+// Returns probability of Up resolution based on recent data
+let cachedRollingBaseRate = 0.50;
+let baseRateLastCalc = 0;
+
+export function getRollingBaseRate(): number {
+  // Cache for 60s
+  if (Date.now() - baseRateLastCalc < 60000) return cachedRollingBaseRate;
+  baseRateLastCalc = Date.now();
+  
+  try {
+    const allPos = storage.getActivePositions("closed");
+    const micro = allPos.filter(p => isMicroTrade(p.title));
+    // Use last 40 trades for rolling window
+    const recent = micro.slice(-40);
+    if (recent.length < 10) { cachedRollingBaseRate = 0.50; return 0.50; }
+    
+    let upResolved = 0;
+    for (const r of recent) {
+      // Determine if resolved Up: YES won OR NO lost
+      const won = (r.unrealizedPnl || 0) > 0;
+      if ((r.side === "YES" && won) || (r.side === "NO" && !won)) upResolved++;
+    }
+    cachedRollingBaseRate = Math.max(0.30, Math.min(0.70, upResolved / recent.length));
+  } catch {
+    cachedRollingBaseRate = 0.50;
+  }
+  return cachedRollingBaseRate;
+}
 const ALL_ASSETS = ["btc", "eth", "sol", "xrp"] as const;
 type CryptoAsset = string;
 
@@ -658,7 +688,7 @@ async function engineArena(asset: string, market: MicroMarket): Promise<EngineRe
   };
 }
 
-// === ENGINE B: Bayesian Edge Model (from commit 5aee0a1) ===
+// === ENGINE B: Bayesian Edge Model (adaptive base rate) ===
 function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   const cal = getCalibration(asset);
   const upPrice = market.upPrice;
@@ -666,42 +696,51 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   const deviation = Math.abs(upPrice - 0.5);
   const reasons: string[] = [];
 
-  const BASE_RATE_UP = 0.56;
+  // ROLLING base rate instead of hardcoded 0.56
+  const BASE_RATE_UP = getRollingBaseRate();
   let trueProb = BASE_RATE_UP;
   let totalWeight = 1.0;
+  reasons.push(`base=${(BASE_RATE_UP*100).toFixed(0)}%`);
 
-  // Market microstructure signal
+  // Market microstructure signal — FOLLOW market direction
+  // When market says Up (>0.51), give Up signal
+  // When market says Down (<0.49), give DOWN signal (not Up!)
   if (upPrice > 0.51) {
-    trueProb = (trueProb * totalWeight + 0.62 * 1.5) / (totalWeight + 1.5);
-    totalWeight += 1.5;
-    reasons.push(`Рынок:Up${(upPrice*100).toFixed(0)}%`);
+    const marketConf = Math.min(0.65, 0.50 + deviation * 2);
+    trueProb = (trueProb * totalWeight + marketConf * 2.0) / (totalWeight + 2.0);
+    totalWeight += 2.0;
+    reasons.push(`Рынок:↑${(upPrice*100).toFixed(0)}%`);
   } else if (upPrice < 0.49) {
-    trueProb = (trueProb * totalWeight + 0.52 * 0.8) / (totalWeight + 0.8);
-    totalWeight += 0.8;
-    reasons.push(`Рынок:Down${(downPrice*100).toFixed(0)}%`);
+    // Market says DOWN — follow it!
+    const marketConf = Math.max(0.35, 0.50 - deviation * 2);
+    trueProb = (trueProb * totalWeight + marketConf * 2.0) / (totalWeight + 2.0);
+    totalWeight += 2.0;
+    reasons.push(`Рынок:↓${(downPrice*100).toFixed(0)}%`);
   }
 
-  // Per-asset calibration
+  // Per-asset calibration (Bayesian smoothing towards rolling base)
   if (cal.totalTrades >= 10) {
     const assetUpRate = (cal.upWins + cal.upLosses) > 0 ? cal.upWins / (cal.upWins + cal.upLosses) : BASE_RATE_UP;
-    const smoothed = (assetUpRate * cal.totalTrades + BASE_RATE_UP * 20) / (cal.totalTrades + 20);
+    const smoothed = (assetUpRate * Math.min(cal.totalTrades, 30) + BASE_RATE_UP * 20) / (Math.min(cal.totalTrades, 30) + 20);
     trueProb = (trueProb * totalWeight + smoothed * 1.0) / (totalWeight + 1.0);
     totalWeight += 1.0;
     reasons.push(`${asset.toUpperCase()}:${(smoothed*100).toFixed(0)}%`);
   }
 
-  // Momentum
+  // Regime momentum — last 5 resolutions
   const recentResults = cal.lastResults.slice(-5);
   if (recentResults.length >= 3) {
     const recentUpRate = (recentResults.filter(r => r.direction === "Up" && r.won).length
       + recentResults.filter(r => r.direction === "Down" && !r.won).length) / recentResults.length;
-    trueProb = (trueProb * totalWeight + recentUpRate * 0.5) / (totalWeight + 0.5);
-    totalWeight += 0.5;
+    // STRONG weight — recent regime is most important signal
+    trueProb = (trueProb * totalWeight + recentUpRate * 1.5) / (totalWeight + 1.5);
+    totalWeight += 1.5;
+    reasons.push(`режим:${(recentUpRate*100).toFixed(0)}%`);
   }
 
   // Uncertainty penalty
   if (market.liquidity < 2000) trueProb = trueProb * 0.7 + 0.5 * 0.3;
-  trueProb = Math.max(0.35, Math.min(0.65, trueProb));
+  trueProb = Math.max(0.30, Math.min(0.70, trueProb));
 
   // Edge
   const edgeUp = trueProb - upPrice;
@@ -719,7 +758,7 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   // Kelly
   const price = direction === "Up" ? upPrice : downPrice;
   const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
-  const kellyFraction = kellyFull * 0.25;
+  const kellyFraction = kellyFull * 0.50; // Half Kelly — more aggressive to use $40 max bet limit
   const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
   const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
@@ -741,13 +780,13 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   const price = direction === "Up" ? market.upPrice : market.downPrice;
   
   // Kelly-based sizing: bankroll × kelly_fraction × asset_risk
-  // riskMultiplier = kelly fraction from analyzeWithCalibration
-  // Cap at $15 max (proven optimal range $5-$15)
+  // riskMultiplier = kelly fraction from model
+  // Cap at microMaxBet (user-configured, default $40)
   const kellySize = microBankroll * riskMultiplier;
   const asset = market.asset;
   const assetRisk = getAssetRiskMultiplier(asset);
   const rawSize = kellySize * assetRisk;
-  const size = Math.max(3, Math.min(rawSize, 15, microMaxBet, microBankroll * 0.08));
+  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
   
   log(`Micro: ${asset} ${direction} kelly=${(riskMultiplier*100).toFixed(1)}% assetRisk=${assetRisk.toFixed(2)} → $${size.toFixed(2)}`, "micro");
 

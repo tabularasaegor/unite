@@ -23,6 +23,7 @@
 
 import { log } from "../index";
 import { storage } from "../storage";
+import { getRollingBaseRate } from "./cryptoMicroScheduler";
 
 // ============================================================
 // PRICE DATA FETCHING
@@ -212,32 +213,26 @@ function modelTAMeanReversion(candles: Candle[], upPrice: number): ModelPredicti
 // Historical: price > 0.50 → Up resolves 62%
 function modelOrderbookImbalance(candles: Candle[], upPrice: number): ModelPrediction {
   const deviation = upPrice - 0.5;
+  const baseRate = getRollingBaseRate();
   const reasons: string[] = [];
   let direction: "Up" | "Down";
   let confidence: number;
 
   if (Math.abs(deviation) < 0.02) {
-    // Neutral zone — use base rate (Up 56%)
-    direction = "Up";
-    confidence = 0.56;
-    reasons.push(`цена~50%→base_rate_up_56%`);
+    // Neutral zone — use rolling base rate
+    direction = baseRate >= 0.50 ? "Up" : "Down";
+    confidence = Math.max(0.51, baseRate);
+    reasons.push(`нейтральный→base=${(baseRate*100).toFixed(0)}%`);
   } else if (deviation > 0) {
-    // Market says Up — historically 62% correct
+    // Market says Up — FOLLOW
     direction = "Up";
-    confidence = 0.55 + Math.min(deviation * 2, 0.15);
-    reasons.push(`стакан:Up${(upPrice*100).toFixed(0)}%→follow`);
+    confidence = 0.52 + Math.min(deviation * 2, 0.15);
+    reasons.push(`стакан:↑${(upPrice*100).toFixed(0)}%`);
   } else {
-    // Market says Down — but only 48% historically (weak signal)
-    // Contrarian for small deviations, follow for large
-    if (Math.abs(deviation) < 0.05) {
-      direction = "Up"; // contrarian — small down signal, bet Up (base rate favors Up)
-      confidence = 0.54;
-      reasons.push(`стакан:Down${((1-upPrice)*100).toFixed(0)}%→contra↑`);
-    } else {
-      direction = "Down";
-      confidence = 0.52 + Math.min(Math.abs(deviation), 0.10);
-      reasons.push(`стакан:Down${((1-upPrice)*100).toFixed(0)}%→follow↓`);
-    }
+    // Market says Down — FOLLOW (not contrarian!)
+    direction = "Down";
+    confidence = 0.52 + Math.min(Math.abs(deviation) * 2, 0.15);
+    reasons.push(`стакан:↓${((1-upPrice)*100).toFixed(0)}%`);
   }
 
   return {
@@ -251,28 +246,30 @@ function modelOrderbookImbalance(candles: Candle[], upPrice: number): ModelPredi
 // --- Model 4: BAYESIAN BASE ---
 // Pure Bayesian update from base rate + market signal + asset calibration
 function modelBayesianBase(candles: Candle[], upPrice: number, assetCalibration: { upWR: number; totalTrades: number }): ModelPrediction {
-  const BASE_RATE = 0.56;
+  const BASE_RATE = getRollingBaseRate();
   let prob = BASE_RATE;
   let weight = 1.0;
-  const reasons: string[] = [];
+  const reasons: string[] = [`base=${(BASE_RATE*100).toFixed(0)}%`];
 
-  // Market signal
+  // Market signal — follow market direction
   if (upPrice > 0.51) {
-    prob = (prob * weight + 0.62 * 1.5) / (weight + 1.5);
-    weight += 1.5;
-    reasons.push(`market→Up(62%)`);
+    const mktConf = Math.min(0.65, 0.50 + Math.abs(upPrice - 0.5) * 2);
+    prob = (prob * weight + mktConf * 2.0) / (weight + 2.0);
+    weight += 2.0;
+    reasons.push(`market↑${(upPrice*100).toFixed(0)}%`);
   } else if (upPrice < 0.49) {
-    prob = (prob * weight + 0.52 * 0.8) / (weight + 0.8);
-    weight += 0.8;
-    reasons.push(`market→Down(48%)`);
+    const mktConf = Math.max(0.35, 0.50 - Math.abs(upPrice - 0.5) * 2);
+    prob = (prob * weight + mktConf * 2.0) / (weight + 2.0);
+    weight += 2.0;
+    reasons.push(`market↓${((1-upPrice)*100).toFixed(0)}%`);
   }
 
   // Asset calibration
   if (assetCalibration.totalTrades >= 10) {
-    const smoothed = (assetCalibration.upWR * assetCalibration.totalTrades + BASE_RATE * 20) / (assetCalibration.totalTrades + 20);
+    const smoothed = (assetCalibration.upWR * Math.min(assetCalibration.totalTrades, 30) + BASE_RATE * 20) / (Math.min(assetCalibration.totalTrades, 30) + 20);
     prob = (prob * weight + smoothed * 1.0) / (weight + 1.0);
     weight += 1.0;
-    reasons.push(`cal=${(assetCalibration.upWR*100).toFixed(0)}%→${(smoothed*100).toFixed(0)}%`);
+    reasons.push(`cal=${(smoothed*100).toFixed(0)}%`);
   }
 
   prob = Math.max(0.35, Math.min(0.65, prob));
@@ -461,7 +458,7 @@ export async function runModelArena(
   const price = direction === "Up" ? upPrice : (1 - upPrice);
   const odds = 1 / price;
   const kellyFull = edge > 0 ? edge / (odds - 1) : 0;
-  const kellyFraction = kellyFull * 0.25;
+  const kellyFraction = kellyFull * 0.50; // Half Kelly to use more of $40 max bet
   
   // Trade blocking
   let blocked = false;
