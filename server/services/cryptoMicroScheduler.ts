@@ -757,31 +757,43 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   confidence = Math.min(0.62, Math.max(0.51, confidence));
 
   // === AI VALIDATION ONLY (never chooses direction) ===
+  // Uses user's own OpenAI key directly (not proxy) for reliability
   let aiVerdict = "";
   try {
     const { default: OpenAI } = await import("openai");
-    const client = new OpenAI();
+    const userKey = storage.getConfig("openai_api_key") || process.env.OPENAI_API_KEY || "";
+    const client = new OpenAI({
+      apiKey: userKey,
+      baseURL: "https://api.openai.com/v1",
+    });
 
     const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%. My signal: ${direction} (${strategy}). Learning weight: ${chosenWeight.toFixed(2)}. Agree/disagree? Reply JSON: {"agree":true/false,"confidence_adj":-0.02 to +0.03}`;
 
-    const response = await client.responses.create({ model: "gpt5_mini", input: prompt });
-    const text = response.output_text || "";
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 60,
+      temperature: 0.3,
+    });
+    const text = response.choices?.[0]?.message?.content || "";
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      if (parsed.confidence_adj) {
-        confidence = Math.min(0.62, Math.max(0.51, confidence + parsed.confidence_adj));
-        if (!parsed.agree) {
-          reasoning += " [AI✗]";
-          confidence = Math.max(0.51, confidence - 0.02);
-          aiVerdict = "disagree";
-        } else {
-          aiVerdict = "agree";
-        }
+      const adj = typeof parsed.confidence_adj === "number" ? parsed.confidence_adj : 0;
+      confidence = Math.min(0.62, Math.max(0.51, confidence + adj));
+      if (!parsed.agree) {
+        reasoning += " [AI✗]";
+        confidence = Math.max(0.51, confidence - 0.02);
+        aiVerdict = "disagree";
+      } else {
+        aiVerdict = "agree";
       }
+    } else {
+      aiVerdict = "no_json";
     }
-  } catch {
+  } catch (err: any) {
     aiVerdict = "unavailable";
+    log(`AI validation error: ${err?.message?.substring(0, 100)}`, "micro");
   }
 
   // Log the decision
