@@ -42,7 +42,7 @@ export function getRollingBaseRate(): number {
     }
     const rate = upResolved / recent.length;
     log(`Rolling base rate: ${upResolved}/${recent.length} = ${(rate*100).toFixed(0)}% Up`, "micro");
-    return Math.max(0.30, Math.min(0.70, rate));
+    return Math.max(0.15, Math.min(0.85, rate));
   } catch {
     return 0.50;
   }
@@ -737,7 +737,7 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
 
   // Uncertainty penalty
   if (market.liquidity < 2000) trueProb = trueProb * 0.7 + 0.5 * 0.3;
-  trueProb = Math.max(0.30, Math.min(0.70, trueProb));
+  trueProb = Math.max(0.15, Math.min(0.85, trueProb));
 
   // Edge
   const edgeUp = trueProb - upPrice;
@@ -754,7 +754,7 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   // Kelly
   const price = direction === "Up" ? upPrice : downPrice;
   const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
-  const kellyFraction = kellyFull * 0.50; // Half Kelly — more aggressive to use $40 max bet limit
+  const kellyFraction = kellyFull * 0.30; // Conservative Kelly — limit downside risk
   const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
   const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
@@ -776,13 +776,13 @@ function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confid
   const price = direction === "Up" ? market.upPrice : market.downPrice;
   
   // Kelly-based sizing: bankroll × kelly_fraction × asset_risk
-  // riskMultiplier = kelly fraction from model
-  // Cap at microMaxBet (user-configured, default $40)
+  // Hard cap at $20 per trade to limit downside
   const kellySize = microBankroll * riskMultiplier;
   const asset = market.asset;
   const assetRisk = getAssetRiskMultiplier(asset);
   const rawSize = kellySize * assetRisk;
-  const size = Math.max(3, Math.min(rawSize, microMaxBet, microBankroll * 0.15));
+  const maxPerTrade = Math.min(20, microMaxBet); // $20 hard cap
+  const size = Math.max(3, Math.min(rawSize, maxPerTrade, microBankroll * 0.08));
   
   log(`Micro: ${asset} ${direction} kelly=${(riskMultiplier*100).toFixed(1)}% assetRisk=${assetRisk.toFixed(2)} → $${size.toFixed(2)}`, "micro");
 
@@ -1007,7 +1007,7 @@ async function runMicroCycle(): Promise<void> {
 
     // Get enabled assets, timeframes, and engines
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
-    const enabledTimeframes = (storage.getConfig("micro_timeframes") || "5m,15m,1h").split(",").map(s => s.trim());
+    const enabledTimeframes = ["5m"]; // Focus on 5m only
     const engines: Record<string, boolean> = {
       A: storage.getConfig("engine_a_enabled") !== "false",
       B: storage.getConfig("engine_b_enabled") !== "false",

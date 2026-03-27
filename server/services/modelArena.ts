@@ -461,7 +461,7 @@ export async function runModelArena(
   const price = direction === "Up" ? upPrice : (1 - upPrice);
   const odds = 1 / price;
   const kellyFull = edge > 0 ? edge / (odds - 1) : 0;
-  const kellyFraction = kellyFull * 0.50; // Half Kelly to use more of $40 max bet
+  const kellyFraction = kellyFull * 0.30; // Conservative Kelly
   
   // Trade blocking
   let blocked = false;

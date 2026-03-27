@@ -101,10 +101,7 @@ function SchedulerBar() {
 
 export default function MicroEngines() {
   const [engineTab, setEngineTab] = useState("all");
-  const [tfTab, setTfTab] = useState("");
-
   const currentEngine = engineTab === "all" ? undefined : engineTab;
-  const currentTf = tfTab || undefined;
 
   return (
     <div className="flex-1 overflow-auto">
@@ -123,22 +120,14 @@ export default function MicroEngines() {
             <TabsTrigger value="D" className="text-xs">ARIMA</TabsTrigger>
           </TabsList>
         </Tabs>
-        {/* Row 2: Timeframe filter */}
-        <Tabs value={tfTab} onValueChange={setTfTab}>
-          <TabsList className="grid w-full max-w-xs grid-cols-4">
-            <TabsTrigger value="" className="text-xs">Все TF</TabsTrigger>
-            <TabsTrigger value="5m" className="text-xs">5 мин</TabsTrigger>
-            <TabsTrigger value="15m" className="text-xs">15 мин</TabsTrigger>
-            <TabsTrigger value="1h" className="text-xs">1 час</TabsTrigger>
-          </TabsList>
-        </Tabs>
+        {/* Timeframe: 5m only */}
       </div>
 
       {/* Scheduler + engine toggles */}
       <SchedulerBar />
 
       {/* Dashboard filtered by selected engine + timeframe */}
-      <MicroDashboard engine={currentEngine} timeframe={currentTf} />
+      <MicroDashboard engine={currentEngine} />
     </div>
   );
 }
