@@ -177,22 +177,17 @@ function recordWindowResult(wins: number, losses: number, pnl: number) {
   }
 }
 
-function shouldSkipAsset(asset: string): boolean {
-  const cooldownUntil = assetCooldown[asset] || 0;
-  if (Date.now() < cooldownUntil) return true;
-  
+// Returns risk multiplier for asset based on recent performance (no blocking)
+function getAssetRiskMultiplier(asset: string): number {
   const cal = getCalibration(asset);
-  // Spec: WR<30% over last 5 trades → 10min cooldown
   const recent = cal.lastResults.slice(-5);
-  if (recent.length >= 5) {
-    const recentWR = recent.filter(r => r.won).length / recent.length;
-    if (recentWR < 0.30) {
-      assetCooldown[asset] = Date.now() + 600000; // 10 min cooldown
-      logModelChange("ASSET_COOLDOWN", `${asset.toUpperCase()} WR=${(recentWR*100).toFixed(0)}% last 5 → skip 10min`);
-      return true;
-    }
-  }
-  return false;
+  if (recent.length < 5) return 1.0;
+  const recentWR = recent.filter(r => r.won).length / recent.length;
+  // WR < 30% → минимальная ставка, WR 30-50% → сниженная, WR > 50% → полная
+  if (recentWR < 0.20) return 0.2;
+  if (recentWR < 0.40) return 0.4;
+  if (recentWR < 0.50) return 0.6;
+  return 1.0;
 }
 
 export function getModelLog() {
@@ -382,10 +377,10 @@ function auditCalibrationOnStartup(): void {
     const recentStr = recent5.map(r => r.won ? "✓" : "✗").join("");
     assetReports.push(`${asset.toUpperCase()}: ${cal.wins}W/${cal.losses}L (${wr.toFixed(0)}%) last5=[${recentStr}] (${(recent5WR*100).toFixed(0)}%)`);
 
-    // Spec: WR<30% over last 5 → 10min cooldown
+    // Log low WR warning (no cooldown — trades continue with reduced size)
     if (recent5.length >= 5 && recent5WR < 0.30) {
-      assetCooldown[asset] = Date.now() + 600000;
-      logModelChange("STARTUP_COOLDOWN", `${asset.toUpperCase()} WR=${(recent5WR*100).toFixed(0)}% last 5 → 10min cooldown`);
+      const riskMult = getAssetRiskMultiplier(asset);
+      logModelChange("РИСК_АКТИВ", `${asset.toUpperCase()} WR=${(recent5WR*100).toFixed(0)}% last 5 → risk=${riskMult}x (сниженный размер)`);
     }
 
     // Count trailing losses for regime calculation
@@ -756,8 +751,12 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
   // Clamp confidence
   confidence = Math.min(0.62, Math.max(0.51, confidence));
 
-  // === AI VALIDATION ONLY (never chooses direction) ===
-  // Uses user's own OpenAI key directly (not proxy) for reliability
+  // === AI EVALUATION ===
+  // Методология:
+  // 1. Отправляем AI полный контекст: цены, стратегия, исторические веса, калибровка
+  // 2. AI оценивает наше направление: agree/disagree + confidence_adj
+  // 3. При disagree — запрашиваем оценку противоположного направления
+  // 4. Если AI уверен в обратном (confidence >= 0.55) — переключаем направление
   let aiVerdict = "";
   try {
     const { default: OpenAI } = await import("openai");
@@ -767,26 +766,104 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
       baseURL: "https://api.openai.com/v1",
     });
 
-    const prompt = `5-min ${asset.toUpperCase()} market. Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%. My signal: ${direction} (${strategy}). Learning weight: ${chosenWeight.toFixed(2)}. Agree/disagree? Reply JSON: {"agree":true/false,"confidence_adj":-0.02 to +0.03}`;
+    // Контекст для AI: цены, стратегия, калибровка, веса
+    const otherDir = direction === "Up" ? "Down" : "Up";
+    const otherWeight = direction === "Up" ? downWeight : upWeight;
+    const calInfo = cal.totalTrades > 0
+      ? `Historical: ${cal.wins}W/${cal.losses}L (${Math.round(cal.wins/cal.totalTrades*100)}% WR), Up WR=${(cal.upWins+cal.upLosses)>0 ? Math.round(cal.upWins/(cal.upWins+cal.upLosses)*100) : '?'}%, Down WR=${(cal.downWins+cal.downLosses)>0 ? Math.round(cal.downWins/(cal.downWins+cal.downLosses)*100) : '?'}%`
+      : "No historical data";
+
+    const systemMsg = `You are a 5-minute crypto prediction market analyst. You evaluate short-term Up/Down signals for BTC/ETH/SOL/XRP on Polymarket. These are binary markets that resolve in 5 minutes. Prices near 0.50 mean market is uncertain. Reply ONLY with valid JSON.`;
+
+    const prompt = [
+      `Asset: ${asset.toUpperCase()}`,
+      `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
+      `My signal: ${direction} (strategy: ${strategy})`,
+      `Learning weights: ${direction}=${chosenWeight.toFixed(2)}, ${otherDir}=${otherWeight.toFixed(2)}`,
+      calInfo,
+      ``,
+      `Evaluate my signal. Reply JSON:`,
+      `{"agree": true/false, "confidence": 0.50-0.65, "reasoning": "brief reason"}`
+    ].join("\n");
 
     const response = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 60,
-      temperature: 0.3,
+      messages: [
+        { role: "system", content: systemMsg },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 100,
+      temperature: 0.2,
     });
     const text = response.choices?.[0]?.message?.content || "";
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const jsonMatch = text.match(/\{[\s\S]*?\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      const adj = typeof parsed.confidence_adj === "number" ? parsed.confidence_adj : 0;
-      confidence = Math.min(0.62, Math.max(0.51, confidence + adj));
-      if (!parsed.agree) {
-        reasoning += " [AI✗]";
-        confidence = Math.max(0.51, confidence - 0.02);
-        aiVerdict = "disagree";
-      } else {
+      const aiConf = typeof parsed.confidence === "number" ? Math.min(0.65, Math.max(0.45, parsed.confidence)) : 0.52;
+      const aiReason = parsed.reasoning || "";
+
+      if (parsed.agree) {
+        // AI согласен — повышаем confidence
+        confidence = Math.min(0.62, Math.max(confidence, (confidence + aiConf) / 2));
         aiVerdict = "agree";
+        reasoning += ` [AI✓ ${(aiConf*100).toFixed(0)}%]`;
+      } else {
+        // AI не согласен — оцениваем противоположное направление
+        logModelChange("AI_ОЦЕНКА", `${asset.toUpperCase()} ${direction} — AI против (${(aiConf*100).toFixed(0)}%): ${aiReason}`);
+
+        // Запрос 2: оценка противоположного
+        try {
+          const reversePrompt = [
+            `Asset: ${asset.toUpperCase()}`,
+            `Market prices: Up=${(upPrice*100).toFixed(1)}%, Down=${((1-upPrice)*100).toFixed(1)}%`,
+            `Signal to evaluate: ${otherDir}`,
+            `Learning weight for ${otherDir}: ${otherWeight.toFixed(2)}`,
+            calInfo,
+            ``,
+            `How confident are you in ${otherDir}? Reply JSON:`,
+            `{"confident": true/false, "confidence": 0.50-0.65, "reasoning": "brief reason"}`
+          ].join("\n");
+
+          const rev = await client.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+              { role: "system", content: systemMsg },
+              { role: "user", content: reversePrompt },
+            ],
+            max_tokens: 100,
+            temperature: 0.2,
+          });
+          const revText = rev.choices?.[0]?.message?.content || "";
+          const revMatch = revText.match(/\{[\s\S]*?\}/);
+          if (revMatch) {
+            const revParsed = JSON.parse(revMatch[0]);
+            const revConf = typeof revParsed.confidence === "number" ? Math.min(0.65, Math.max(0.45, revParsed.confidence)) : 0.50;
+            const revReason = revParsed.reasoning || "";
+
+            if (revParsed.confident && revConf >= 0.55) {
+              // AI уверен в обратном — переключаем
+              logModelChange("AI_ФЛИП", `${asset.toUpperCase()} ${direction}→${otherDir} AI conf=${(revConf*100).toFixed(0)}%: ${revReason}`);
+              direction = otherDir as "Up" | "Down";
+              confidence = Math.min(0.60, revConf);
+              reasoning += ` [AI→${otherDir} ${(revConf*100).toFixed(0)}%]`;
+              aiVerdict = "flip";
+            } else {
+              // AI не уверен и в обратном — оставляем но снижаем
+              confidence = Math.max(0.51, confidence - 0.02);
+              reasoning += ` [AI✗ ${(aiConf*100).toFixed(0)}%, rev=${(revConf*100).toFixed(0)}%]`;
+              aiVerdict = "disagree";
+            }
+          } else {
+            confidence = Math.max(0.51, confidence - 0.02);
+            reasoning += " [AI✗]";
+            aiVerdict = "disagree";
+          }
+        } catch {
+          // Второй запрос упал — просто disagree
+          confidence = Math.max(0.51, confidence - 0.02);
+          reasoning += " [AI✗]";
+          aiVerdict = "disagree";
+        }
       }
     } else {
       aiVerdict = "no_json";
@@ -796,10 +873,13 @@ async function analyzeWithCalibration(asset: string, market: MicroMarket): Promi
     log(`AI validation error: ${err?.message?.substring(0, 100)}`, "micro");
   }
 
-  // Log the decision
-  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% w=${chosenWeight.toFixed(2)} ai=${aiVerdict} | ${reasoning}`);
+  // Recalculate weight after potential AI flip
+  const finalWeight = direction === "Up" ? upWeight : downWeight;
 
-  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: chosenWeight };
+  // Log the decision
+  logModelChange("РЕШЕНИЕ", `${asset.toUpperCase()} ${direction} [${strategy}] conf=${(confidence*100).toFixed(0)}% w=${finalWeight.toFixed(2)} ai=${aiVerdict} | ${reasoning}`);
+
+  return { direction, confidence, reasoning, strategy, aiVerdict, learningWeight: finalWeight };
 }
 
 // --- Execute micro-trade ---
@@ -1064,11 +1144,6 @@ async function runMicroCycle(): Promise<void> {
     const analyses: Array<{ asset: string; market: MicroMarket; direction: "Up" | "Down"; confidence: number; reasoning: string; strategy: string; aiVerdict: string; learningWeight: number }> = [];
 
     for (const asset of enabledAssets) {
-      if (shouldSkipAsset(asset)) {
-        log(`Micro: ${asset.toUpperCase()} on cooldown, skipping`, "micro");
-        continue;
-      }
-
       const market = await fetchMicroMarket(asset);
       if (!market) continue;
 
@@ -1085,14 +1160,19 @@ async function runMicroCycle(): Promise<void> {
 
     // Execute trades — all 4 assets always trade, but with risk-adjusted sizing
     for (const a of analyses) {
-      let riskMult = 1.0; // полный размер
+      let riskMult = 1.0;
 
-      // === RISK ADJUSTMENT: снижаем размер для слабых сигналов ===
+      // === RISK ADJUSTMENT ===
 
-      // AI не согласен → снижаем
+      // Риск актива (последние 5 сделок)
+      riskMult *= getAssetRiskMultiplier(a.asset);
+
+      // AI не согласен (но не флипнул) → снижаем
       if (a.aiVerdict === "disagree") riskMult *= 0.5;
       // AI недоступен → нет валидации, снижаем
       if (a.aiVerdict === "unavailable" || a.aiVerdict === "no_json") riskMult *= 0.6;
+      // AI флипнул направление → умеренный размер (новая гипотеза)
+      if (a.aiVerdict === "flip") riskMult *= 0.7;
 
       // alternate стратегия — дополнительное снижение
       if (a.strategy === "alternate") {
@@ -1161,10 +1241,10 @@ export function getMicroStatus() {
     }
   }
 
-  // Cooldown status per asset
-  const cooldowns: Record<string, boolean> = {};
+  // Asset risk multipliers (replaces cooldowns)
+  const assetRisk: Record<string, number> = {};
   for (const asset of enabledAssets) {
-    cooldowns[asset.toLowerCase()] = shouldSkipAsset(asset.toLowerCase());
+    assetRisk[asset.toLowerCase()] = getAssetRiskMultiplier(asset.toLowerCase());
   }
 
   return {
@@ -1181,7 +1261,7 @@ export function getMicroStatus() {
       betSizeMultiplier: Math.round(betSizeMultiplier * 100) / 100,
       consecutiveLossWindows,
       lastWindowPnl: Math.round(lastWindowPnl * 100) / 100,
-      cooldowns,
+      assetRisk,
     },
   };
 }
