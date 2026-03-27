@@ -67,11 +67,15 @@ const MAX_TRADE_WINDOW_SEC = 180; // Trade within first 3 minutes
 const MIN_EDGE_MIDPOINT = 0.015; // Skip when midpoint is within 1.5% of 50/50 — no real edge
 const PROVEN_STRATEGY_THRESHOLD = 5; // Need at least 5 trades before full bet sizing
 
+// Exploitation rate: how often to use the backtest-selected strategy vs. explore
+const EXPLOIT_RATE = 0.80; // 80% exploit best model, 20% Thompson Sampling exploration
+
 // ─── Module State ────────────────────────────────────────────────
 
 let schedulerInterval: NodeJS.Timeout | null = null;
 let schedulerRunning = false;
 let sessionPeakBankroll = 0;
+let backtestBestStrategy: string | null = null; // Set by applyBacktestPriors
 let windowState: WindowState = {
   lastProcessedWindowEnd: 0,
   pendingSettlement: new Set(),
@@ -325,9 +329,41 @@ function ciLowerBound(alpha: number, beta: number): number {
 }
 
 /**
- * Select a strategy using Thompson Sampling.
- * The skip arm is almost never selected (very pessimistic prior).
- * Strategies that have never been tried get optimistic priors.
+ * Select a strategy. Uses a two-phase approach:
+ * 1. If a backtest best model is set, exploit it EXPLOIT_RATE% of the time
+ * 2. Otherwise (or for the exploration fraction), use Thompson Sampling
+ *
+ * Thompson Sampling priors come from the DB (set by applyBacktestPriors),
+ * NOT from hardcoded values. This ensures the backtest winner gets selected.
+ */
+async function selectStrategy(asset: Asset): Promise<string> {
+  const now = Date.now();
+
+  // Load backtest best strategy from config if not cached
+  if (backtestBestStrategy === null) {
+    const stored = await storage.getConfig("backtest_best_strategy");
+    backtestBestStrategy = stored || "";
+  }
+
+  // Phase 1: Exploit — use backtest best model directly
+  if (backtestBestStrategy && STRATEGY_NAMES.includes(backtestBestStrategy as any)) {
+    const disableKey = `${backtestBestStrategy}:${asset}`;
+    const isDisabled = strategyDisabled.has(disableKey) && now < (strategyDisabled.get(disableKey) || 0);
+
+    if (!isDisabled && Math.random() < EXPLOIT_RATE) {
+      await storage.addModelLog("STRATEGY_EXPLOIT", asset,
+        `Using backtest best: ${backtestBestStrategy} (exploit rate ${EXPLOIT_RATE * 100}%)`);
+      return backtestBestStrategy;
+    }
+  }
+
+  // Phase 2: Explore — Thompson Sampling from DB priors
+  return await selectStrategyByThompson(asset);
+}
+
+/**
+ * Pure Thompson Sampling selection using DB-stored alpha/beta.
+ * No hardcoded priors — all priors come from applyBacktestPriors().
  */
 async function selectStrategyByThompson(asset: Asset): Promise<string> {
   const now = Date.now();
@@ -366,29 +402,16 @@ async function selectStrategyByThompson(asset: Asset): Promise<string> {
       continue;
     }
 
-    // Data-driven priors based on live performance:
-    // - marketFollow: 3W/0L → strong prior Beta(4, 1)
-    // - contrarian: 1W/0L → good prior Beta(3, 1)
-    // - Others: neutral prior Beta(2, 2) until proven
-    let alpha: number, beta: number;
-    if (perf.totalTrades === 0) {
-      // Assign priors based on live data track record
-      if (stratName === "marketFollow") {
-        alpha = 4; beta = 1; // Proven best strategy
-      } else if (stratName === "contrarian") {
-        alpha = 3; beta = 1; // Proven secondary
-      } else {
-        alpha = 2; beta = 2; // Neutral until proven
-      }
-    } else if (perf.totalTrades < 5) {
-      // Blend prior with actual data
-      const priorAlpha = stratName === "marketFollow" ? 3 : stratName === "contrarian" ? 2 : 1;
-      const priorBeta = stratName === "marketFollow" ? 0.5 : 1;
-      alpha = priorAlpha + perf.wins;
-      beta = priorBeta + perf.losses;
-    } else {
-      alpha = perf.alphaWins;
-      beta = perf.betaLosses;
+    // Use DB-stored alpha/beta (set by applyBacktestPriors).
+    // These reflect backtest performance, NOT hardcoded guesses.
+    // Fallback: neutral Beta(2, 2) if no priors set at all.
+    let alpha = perf.alphaWins;
+    let beta = perf.betaLosses;
+
+    // If DB has default 1/1 priors and no trades, use neutral
+    if (alpha <= 1.01 && beta <= 1.01 && perf.totalTrades === 0) {
+      alpha = 2;
+      beta = 2;
     }
 
     const sample = sampleBeta(alpha, beta);
@@ -597,52 +620,49 @@ async function processNewWindow() {
         continue;
       }
 
-      // Thompson Sampling: select strategy
-      const selectedStrategy = await selectStrategyByThompson(asset);
+      // Select strategy: exploit backtest best (80%) or explore via Thompson Sampling (20%)
+      const selectedStrategy = await selectStrategy(asset);
 
       if (selectedStrategy === "skip") {
-        // Even if Thompson says skip, try marketFollow as a fallback
-        // This guarantees we don't miss windows entirely
-        if (attempts >= 2) {
-          const fallbackSignal = strategyMarketFollow(upPct, downPct);
-          if (fallbackSignal.confidence >= threshold) {
-            await storage.addModelLog("FALLBACK_MARKET_FOLLOW", asset,
-              `Thompson selected SKIP but falling back to marketFollow (attempt ${attempts + 1})`);
-            tradedThisWindow.add(tradeKey);
-            await openTrade(asset, event, fallbackSignal, upPct, downPct, maxBet, slug, windowEnd);
-            anyTradeOpened = true;
-            continue;
-          }
-        }
         await storage.addModelLog("SKIP", asset,
-          `Thompson selected SKIP for window ${windowEnd} (attempt ${attempts + 1})`);
+          `Strategy selection returned SKIP for window ${windowEnd} (attempt ${attempts + 1})`);
         continue;
       }
 
       // Run the selected strategy
-      const signal = await runStrategy(selectedStrategy, asset, event, upPct, downPct);
+      let signal = await runStrategy(selectedStrategy, asset, event, upPct, downPct);
 
+      // If selected strategy returned skip, try alternatives:
+      // 1. Thompson Sampling pick (if we were exploiting)
+      // 2. Any strategy that produces a signal
       if (signal.direction === "skip") {
-        // Strategy returned skip — try fallback on later attempts
-        if (attempts >= 2) {
-          const fallbackSignal = strategyMarketFollow(upPct, downPct);
-          if (fallbackSignal.confidence >= threshold) {
-            await storage.addModelLog("FALLBACK_AFTER_SKIP", asset,
-              `${selectedStrategy} returned skip, falling back to marketFollow`);
-            tradedThisWindow.add(tradeKey);
-            await openTrade(asset, event, fallbackSignal, upPct, downPct, maxBet, slug, windowEnd);
-            anyTradeOpened = true;
-            continue;
+        await storage.addModelLog("STRATEGY_SKIP", asset,
+          `${selectedStrategy} returned skip, trying alternatives`);
+
+        // Try all strategies in order of backtest WR to find one that doesn't skip
+        const fallbackOrder: StrategyName[] = ["contrarian", "marketFollow", "momentum", "meanReversion", "orderBookImbalance"];
+        let foundFallback = false;
+        for (const fallbackName of fallbackOrder) {
+          if (fallbackName === selectedStrategy) continue; // already tried
+          const fbSignal = await runStrategy(fallbackName, asset, event, upPct, downPct);
+          if (fbSignal.direction !== "skip" && fbSignal.confidence >= threshold) {
+            await storage.addModelLog("FALLBACK_STRATEGY", asset,
+              `${selectedStrategy} skipped, using ${fallbackName} (conf: ${fbSignal.confidence.toFixed(4)})`);
+            signal = fbSignal;
+            foundFallback = true;
+            break;
           }
         }
-        await storage.addModelLog("STRATEGY_SKIP", asset,
-          `${selectedStrategy} returned skip for window ${windowEnd} (attempt ${attempts + 1})`);
-        continue;
+        if (!foundFallback) {
+          await storage.addModelLog("ALL_SKIP", asset,
+            `All strategies returned skip for window ${windowEnd}`);
+          continue;
+        }
       }
 
       if (signal.confidence < threshold) {
         await storage.addModelLog("LOW_CONFIDENCE", asset,
-          `${selectedStrategy}: confidence ${signal.confidence.toFixed(4)} < threshold ${threshold}`);
+          `${signal.strategyName}: confidence ${signal.confidence.toFixed(4)} < threshold ${threshold}`);
         continue;
       }
 
@@ -971,6 +991,13 @@ async function snapshotPerformance() {
 export async function calibrateFromHistory() {
   console.log("[MicroEngine] Calibrating from historical data...");
 
+  // Load backtest best strategy from config
+  const storedBest = await storage.getConfig("backtest_best_strategy");
+  if (storedBest) {
+    backtestBestStrategy = storedBest;
+    console.log(`[MicroEngine] Loaded backtest best strategy: ${storedBest}`);
+  }
+
   const assets: Asset[] = ["btc", "eth", "sol", "xrp"];
 
   for (const asset of assets) {
@@ -1028,21 +1055,40 @@ export async function calibrateFromHistory() {
 export async function applyBacktestPriors(
   results: { strategyName: string; winRate: number; totalTrades: number; wins: number; losses: number }[]
 ) {
-  const PRIOR_SCALE = 0.3;
+  // Scale factor: controls how much weight backtest results have as priors.
+  // 0.1 = weak, 0.5 = moderate, 1.0 = full weight.
+  // We use 0.15 to give a meaningful but not overwhelming prior (scales ~150 trades to ~22 pseudo-observations).
+  const PRIOR_SCALE = 0.15;
   const assets: Asset[] = ["btc", "eth", "sol", "xrp"];
   const microStrategyNames = new Set<string>(STRATEGY_NAMES);
+
+  // Find the best individual strategy from backtest (exclude ensembles)
+  const microResults = results.filter(r => microStrategyNames.has(r.strategyName));
+  const bestMicro = microResults.length > 0
+    ? microResults.reduce((a, b) => a.winRate > b.winRate ? a : b)
+    : null;
+
+  // Save best strategy to config so the engine exploits it
+  if (bestMicro) {
+    await storage.setConfig("backtest_best_strategy", bestMicro.strategyName);
+    backtestBestStrategy = bestMicro.strategyName; // Update in-memory cache
+    console.log(`[MicroEngine] Backtest best strategy set: ${bestMicro.strategyName} (WR: ${(bestMicro.winRate * 100).toFixed(1)}%)`);
+    await storage.addModelLog("BACKTEST_BEST_SET", undefined,
+      `Best strategy: ${bestMicro.strategyName} (WR: ${(bestMicro.winRate * 100).toFixed(1)}%). Will exploit ${EXPLOIT_RATE * 100}% of the time.`);
+  }
 
   for (const result of results) {
     if (!microStrategyNames.has(result.strategyName)) continue;
 
-    const scaledWins = Math.max(0.5, result.wins * PRIOR_SCALE);
-    const scaledLosses = Math.max(0.5, result.losses * PRIOR_SCALE);
+    const scaledWins = Math.max(1, result.wins * PRIOR_SCALE);
+    const scaledLosses = Math.max(1, result.losses * PRIOR_SCALE);
     const newAlpha = 1 + scaledWins;
     const newBeta = 1 + scaledLosses;
 
     for (const asset of assets) {
       const perf = await storage.getOrCreateStrategyPerf(result.strategyName, asset);
 
+      // If real trades exist, blend priors with actual data
       if (perf.totalTrades >= 20) {
         console.log(
           `[MicroEngine] Skipping backtest prior for ${result.strategyName}/${asset}: ${perf.totalTrades} real trades exist`
@@ -1050,15 +1096,17 @@ export async function applyBacktestPriors(
         continue;
       }
 
+      const finalAlpha = newAlpha + (perf.totalTrades > 0 ? perf.wins : 0);
+      const finalBeta = newBeta + (perf.totalTrades > 0 ? perf.losses : 0);
+
       await storage.updateStrategyPerf(perf.id, {
-        alphaWins: newAlpha + (perf.totalTrades > 0 ? perf.wins : 0),
-        betaLosses: newBeta + (perf.totalTrades > 0 ? perf.losses : 0),
+        alphaWins: finalAlpha,
+        betaLosses: finalBeta,
       });
 
       console.log(
         `[MicroEngine] Applied backtest prior for ${result.strategyName}/${asset}: ` +
-        `alpha=${(newAlpha + (perf.totalTrades > 0 ? perf.wins : 0)).toFixed(2)}, ` +
-        `beta=${(newBeta + (perf.totalTrades > 0 ? perf.losses : 0)).toFixed(2)} ` +
+        `alpha=${finalAlpha.toFixed(2)}, beta=${finalBeta.toFixed(2)} ` +
         `(backtest WR: ${(result.winRate * 100).toFixed(1)}%)`
       );
     }
@@ -1141,5 +1189,7 @@ export async function getSchedulerStatus() {
     assetCooldowns: Object.fromEntries(assetCooldowns),
     disabledStrategies: Object.fromEntries(strategyDisabled),
     sessionPeakBankroll,
+    backtestBestStrategy: backtestBestStrategy || null,
+    exploitRate: EXPLOIT_RATE,
   };
 }
