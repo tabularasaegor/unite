@@ -68,16 +68,29 @@ function EngineControl({ engine, label }: { engine: string; label: string }) {
 }
 
 export default function MicroEngines() {
-  const [tab, setTab] = useState("all");
+  const [engineTab, setEngineTab] = useState("all");
+  const [tfTab, setTfTab] = useState(""); // "" = all timeframes
+
+  const engineLabels: Record<string, string> = {
+    all: "Все модели",
+    A: "Arena — 5 TA-моделей",
+    B: "Bayesian Edge — adaptive base rate",
+    C: "Latency Arbitrage — спот vs Polymarket",
+    D: "ARIMA(3,1,1) — статпрогноз",
+  };
+
+  const currentEngine = engineTab === "all" ? undefined : engineTab;
+  const currentTf = tfTab || undefined;
 
   return (
     <div className="flex-1 overflow-auto">
-      <Tabs value={tab} onValueChange={setTab} className="h-full flex flex-col">
-        <div className="border-b border-border bg-background/95 backdrop-blur sticky top-0 z-10 px-4 pt-3">
-          <div className="flex items-center gap-2 mb-2">
-            <Zap className="h-5 w-5 text-amber-500" />
-            <h2 className="text-lg font-semibold">Крипто 5-мин</h2>
-          </div>
+      <div className="border-b border-border bg-background/95 backdrop-blur sticky top-0 z-10 px-4 pt-3 space-y-2 pb-2">
+        <div className="flex items-center gap-2">
+          <Zap className="h-5 w-5 text-amber-500" />
+          <h2 className="text-lg font-semibold">Крипто торговля</h2>
+        </div>
+        {/* Row 1: Engine tabs */}
+        <Tabs value={engineTab} onValueChange={setEngineTab}>
           <TabsList className="grid w-full max-w-xl grid-cols-5">
             <TabsTrigger value="all" className="text-xs">Все</TabsTrigger>
             <TabsTrigger value="A" className="text-xs">Арена</TabsTrigger>
@@ -85,33 +98,20 @@ export default function MicroEngines() {
             <TabsTrigger value="C" className="text-xs">Latency</TabsTrigger>
             <TabsTrigger value="D" className="text-xs">ARIMA</TabsTrigger>
           </TabsList>
-        </div>
+        </Tabs>
+        {/* Row 2: Timeframe tabs */}
+        <Tabs value={tfTab} onValueChange={setTfTab}>
+          <TabsList className="grid w-full max-w-xs grid-cols-4">
+            <TabsTrigger value="" className="text-xs">Все TF</TabsTrigger>
+            <TabsTrigger value="5m" className="text-xs">5 мин</TabsTrigger>
+            <TabsTrigger value="15m" className="text-xs">15 мин</TabsTrigger>
+            <TabsTrigger value="1h" className="text-xs">1 час</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      </div>
 
-        <TabsContent value="all" className="flex-1 m-0">
-          <EngineControl engine="ALL" label="Все 4 модели" />
-          <MicroDashboard />
-        </TabsContent>
-
-        <TabsContent value="A" className="flex-1 m-0">
-          <EngineControl engine="A" label="Arena — 5 TA-моделей с ELO-рейтингами" />
-          <MicroDashboard engine="A" />
-        </TabsContent>
-
-        <TabsContent value="B" className="flex-1 m-0">
-          <EngineControl engine="B" label="Bayesian Edge — adaptive base rate + калибровка" />
-          <MicroDashboard engine="B" />
-        </TabsContent>
-
-        <TabsContent value="C" className="flex-1 m-0">
-          <EngineControl engine="C" label="Latency Arbitrage — спотовый опережает Polymarket" />
-          <MicroDashboard engine="C" />
-        </TabsContent>
-
-        <TabsContent value="D" className="flex-1 m-0">
-          <EngineControl engine="D" label="ARIMA(3,1,1) — статистическое прогнозирование" />
-          <MicroDashboard engine="D" />
-        </TabsContent>
-      </Tabs>
+      <EngineControl engine={engineTab === "all" ? "ALL" : engineTab} label={engineLabels[engineTab] || ""} />
+      <MicroDashboard engine={currentEngine} timeframe={currentTf} />
     </div>
   );
 }

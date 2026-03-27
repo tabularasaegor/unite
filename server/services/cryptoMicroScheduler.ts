@@ -14,12 +14,16 @@ import { storage } from "../storage";
 import { fetchPrice } from "./polymarket";
 import { runLatencyArbitrage } from "./engineLatencyArb";
 import { runARIMAPredict } from "./engineARIMA";
+import { fetchMarket, type MarketData, getAllAssets, getTimeframes } from "./marketFetcher";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
-// Match all micro-trade titles: [5m], [5m-A], [5m-B]
+// Match all trade titles: [5m], [5m-A], [15m-B], [1h-C], etc.
 function isMicroTrade(title: string | null | undefined): boolean {
-  return !!title && (title.startsWith("[5m]") || title.startsWith("[5m-"));
+  if (!title) return false;
+  return title.startsWith("[5m]") || title.startsWith("[5m-") 
+    || title.startsWith("[15m]") || title.startsWith("[15m-")
+    || title.startsWith("[1h]") || title.startsWith("[1h-");
 }
 
 // Rolling base rate from last N resolutions (replaces hardcoded 0.56)
@@ -760,8 +764,8 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
 }
 
 // --- Execute micro-trade ---
-function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0, modelTag: string = ""): boolean {
-  const tag = modelTag ? `[5m-${modelTag}]` : "[5m]";
+function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0, modelTag: string = "", timeframe: string = "5m"): boolean {
+  const tag = modelTag ? `[${timeframe}-${modelTag}]` : `[${timeframe}]`;
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
@@ -1001,84 +1005,64 @@ async function runMicroCycle(): Promise<void> {
       log(`Micro: settled ${settled} trades. Total P&L: $${totalPnl.toFixed(2)}`, "micro");
     }
 
-    // Get enabled assets and engines
+    // Get enabled assets, timeframes, and engines
     const enabledAssets = (storage.getConfig("micro_assets") || "btc,eth,sol,xrp").split(",").map(s => s.trim().toLowerCase());
-    const engineAEnabled = storage.getConfig("engine_a_enabled") !== "false";
-    const engineBEnabled = storage.getConfig("engine_b_enabled") !== "false";
-    const engineCEnabled = storage.getConfig("engine_c_enabled") !== "false";
-    const engineDEnabled = storage.getConfig("engine_d_enabled") !== "false";
+    const enabledTimeframes = (storage.getConfig("micro_timeframes") || "5m,15m,1h").split(",").map(s => s.trim());
+    const engines: Record<string, boolean> = {
+      A: storage.getConfig("engine_a_enabled") !== "false",
+      B: storage.getConfig("engine_b_enabled") !== "false",
+      C: storage.getConfig("engine_c_enabled") !== "false",
+      D: storage.getConfig("engine_d_enabled") !== "false",
+    };
 
-    for (const asset of enabledAssets) {
-      const market = await fetchMicroMarket(asset);
-      if (!market) continue;
-      if (market.liquidity < 500) continue;
+    for (const tf of enabledTimeframes) {
+      for (const asset of enabledAssets) {
+        // Fetch market for this asset+timeframe
+        const mktData = await fetchMarket(asset, tf);
+        if (!mktData) continue;
+        if (mktData.liquidity < 300) continue;
 
-      // === ENGINE A: Model Arena ===
-      if (engineAEnabled) {
-        const alreadyTraded = storage.getOpportunityByExternalId(`micro-A-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-A-${market.slug}-Down`);
-        if (!alreadyTraded) {
+        // Convert MarketData to MicroMarket for compatibility
+        const market: MicroMarket = {
+          asset: mktData.asset, slug: mktData.slug, title: mktData.title,
+          conditionId: mktData.conditionId, upTokenId: mktData.upTokenId, downTokenId: mktData.downTokenId,
+          upPrice: mktData.upPrice, downPrice: mktData.downPrice,
+          volume24h: mktData.volume24h, liquidity: mktData.liquidity,
+          endDate: mktData.endDate, tickSize: mktData.tickSize, negRisk: mktData.negRisk,
+          windowStart: mktData.windowStart, windowEnd: mktData.windowEnd,
+        };
+
+        // Run each enabled engine
+        const engineConfigs: Array<{ tag: string; run: () => Promise<EngineResult> | EngineResult }> = [];
+        
+        if (engines.A) engineConfigs.push({ tag: "A", run: () => engineArena(asset, market) });
+        if (engines.B) engineConfigs.push({ tag: "B", run: () => engineBayesian(asset, market) });
+        if (engines.C) engineConfigs.push({ tag: "C", run: async () => {
+          const r = await runLatencyArbitrage(asset, market.upPrice, market.liquidity);
+          logModelChange("LATENCY", `[${tf}] ${asset.toUpperCase()} ${r.direction} Δ=${r.priceChange.toFixed(3)}%`);
+          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "latency", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "C" };
+        }});
+        if (engines.D) engineConfigs.push({ tag: "D", run: async () => {
+          const r = await runARIMAPredict(asset, market.upPrice, market.liquidity);
+          logModelChange("ARIMA", `[${tf}] ${asset.toUpperCase()} ${r.direction} Δ=${r.predictedChange.toFixed(3)}%`);
+          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "arima", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "D" };
+        }});
+
+        for (const eng of engineConfigs) {
+          const extId = `micro-${eng.tag}-${market.slug}-Up`;
+          const extId2 = `micro-${eng.tag}-${market.slug}-Down`;
+          if (storage.getOpportunityByExternalId(extId) || storage.getOpportunityByExternalId(extId2)) continue;
+          
           try {
-            const result = await engineArena(asset, market);
+            const result = await eng.run();
             if (result.blocked) {
-              logModelChange("БЛОК_A", `${asset.toUpperCase()} ${result.direction} | ${result.reasoning}`);
+              // Skip blocked silently
             } else {
               const kelly = Math.max(0.01, result.kellyFraction);
-              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "A");
+              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, eng.tag, tf);
             }
           } catch (err) {
-            log(`Engine A error for ${asset}: ${err}`, "micro");
-          }
-        }
-      }
-
-      // === ENGINE B: Bayesian Edge ===
-      if (engineBEnabled) {
-        const alreadyTraded = storage.getOpportunityByExternalId(`micro-B-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-B-${market.slug}-Down`);
-        if (!alreadyTraded) {
-          try {
-            const result = engineBayesian(asset, market);
-            if (result.blocked) {
-              logModelChange("БЛОК_B", `${asset.toUpperCase()} ${result.direction} | ${result.reasoning}`);
-            } else {
-              const kelly = Math.max(0.01, result.kellyFraction);
-              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "B");
-            }
-          } catch (err) {
-            log(`Engine B error for ${asset}: ${err}`, "micro");
-          }
-        }
-      }
-
-      // === ENGINE C: Latency Arbitrage ===
-      if (engineCEnabled) {
-        const alreadyTraded = storage.getOpportunityByExternalId(`micro-C-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-C-${market.slug}-Down`);
-        if (!alreadyTraded) {
-          try {
-            const result = await runLatencyArbitrage(asset, market.upPrice, market.liquidity);
-            logModelChange("LATENCY", `${asset.toUpperCase()} ${result.direction} Δ=${result.priceChange.toFixed(3)}% conf=${(result.confidence*100).toFixed(0)}%`);
-            if (!result.blocked) {
-              const kelly = Math.max(0.01, result.kellyFraction);
-              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "C");
-            }
-          } catch (err) {
-            log(`Engine C error for ${asset}: ${err}`, "micro");
-          }
-        }
-      }
-
-      // === ENGINE D: ARIMA Prediction ===
-      if (engineDEnabled) {
-        const alreadyTraded = storage.getOpportunityByExternalId(`micro-D-${market.slug}-Up`) || storage.getOpportunityByExternalId(`micro-D-${market.slug}-Down`);
-        if (!alreadyTraded) {
-          try {
-            const result = await runARIMAPredict(asset, market.upPrice, market.liquidity);
-            logModelChange("ARIMA", `${asset.toUpperCase()} ${result.direction} Δ=${result.predictedChange.toFixed(3)}% conf=${(result.confidence*100).toFixed(0)}%`);
-            if (!result.blocked) {
-              const kelly = Math.max(0.01, result.kellyFraction);
-              executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, "D");
-            }
-          } catch (err) {
-            log(`Engine D error for ${asset}: ${err}`, "micro");
+            log(`Engine ${eng.tag} error [${tf}] ${asset}: ${err}`, "micro");
           }
         }
       }

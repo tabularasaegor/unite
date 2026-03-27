@@ -14,7 +14,10 @@ import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
 
 // Helper: match all micro-trade titles [5m], [5m-A], [5m-B]
 function isMicro(title: string | null | undefined): boolean {
-  return !!title && (title.startsWith("[5m]") || title.startsWith("[5m-"));
+  if (!title) return false;
+  return title.startsWith("[5m]") || title.startsWith("[5m-")
+    || title.startsWith("[15m]") || title.startsWith("[15m-")
+    || title.startsWith("[1h]") || title.startsWith("[1h-");
 }
 
 // --- Authentication ---
@@ -469,12 +472,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Detailed micro stats with per-asset breakdown, time series, averages
   app.get("/api/micro/stats", (req, res) => {
     try {
-      const engine = (req.query.engine as string) || ""; // "A", "B", or "" for all
+      const engine = (req.query.engine as string) || "";
+      const tf = (req.query.tf as string) || ""; // "5m", "15m", "1h"
       const allPositions = storage.getActivePositions();
       const microPositions = allPositions.filter(p => {
         if (!p.title) return false;
-        if (["A","B","C","D"].includes(engine)) return p.title?.startsWith(`[5m-${engine}]`);
-        return isMicro(p.title);
+        if (!isMicro(p.title)) return false;
+        // Filter by engine
+        if (["A","B","C","D"].includes(engine) && !p.title.includes(`-${engine}]`)) return false;
+        // Filter by timeframe
+        if (tf && !p.title.startsWith(`[${tf}]`) && !p.title.startsWith(`[${tf}-`)) return false;
+        return true;
       });
       const closedMicro = microPositions.filter(p => p.status === "closed");
       const openMicro = microPositions.filter(p => p.status === "open");
