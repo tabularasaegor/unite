@@ -1,13 +1,14 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
-import { storage } from "./storage";
+import { storage, rawSqlite } from "./storage";
 import { runFullPipeline, runStage, startPipelineScheduler, stopPipelineScheduler, getPipelineStatus } from "./services/pipelineOrchestrator";
 import { runMarketScan, getLastScanResult, isScanRunning } from "./services/marketScanner";
 import { researchOpportunity } from "./services/researchSwarm";
 import { estimateProbability } from "./services/probabilityEngine";
 import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
-import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog, getLearningMatrixSummary, getStrategyPerfSummary } from "./services/cryptoMicroScheduler";
+import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog, getLearningMatrixSummary, getStrategyPerfSummary, resetMicroState } from "./services/cryptoMicroScheduler";
 import { getArenaStatus } from "./services/modelArena";
+import { getWhaleStatus } from "./services/engineWhaleCopy";
 import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
@@ -453,20 +454,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(getArenaStatus());
   });
 
-  // Engine toggle: POST /api/micro/engine { engine: "A"|"B"|"C"|"D", enabled: true|false }
+  app.get("/api/micro/whales", (_req, res) => {
+    res.json(getWhaleStatus());
+  });
+
+  // Engine toggle: POST /api/micro/engine { engine: "A"|"B"|"C"|"D"|"E", enabled: true|false }
   app.post("/api/micro/engine", (req, res) => {
     const { engine, enabled } = req.body;
-    if (["A", "B", "C", "D"].includes(engine)) {
+    if (["A", "B", "C", "D", "E"].includes(engine)) {
       storage.setConfig(`engine_${engine.toLowerCase()}_enabled`, enabled ? "true" : "false");
       res.json({ engine, enabled, message: `Engine ${engine} ${enabled ? 'enabled' : 'disabled'}` });
     } else {
-      res.status(400).json({ error: "engine must be A, B, C, or D" });
+      res.status(400).json({ error: "engine must be A, B, C, D, or E" });
     }
   });
 
   app.post("/api/micro/stop", (_req, res) => {
     stopMicroScheduler();
     res.json({ stopped: true, ...getMicroStatus() });
+  });
+
+  // Reset all trading statistics (wipe DB + memory)
+  app.post("/api/micro/reset", (_req, res) => {
+    // Stop scheduler first if running
+    stopMicroScheduler();
+    // Wipe trading data from DB
+    try {
+      rawSqlite.exec(`
+        DELETE FROM active_positions;
+        DELETE FROM settlements;
+        DELETE FROM executions;
+        DELETE FROM opportunities;
+        DELETE FROM audit_log;
+        DELETE FROM performance_snapshots;
+        DELETE FROM post_mortems;
+        DELETE FROM research_reports;
+        DELETE FROM risk_assessments;
+        DELETE FROM probability_estimates;
+        DELETE FROM memory_store WHERE category IN ('micro_calibration', 'micro_model_log', 'model_arena');
+      `);
+    } catch (err) {
+      console.error("Reset DB error:", err);
+    }
+    // Reset in-memory state
+    resetMicroState();
+    res.json({ reset: true, ...getMicroStatus() });
   });
 
   // Detailed micro stats with per-asset breakdown, time series, averages
@@ -479,7 +511,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (!p.title) return false;
         if (!isMicro(p.title)) return false;
         // Filter by engine
-        if (["A","B","C","D"].includes(engine) && !p.title.includes(`-${engine}]`)) return false;
+        if (["A","B","C","D","E"].includes(engine) && !p.title.includes(`-${engine}]`)) return false;
         // Filter by timeframe
         if (tf && !p.title.startsWith(`[${tf}]`) && !p.title.startsWith(`[${tf}-`)) return false;
         return true;
@@ -628,6 +660,29 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       assetDirectionMatrix.forEach(e => { e.winRate = e.trades > 0 ? Math.round(e.wins/e.trades*100) : 0; e.pnl = Math.round(e.pnl*100)/100; });
 
+      // Per-engine breakdown (only in aggregate "all" view)
+      const engineBreakdown: Array<{ engine: string; label: string; trades: number; wins: number; winRate: number; pnl: number; avgSize: number }> = [];
+      if (!engine) {
+        const engineMeta: Record<string, string> = { A: "Арена", B: "Байес", C: "Latency", D: "ARIMA", E: "Киты" };
+        for (const [eid, label] of Object.entries(engineMeta)) {
+          const ePosAll = allPositions.filter(p => p.title && p.title.includes(`-${eid}]`));
+          const eClosed = ePosAll.filter(p => p.status === "closed");
+          const eWins = eClosed.filter(p => (p.unrealizedPnl || 0) > 0).length;
+          const ePnl = eClosed.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
+          const eSize = eClosed.reduce((s, p) => s + p.size, 0);
+          const eOpen = ePosAll.filter(p => p.status === "open").length;
+          engineBreakdown.push({
+            engine: eid,
+            label,
+            trades: eClosed.length,
+            wins: eWins,
+            winRate: eClosed.length > 0 ? Math.round(eWins / eClosed.length * 100) : 0,
+            pnl: Math.round(ePnl * 100) / 100,
+            avgSize: eClosed.length > 0 ? Math.round(eSize / eClosed.length * 100) / 100 : 0,
+          });
+        }
+      }
+
       res.json({
         totalTrades,
         totalWins,
@@ -645,6 +700,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         strategyBreakdown,
         hourlyBreakdown,
         assetDirectionMatrix,
+        engineBreakdown,
         timeSeries: timeSeries.slice(-100),
       });
     } catch (err: any) {
@@ -814,9 +870,9 @@ function getDefaultConfigValue(key: string): string {
     auto_approve_threshold: "100",
     kill_switch: "false",
     max_trade_size: "100",
-    micro_scheduler_enabled: "false",
+    micro_scheduler_enabled: "true",
     micro_assets: "btc,eth,sol,xrp",
-    micro_bankroll: "200",
+    micro_bankroll: "500",
     micro_max_bet: "20",
     pipeline_min_days: "0",
     pipeline_max_days: "30",

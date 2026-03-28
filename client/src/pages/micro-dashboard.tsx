@@ -149,7 +149,7 @@ export default function MicroDashboard({ engine, timeframe }: { engine?: string;
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold flex items-center gap-2">
-            <Zap className="h-5 w-5 text-amber-500" /> {engine === "A" ? "Арена" : engine === "B" ? "Bayesian" : engine === "C" ? "Latency" : engine === "D" ? "ARIMA" : "Все модели"}{timeframe ? ` [${timeframe}]` : ""}
+            <Zap className="h-5 w-5 text-amber-500" /> {engine === "A" ? "Арена" : engine === "B" ? "Bayesian" : engine === "C" ? "Latency" : engine === "D" ? "ARIMA" : engine === "E" ? "Киты" : "Все модели"}{timeframe ? ` [${timeframe}]` : ""}
           </h2>
           <p className="text-sm text-muted-foreground">{[engine && `Модель ${engine}`, timeframe || "Все таймфреймы", "BTC/ETH/SOL/XRP"].filter(Boolean).join(" — ")}</p>
         </div>
@@ -210,6 +210,50 @@ export default function MicroDashboard({ engine, timeframe }: { engine?: string;
           </CardContent>
         </Card>
       </div>
+
+      {/* Engine breakdown (only in aggregate "Все" view) */}
+      {!engine && (s.engineBreakdown || []).length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">Сравнение моделей</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border/50">
+                    <th className="text-left py-1.5 px-2 font-medium text-muted-foreground">Модель</th>
+                    <th className="text-right py-1.5 px-2 font-medium text-muted-foreground">Сделки</th>
+                    <th className="text-right py-1.5 px-2 font-medium text-muted-foreground">WR%</th>
+                    <th className="text-right py-1.5 px-2 font-medium text-muted-foreground">P&L</th>
+                    <th className="text-right py-1.5 px-2 font-medium text-muted-foreground">Ср. ставка</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(s.engineBreakdown as any[]).map((e: any) => (
+                    <tr key={e.engine} className="border-b border-border/20 hover:bg-muted/30">
+                      <td className="py-1.5 px-2 font-medium">
+                        <span className={`inline-block w-2 h-2 rounded-full mr-1.5 ${
+                          e.engine === 'A' ? 'bg-blue-500' : e.engine === 'B' ? 'bg-purple-500' : e.engine === 'C' ? 'bg-amber-500' : e.engine === 'D' ? 'bg-emerald-500' : 'bg-cyan-500'
+                        }`} />
+                        {e.label} ({e.engine})
+                      </td>
+                      <td className="text-right py-1.5 px-2 tabular-nums">{e.trades}</td>
+                      <td className={`text-right py-1.5 px-2 tabular-nums font-medium ${e.winRate >= 55 ? 'text-green-500' : e.winRate >= 45 ? 'text-foreground' : 'text-red-500'}`}>
+                        {e.winRate}%
+                      </td>
+                      <td className={`text-right py-1.5 px-2 tabular-nums font-medium ${e.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                        ${e.pnl.toFixed(2)}
+                      </td>
+                      <td className="text-right py-1.5 px-2 tabular-nums">${e.avgSize.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Row 2: Scheduler Controls */}
       <MicroSchedulerControls />

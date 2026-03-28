@@ -26,6 +26,7 @@ const DB_PATH = path.resolve(dataDir, "data.db");
 const sqlite = new Database(DB_PATH);
 sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
+export const rawSqlite = sqlite;
 
 export interface IStorage {
   getOpportunities(filters?: { status?: string; platform?: string; stage?: string; limit?: number }): Opportunity[];

@@ -337,6 +337,59 @@ export async function getOpenOrders(): Promise<any[]> {
   }
 }
 
+// --- Real Balance Reading ---
+
+let cachedBalance: { value: number; fetchedAt: number } | null = null;
+const BALANCE_CACHE_TTL = 30000; // 30 seconds
+
+/**
+ * Fetch the real USDC balance on Polymarket for the funder address.
+ * Uses the Data API /value endpoint.
+ * Returns balance in USDC or null if unavailable.
+ */
+export async function getPolymarketBalance(): Promise<number | null> {
+  const now = Date.now();
+  if (cachedBalance && now - cachedBalance.fetchedAt < BALANCE_CACHE_TTL) {
+    return cachedBalance.value;
+  }
+
+  const funderAddress = process.env.POLY_FUNDER_ADDRESS;
+  if (!funderAddress) return null;
+
+  try {
+    const resp = await fetch(`https://data-api.polymarket.com/value?user=${funderAddress}`);
+    if (!resp.ok) return cachedBalance?.value ?? null;
+    const data = await resp.json();
+    const entry = Array.isArray(data) ? data[0] : data;
+    const balance = entry?.value != null ? Number(entry.value) : 0;
+    cachedBalance = { value: balance, fetchedAt: now };
+    return balance;
+  } catch {
+    return cachedBalance?.value ?? null;
+  }
+}
+
+/**
+ * Get the effective bankroll for micro-trading.
+ * In paper mode: uses configured micro_bankroll.
+ * In live mode: uses MIN(configured bankroll, real Polymarket balance).
+ */
+export async function getEffectiveBankroll(configuredBankroll: number, isPaper: boolean): Promise<number> {
+  if (isPaper) return configuredBankroll;
+
+  const realBalance = await getPolymarketBalance();
+  if (realBalance === null) {
+    log(`Warning: Cannot read Polymarket balance, using configured bankroll $${configuredBankroll}`, "polymarket");
+    return configuredBankroll;
+  }
+
+  const effective = Math.min(configuredBankroll, realBalance);
+  if (effective < configuredBankroll) {
+    log(`Live bankroll capped to real balance: $${realBalance.toFixed(2)} (configured: $${configuredBankroll})`, "polymarket");
+  }
+  return Math.max(0, effective);
+}
+
 // --- Helper: Parse Gamma market data into our internal format ---
 
 export function parseGammaMarket(m: GammaMarket): {

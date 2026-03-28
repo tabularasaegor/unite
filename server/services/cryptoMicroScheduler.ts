@@ -11,9 +11,10 @@
 
 import { log } from "../index";
 import { storage } from "../storage";
-import { fetchPrice } from "./polymarket";
+import { fetchPrice, getPolymarketBalance, getEffectiveBankroll } from "./polymarket";
 import { runLatencyArbitrage } from "./engineLatencyArb";
 import { runARIMAPredict } from "./engineARIMA";
+import { runWhaleCopyTrading } from "./engineWhaleCopy";
 import { fetchMarket, type MarketData, getAllAssets, getTimeframes } from "./marketFetcher";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
 
@@ -765,13 +766,24 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
 }
 
 // --- Execute micro-trade ---
+// Cached effective bankroll (updated every cycle)
+let _effectiveBankroll: number | null = null;
+
+async function updateEffectiveBankroll(): Promise<number> {
+  const isPaper = storage.getConfig("paper_trading") !== "false";
+  const configured = parseFloat(storage.getConfig("micro_bankroll") || "200");
+  _effectiveBankroll = await getEffectiveBankroll(configured, isPaper);
+  return _effectiveBankroll;
+}
+
 function executeMicroTrade(market: MicroMarket, direction: "Up" | "Down", confidence: number, reasoning: string, riskMultiplier: number = 1.0, modelTag: string = "", timeframe: string = "5m"): boolean {
   const tag = modelTag ? `[${timeframe}-${modelTag}]` : `[${timeframe}]`;
   const killSwitch = storage.getConfig("kill_switch") === "true";
   if (killSwitch) return false;
 
   const isPaperTrading = storage.getConfig("paper_trading") !== "false";
-  const microBankroll = parseFloat(storage.getConfig("micro_bankroll") || "200");
+  // Use effective bankroll (capped to real balance in live mode)
+  const microBankroll = _effectiveBankroll ?? parseFloat(storage.getConfig("micro_bankroll") || "200");
   const microMaxBet = parseFloat(storage.getConfig("micro_max_bet") || "20");
   
   const price = direction === "Up" ? market.upPrice : market.downPrice;
@@ -1001,6 +1013,9 @@ async function runMicroCycle(): Promise<void> {
     totalCycles++;
     if (storage.getConfig("micro_scheduler_enabled") !== "true") { isRunning = false; return; }
 
+    // Update effective bankroll (reads real balance in live mode)
+    await updateEffectiveBankroll();
+
     // Settle expired trades
     const settled = await settleMicroTrades();
     if (settled > 0) {
@@ -1015,6 +1030,7 @@ async function runMicroCycle(): Promise<void> {
       B: storage.getConfig("engine_b_enabled") !== "false",
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
+      E: storage.getConfig("engine_e_enabled") !== "false",
     };
 
     for (const tf of enabledTimeframes) {
@@ -1048,6 +1064,11 @@ async function runMicroCycle(): Promise<void> {
           const r = await runARIMAPredict(asset, market.upPrice, market.liquidity);
           logModelChange("ARIMA", `[${tf}] ${asset.toUpperCase()} ${r.direction} Δ=${r.predictedChange.toFixed(3)}%`);
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "arima", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "D" };
+        }});
+        if (engines.E) engineConfigs.push({ tag: "E", run: async () => {
+          const r = await runWhaleCopyTrading(asset, market.conditionId, market.upPrice, market.liquidity);
+          logModelChange("КИТЫ", `[${tf}] ${asset.toUpperCase()} ${r.direction} whale_vol=$${r.whaleVolume.toFixed(0)} ratio=${(r.whaleRatio*100).toFixed(0)}%`);
+          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "whale_copy", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "E" };
         }});
 
         for (const eng of engineConfigs) {
@@ -1094,7 +1115,29 @@ export function startMicroScheduler(): void {
 export function stopMicroScheduler(): void {
   if (schedulerInterval) { clearInterval(schedulerInterval); schedulerInterval = null; }
   storage.setConfig("micro_scheduler_enabled", "false");
-  log("Micro-scheduler stopped", "micro");
+  // Do NOT reset counters — stats persist for display after stop
+  log(`Micro-scheduler stopped. Stats preserved: ${totalTrades} trades, P&L: $${totalPnl.toFixed(2)}`, "micro");
+}
+
+/** Reset in-memory counters (e.g. after DB wipe). Re-reads from DB on next status call. */
+export function resetMicroState(): void {
+  totalTrades = 0;
+  totalPnl = 0;
+  totalCycles = 0;
+  sessionPnl = 0;
+  sessionPeakPnl = 0;
+  betSizeMultiplier = 1.0;
+  consecutiveLossWindows = 0;
+  stateInitialized = false;
+  calibrationLoaded = false;
+  modelLog.length = 0;
+  // Clear calibration
+  for (const asset of ALL_ASSETS) {
+    calibration[asset] = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, upWins: 0, upLosses: 0, downWins: 0, downLosses: 0, lastResults: [], avgEdgeRealized: 0 };
+  }
+  Object.keys(learningMatrix).forEach(k => delete learningMatrix[k]);
+  Object.keys(strategyPerf).forEach(k => delete strategyPerf[k]);
+  log("Micro: All in-memory state reset", "micro");
 }
 
 export function getMicroStatus() {
@@ -1140,7 +1183,9 @@ export function getMicroStatus() {
       B: storage.getConfig("engine_b_enabled") !== "false",
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
+      E: storage.getConfig("engine_e_enabled") !== "false",
     },
+    effectiveBankroll: _effectiveBankroll,
     regime: {
       betSizeMultiplier: Math.round(betSizeMultiplier * 100) / 100,
       consecutiveLossWindows,

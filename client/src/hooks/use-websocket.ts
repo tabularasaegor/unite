@@ -8,7 +8,7 @@ interface WSMessage {
 }
 
 // Build WS base URL using the same pattern as API_BASE in queryClient
-const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+const API_BASE = "";
 
 function buildWsUrl(): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";

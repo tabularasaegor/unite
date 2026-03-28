@@ -1,6 +1,9 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
 
-const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+// Use relative path (".") so requests go through the same proxy origin
+// In deployed mode: sites.pplx.app/sites/proxy/.../port/5000/api/... 
+// The "." prefix ensures the browser resolves relative to current page URL
+const API_BASE = ".";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {

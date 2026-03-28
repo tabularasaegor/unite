@@ -7,6 +7,8 @@ import { serveStatic } from "./static";
 import { initClobClient } from "./services/polymarket";
 import { updatePositionPrices, checkMarketResolutions } from "./services/executionEngine";
 import { checkSettlements, recordPerformanceSnapshot } from "./services/settlementMonitor";
+import { startMicroScheduler, getMicroStatus } from "./services/cryptoMicroScheduler";
+import { storage } from "./storage";
 
 export function log(message: string, source = "server") {
   const time = new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -94,6 +96,15 @@ app.use((req, res, next) => {
       }
     }, PRICE_UPDATE_INTERVAL);
     log("Background price ticker started (every 60s)");
+
+    // Auto-start micro scheduler if enabled in config
+    setTimeout(() => {
+      const enabled = storage.getConfig("micro_scheduler_enabled");
+      if (enabled === "true") {
+        log("Auto-starting micro scheduler (config: enabled)");
+        startMicroScheduler();
+      }
+    }, 3000); // Wait 3s for other services to init
 
     // Push DB schema (creates tables if missing, no-op if they exist)
     log("Pushing database schema...");
