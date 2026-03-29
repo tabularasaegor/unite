@@ -673,15 +673,25 @@ async function engineArena(asset: string, market: MicroMarket): Promise<EngineRe
     upWR, totalTrades: cal.totalTrades,
   });
 
-  logModelChange("АРЕНА", `${asset.toUpperCase()} ${arena.direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(arena.kellyFraction*100).toFixed(1)}% ${arena.blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8)+':'+m.direction).join(' ')}`);
+  let { direction, blocked, kellyFraction } = arena;
+
+  // OVERRIDE: When rolling base rate < 35%, block YES trades (data: YES=40% WR vs NO=65%)
+  const baseRate = getRollingBaseRate();
+  if (direction === "Up" && baseRate < 0.35) {
+    // Flip to Down or block
+    direction = "Down";
+    kellyFraction = kellyFraction * 0.5; // reduced confidence on flip
+  }
+
+  logModelChange("АРЕНА", `${asset.toUpperCase()} ${direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8)+':'+m.direction).join(' ')}`);
 
   return {
-    direction: arena.direction,
+    direction,
     confidence: arena.confidence,
     reasoning: arena.reasoning,
     strategy: "arena",
     blocked: arena.blocked,
-    kellyFraction: arena.kellyFraction,
+    kellyFraction,
     modelTag: "A",
   };
 }
@@ -745,18 +755,30 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   const edgeDown = (1 - trueProb) - downPrice;
   let direction: "Up" | "Down" = edgeUp >= edgeDown ? "Up" : "Down";
   let edge = direction === "Up" ? edgeUp : edgeDown;
-  if (edge < 0) { direction = "Up"; edge = Math.max(0, edgeUp); }
+  // If no edge in chosen direction, try the other; if both negative, block
+  if (edge < 0) {
+    direction = direction === "Up" ? "Down" : "Up";
+    edge = direction === "Up" ? edgeUp : edgeDown;
+  }
+
+  // Direction override: strongly favor Down when base rate < 40% (data: NO trades ~70% WR)
+  const currentBaseRate = getRollingBaseRate();
+  if (direction === "Up" && currentBaseRate < 0.40 && edge < 0.03) {
+    direction = "Down";
+    edge = edgeDown > 0 ? edgeDown : 0.005;
+  }
 
   // Blocking
   let blocked = false;
-  if (deviation > 0.15) blocked = true; // only extreme (>65/35)
+  if (deviation > 0.15) blocked = true;
   if (market.liquidity < 500) blocked = true;
-  if (edge < 0.005) blocked = true; // don't trade with no real edge
+  if (edge < 0.005) blocked = true;
 
-  // Kelly
+  // Kelly — asymmetric: Down gets more because NO trades historically 72% WR
   const price = direction === "Up" ? upPrice : downPrice;
   const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
-  const kellyFraction = kellyFull * 0.25; // Conservative Kelly — limit downside risk
+  const dirMultiplier = direction === "Down" ? 0.30 : 0.15; // Down = 2x Kelly vs Up
+  const kellyFraction = kellyFull * dirMultiplier;
   const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
   const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
@@ -1071,6 +1093,28 @@ async function runMicroCycle(): Promise<void> {
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "whale_copy", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "E" };
         }});
 
+        // Hourly performance filter: reduce exposure during historically bad hours
+        const currentHour = new Date().getUTCHours();
+        let hourlyMultiplier = 1.0;
+        const hourKey = `hour_${currentHour}`;
+        const hourPerf = learningMatrix[hourKey];
+        // If we have data showing this hour has < 45% WR, reduce bets
+        // Check via aggregated hourly data from learning matrix
+        const hourEntries = Object.entries(learningMatrix).filter(([k]) => k.includes(`|${currentHour}`));
+        if (hourEntries.length > 0) {
+          const totalHourTrades = hourEntries.reduce((s, [, lw]) => s + lw.trades, 0);
+          const totalHourWins = hourEntries.reduce((s, [, lw]) => s + lw.wins, 0);
+          if (totalHourTrades >= 10) {
+            const hourWR = totalHourWins / totalHourTrades;
+            if (hourWR < 0.42) {
+              hourlyMultiplier = 0.3; // Heavily reduce in bad hours
+              logModelChange("ЧАС_ФИЛЬТР", `${currentHour}:00 UTC WR=${(hourWR*100).toFixed(0)}% → mult=0.3x`);
+            } else if (hourWR < 0.48) {
+              hourlyMultiplier = 0.6;
+            }
+          }
+        }
+
         for (const eng of engineConfigs) {
           const extId = `micro-${eng.tag}-${market.slug}-Up`;
           const extId2 = `micro-${eng.tag}-${market.slug}-Down`;
@@ -1081,7 +1125,8 @@ async function runMicroCycle(): Promise<void> {
             if (result.blocked) {
               // Skip blocked silently
             } else {
-              const kelly = Math.max(0.01, result.kellyFraction);
+              // Apply hourly multiplier to kelly
+              const kelly = Math.max(0.01, result.kellyFraction * hourlyMultiplier);
               executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, eng.tag, tf);
             }
           } catch (err) {

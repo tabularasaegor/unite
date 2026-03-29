@@ -378,16 +378,18 @@ export async function runWhaleCopyTrading(
     reasons.push("whale≠market");
   }
 
-  // Blocking
+  // Blocking — very permissive, we want to trade when whales are active
   let blocked = false;
-  if (whaleRatio < MIN_WHALE_CONSENSUS) { blocked = true; }
-  if (uniqueWhales < MIN_WHALES) { blocked = true; }
+  if (whaleRatio < MIN_WHALE_CONSENSUS && totalWhaleVol < 200) { blocked = true; }
+  // Don't block if single whale with large volume (>$500) — strong signal
+  if (uniqueWhales < MIN_WHALES && totalWhaleVol < 500) { blocked = true; }
 
   // Kelly sizing — calibrate to whale volume proportionally
-  // If whales bet $5000, we scale proportionally to our bankroll
   const edge = Math.max(0, confidence - 0.50);
-  const volumeScale = Math.min(1.0, totalWhaleVol / 1000); // $1000+ whale vol = full kelly
-  const kellyFraction = edge > 0 ? edge * 0.65 * volumeScale : 0;
+  const volumeScale = Math.min(1.0, totalWhaleVol / 500); // $500+ whale vol = full kelly
+  // Down bias: if whale consensus is Down, boost kelly (matches overall market tendency)
+  const dirBoost = direction === "Down" ? 1.2 : 1.0;
+  const kellyFraction = edge > 0 ? edge * 0.70 * volumeScale * dirBoost : 0;
 
   return {
     direction,
