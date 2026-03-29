@@ -8,7 +8,7 @@ import { estimateProbability } from "./services/probabilityEngine";
 import { assessRisk, approveRiskAssessment, rejectRiskAssessment } from "./services/riskEngine";
 import { startMicroScheduler, stopMicroScheduler, getMicroStatus, getModelLog, getLearningMatrixSummary, getStrategyPerfSummary, resetMicroState } from "./services/cryptoMicroScheduler";
 import { getArenaStatus } from "./services/modelArena";
-import { getWhaleStatus } from "./services/engineWhaleCopy";
+// Whale engine removed
 import { executeOpportunity, closePosition, updatePositionPrices } from "./services/executionEngine";
 import { checkSettlements, generatePostMortem, recordPerformanceSnapshot } from "./services/settlementMonitor";
 import { isTradeEnabled, fetchMarkets } from "./services/polymarket";
@@ -454,14 +454,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(getArenaStatus());
   });
 
-  app.get("/api/micro/whales", (_req, res) => {
-    res.json(getWhaleStatus());
-  });
+
 
   // Engine toggle: POST /api/micro/engine { engine: "A"|"B"|"C"|"D"|"E", enabled: true|false }
   app.post("/api/micro/engine", (req, res) => {
     const { engine, enabled } = req.body;
-    if (["A", "B", "C", "D", "E", "F"].includes(engine)) {
+    if (["A", "B", "C", "D", "F"].includes(engine)) {
       storage.setConfig(`engine_${engine.toLowerCase()}_enabled`, enabled ? "true" : "false");
       res.json({ engine, enabled, message: `Engine ${engine} ${enabled ? 'enabled' : 'disabled'}` });
     } else {
@@ -511,7 +509,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         if (!p.title) return false;
         if (!isMicro(p.title)) return false;
         // Filter by engine
-        if (["A","B","C","D","E","F"].includes(engine) && !p.title.includes(`-${engine}]`)) return false;
+        if (["A","B","C","D","F"].includes(engine) && !p.title.includes(`-${engine}]`)) return false;
         // Filter by timeframe
         if (tf && !p.title.startsWith(`[${tf}]`) && !p.title.startsWith(`[${tf}-`)) return false;
         return true;
@@ -663,7 +661,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // Per-engine breakdown (only in aggregate "all" view)
       const engineBreakdown: Array<{ engine: string; label: string; trades: number; wins: number; winRate: number; pnl: number; avgSize: number }> = [];
       if (!engine) {
-        const engineMeta: Record<string, string> = { A: "Арена", B: "Байес", C: "Latency", D: "VWAP/Mom", E: "Киты", F: "ML/RF" };
+        const engineMeta: Record<string, string> = { A: "Арена", B: "Байес", C: "Latency", D: "VWAP/Mom", F: "ML/RF" };
         for (const [eid, label] of Object.entries(engineMeta)) {
           const ePosAll = allPositions.filter(p => p.title && p.title.includes(`-${eid}]`));
           const eClosed = ePosAll.filter(p => p.status === "closed");

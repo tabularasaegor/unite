@@ -14,7 +14,7 @@ import { storage } from "../storage";
 import { fetchPrice, getPolymarketBalance, getEffectiveBankroll } from "./polymarket";
 import { runLatencyArbitrage } from "./engineLatencyArb";
 import { runMomentumPredict } from "./engineMomentum";
-import { runWhaleCopyTrading, refreshWhaleList } from "./engineWhaleCopy";
+// Engine E (Whale) removed by user request
 import { runMLPredict, addMLTrainingSample, loadMLTrainingData } from "./engineXGBoost";
 import { analyzeTrend, type TrendSignal } from "./trendAnalysis";
 import { fetchMarket, type MarketData, getAllAssets, getTimeframes } from "./marketFetcher";
@@ -375,12 +375,12 @@ export function getEngineStats() {
 }
 
 // === THOMPSON SAMPLING FOR ENGINE ALLOCATION ===
-// Each engine has a Beta distribution: Beta(alpha, beta) where alpha = wins+1, beta = losses+1
-// Sample from each, highest sample gets to trade (or all trade but with weighted sizing)
+// Beta(alpha, beta) where alpha = wins+1, beta = max(1, losses-1)
+// losses-1 makes the distribution more optimistic — we want to explore, not punish
 function thompsonSample(tag: string): number {
   const ep = getEnginePerf(tag);
   const alpha = ep.wins + 1;
-  const beta_param = ep.losses + 1;
+  const beta_param = Math.max(1, ep.losses - 1);
   // Simple Beta sampling approximation using normal distribution
   const mean = alpha / (alpha + beta_param);
   const variance = (alpha * beta_param) / ((alpha + beta_param) ** 2 * (alpha + beta_param + 1));
@@ -1164,7 +1164,6 @@ async function runMicroCycle(): Promise<void> {
       B: storage.getConfig("engine_b_enabled") !== "false",
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
-      E: storage.getConfig("engine_e_enabled") !== "false",
       F: storage.getConfig("engine_f_enabled") !== "false",
     };
 
@@ -1173,11 +1172,6 @@ async function runMicroCycle(): Promise<void> {
     const tsWeights = getThompsonWeights(enabledTags);
     if (totalCycles % 10 === 0) {
       logModelChange("THOMPSON", enabledTags.map(t => `${t}:${tsWeights[t].toFixed(2)}x`).join(" "));
-    }
-
-    // Refresh whale list periodically (every 30 cycles = ~30 minutes)
-    if (totalCycles % 30 === 0 && engines.E) {
-      refreshWhaleList().catch(() => {});
     }
 
     for (const tf of enabledTimeframes) {
@@ -1211,11 +1205,6 @@ async function runMicroCycle(): Promise<void> {
           const r = await runMomentumPredict(asset, market.upPrice, market.liquidity);
           logModelChange("VWAP/MOM", `[${tf}] ${asset.toUpperCase()} ${r.direction} vwap=${r.vwapDeviation.toFixed(3)}% roc=${r.roc3m.toFixed(3)}%`);
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "momentum", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "D" };
-        }});
-        if (engines.E) engineConfigs.push({ tag: "E", run: async () => {
-          const r = await runWhaleCopyTrading(asset, market.conditionId, market.upPrice, market.liquidity);
-          logModelChange("КИТЫ", `[${tf}] ${asset.toUpperCase()} ${r.direction} whale_vol=$${r.whaleVolume.toFixed(0)} ratio=${(r.whaleRatio*100).toFixed(0)}%`);
-          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "whale_copy", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "E" };
         }});
         if (engines.F) engineConfigs.push({ tag: "F", run: async () => {
           const r = await runMLPredict(asset, market.upPrice, market.liquidity);
@@ -1354,7 +1343,6 @@ export function getMicroStatus() {
       B: storage.getConfig("engine_b_enabled") !== "false",
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
-      E: storage.getConfig("engine_e_enabled") !== "false",
       F: storage.getConfig("engine_f_enabled") !== "false",
     },
     effectiveBankroll: _effectiveBankroll,
