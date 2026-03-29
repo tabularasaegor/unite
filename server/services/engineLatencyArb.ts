@@ -75,52 +75,46 @@ export async function runLatencyArbitrage(asset: string, upPrice: number, liquid
   const direction: "Up" | "Down" = priceChange > 0 ? "Up" : "Down";
   let confidence = 0.50;
   
-  // ASYMMETRIC confidence: Down signals are much more reliable (72% WR) vs Up (50% WR)
-  // Spot price drops = sharp panic sells → Polymarket lags → easy prediction
-  // Spot price rises = gradual buying → Polymarket keeps up → no edge
+  // Stronger movement → higher confidence
+  // Engine C has 62% WR historically — trust its signals more
   const absPctChange = Math.abs(priceChange) * 100;
-  const isDown = direction === "Down";
   
   if (absPctChange > 0.15) {
-    confidence = isDown ? 0.60 : 0.54; // Down: strong, Up: moderate
+    confidence = 0.58;
     reasons.push(`strong Δ=${(priceChange*100).toFixed(3)}%`);
   } else if (absPctChange > 0.08) {
-    confidence = isDown ? 0.57 : 0.52;
+    confidence = 0.55;
     reasons.push(`spot Δ=${(priceChange*100).toFixed(3)}%`);
   } else if (absPctChange > 0.03) {
-    confidence = isDown ? 0.54 : 0.51;
+    confidence = 0.53;
     reasons.push(`trend=${direction}`);
   }
   
-  // Volume spike amplifies signal (more for Down)
+  // Volume spike amplifies signal
   if (volSpike > 1.5) {
-    confidence += isDown ? 0.03 : 0.01;
+    confidence += 0.03;
     reasons.push(`vol×${volSpike.toFixed(1)}`);
   }
   
   // Disagreement with Polymarket odds = latency opportunity
-  const polyDirection = upPrice > 0.52 ? "Up" : upPrice < 0.48 ? "Down" : "neutral";
+  const polyDirection = upPrice > 0.51 ? "Up" : upPrice < 0.49 ? "Down" : "neutral";
   if (polyDirection !== "neutral" && polyDirection !== direction) {
-    confidence += isDown ? 0.04 : 0.02;
+    confidence += 0.04; // Polymarket hasn't caught up — strong signal
     reasons.push(`latency:spot≠poly`);
   }
   
-  // 1-min momentum alignment
+  // 1-min momentum alignment: if last 1min candle agrees with 3min move, stronger signal
   if (Math.sign(lastChange) === Math.sign(priceChange) && Math.abs(lastChange) * 100 > 0.03) {
     confidence += 0.02;
     reasons.push(`1min✓`);
   }
   
-  // Block weak Up signals entirely (50% WR = coin flip)
-  let blocked = absPctChange < 0.015;
-  if (!isDown && absPctChange < 0.08) {
-    blocked = true; // Only allow Up on very strong spot moves (>0.08%)
-    reasons.push(`up_filtered`);
-  }
+  // Block only when truly no movement
+  const blocked = absPctChange < 0.015;
   
-  // Kelly — asymmetric: Down gets bigger bets
+  // Kelly — larger sizing for best engine
   const edge = Math.max(0, confidence - 0.50);
-  const kellyFraction = edge > 0 ? edge * (isDown ? 0.70 : 0.40) : 0;
+  const kellyFraction = edge > 0 ? edge * 0.70 : 0; // Higher Kelly for proven engine
 
   return {
     direction,

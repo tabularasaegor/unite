@@ -71,32 +71,28 @@ export async function runARIMAPredict(asset: string, upPrice: number, liquidity:
     const predictedPrice = predicted[0];
     const pctChange = (predictedPrice - lastPrice) / lastPrice * 100;
     
-    const rawDirection: "Up" | "Down" = predictedPrice > lastPrice ? "Up" : "Down";
+    const direction: "Up" | "Down" = predictedPrice > lastPrice ? "Up" : "Down";
     
-    // ARIMA Down predictions are slightly more reliable (58% vs 55%)
-    // But both are marginal — be very conservative
-    const isDown = rawDirection === "Down";
+    // Confidence based on magnitude of predicted move
     const absPct = Math.abs(pctChange);
-    let confidence = 0.51;
-    if (absPct > 0.05) confidence = isDown ? 0.54 : 0.52;
-    if (absPct > 0.10) confidence = isDown ? 0.56 : 0.53;
-    if (absPct > 0.20) confidence = isDown ? 0.58 : 0.55;
+    let confidence = 0.51; // conservative base
+    if (absPct > 0.05) confidence = 0.53;
+    if (absPct > 0.10) confidence = 0.55;
+    if (absPct > 0.20) confidence = 0.57;
     
     // Ensemble with market price signal
     const marketDir = upPrice > 0.51 ? "Up" : upPrice < 0.49 ? "Down" : "neutral";
-    if (marketDir === rawDirection) {
-      confidence += 0.02;
-    } else if (marketDir !== "neutral" && marketDir !== rawDirection) {
-      confidence -= 0.02;
+    if (marketDir === direction) {
+      confidence += 0.02; // agreement bonus
+    } else if (marketDir !== "neutral" && marketDir !== direction) {
+      confidence -= 0.02; // disagreement penalty
     }
     
-    // Use direction as-is, but block weak Up signals
-    const direction = rawDirection;
-    let blocked = absPct < 0.03;
-    if (!isDown && absPct < 0.08) blocked = true; // Only strong Up moves pass
+    // BLOCK weak signals: ARIMA prediction too small to be meaningful
+    const blocked = absPct < 0.03;
     
     const edge = Math.max(0, confidence - 0.50);
-    const kellyFraction = edge * (isDown ? 0.45 : 0.25); // Down gets more Kelly
+    const kellyFraction = edge * 0.40; // more conservative than before
     
     const reasoning = `ARIMA(3,1,1): ${lastPrice.toFixed(2)}→${predictedPrice.toFixed(2)} (Δ${pctChange > 0 ? '+' : ''}${pctChange.toFixed(3)}%) ${marketDir === direction ? '✓market' : ''}`;
     

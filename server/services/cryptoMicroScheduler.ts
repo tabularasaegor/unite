@@ -15,6 +15,7 @@ import { fetchPrice, getPolymarketBalance, getEffectiveBankroll } from "./polyma
 import { runLatencyArbitrage } from "./engineLatencyArb";
 import { runARIMAPredict } from "./engineARIMA";
 import { runWhaleCopyTrading } from "./engineWhaleCopy";
+import { analyzeTrend, type TrendSignal } from "./trendAnalysis";
 import { fetchMarket, type MarketData, getAllAssets, getTimeframes } from "./marketFetcher";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
 
@@ -27,23 +28,32 @@ function isMicroTrade(title: string | null | undefined): boolean {
     || title.startsWith("[1h]") || title.startsWith("[1h-");
 }
 
-// Rolling base rate from last N resolutions (replaces hardcoded 0.56)
+// Rolling base rate from last N MARKET resolutions (NOT our trade outcomes)
+// This prevents the feedback loop where losing trades warp the base rate
 export function getRollingBaseRate(): number {
   try {
-    // getActivePositions("closed") returns ordered by openedAt DESC (newest first)
     const allPos = storage.getActivePositions("closed");
     const micro = allPos.filter(p => isMicroTrade(p.title));
-    const recent = micro.slice(0, 30); // FIRST 30 = newest 30 (DESC order)
-    if (recent.length < 5) return 0.50;
+    const recent = micro.slice(0, 60); // Look at more trades for stability
+    if (recent.length < 10) return 0.50; // Start neutral with insufficient data
     
+    // Count MARKET resolutions (did the market resolve Up?), not our P&L
+    // A YES trade that won = market resolved Up
+    // A NO trade that lost = market resolved Up  
+    // A YES trade that lost = market resolved Down
+    // A NO trade that won = market resolved Down
     let upResolved = 0;
     for (const r of recent) {
       const won = (r.unrealizedPnl || 0) > 0;
-      if ((r.side === "YES" && won) || (r.side === "NO" && !won)) upResolved++;
+      const marketResolvedUp = (r.side === "YES" && won) || (r.side === "NO" && !won);
+      if (marketResolvedUp) upResolved++;
     }
     const rate = upResolved / recent.length;
-    log(`Rolling base rate: ${upResolved}/${recent.length} = ${(rate*100).toFixed(0)}% Up`, "micro");
-    return Math.max(0.15, Math.min(0.85, rate));
+    // CRITICAL: clamp to 35%-65% to prevent extreme biases
+    // Even if 80% of recent markets resolved Up, don't bet on it — it's noise
+    const clamped = Math.max(0.35, Math.min(0.65, rate));
+    log(`Rolling base rate: ${upResolved}/${recent.length} = ${(rate*100).toFixed(0)}% Up (clamped: ${(clamped*100).toFixed(0)}%)`, "micro");
+    return clamped;
   } catch {
     return 0.50;
   }
@@ -664,6 +674,17 @@ interface EngineResult {
   modelTag: string; // "A" (arena) or "B" (bayesian)
 }
 
+// === MULTI-TIMEFRAME TREND (10/15 min) ===
+// Cached trend results per cycle
+const trendResults: Record<string, TrendSignal> = {};
+
+async function getMultiTimeframeTrend(asset: string): Promise<TrendSignal> {
+  if (trendResults[asset]) return trendResults[asset];
+  const trend = await analyzeTrend(asset);
+  trendResults[asset] = trend;
+  return trend;
+}
+
 // === ENGINE A: Model Arena (5 competing TA/ML models) ===
 async function engineArena(asset: string, market: MicroMarket): Promise<EngineResult> {
   const cal = getCalibration(asset);
@@ -673,25 +694,29 @@ async function engineArena(asset: string, market: MicroMarket): Promise<EngineRe
     upWR, totalTrades: cal.totalTrades,
   });
 
-  let { direction, blocked, kellyFraction } = arena;
-
-  // OVERRIDE: When rolling base rate < 35%, block YES trades (data: YES=40% WR vs NO=65%)
-  const baseRate = getRollingBaseRate();
-  if (direction === "Up" && baseRate < 0.35) {
-    // Flip to Down or block
-    direction = "Down";
-    kellyFraction = kellyFraction * 0.5; // reduced confidence on flip
+  // Apply multi-timeframe trend filter
+  let { direction } = arena;
+  const trend = await getMultiTimeframeTrend(asset);
+  let kellyMult = 1.0;
+  if (trend.direction !== "neutral") {
+    if (trend.direction !== direction && trend.confidence > 0.6) {
+      // Strong trend disagrees → reduce kelly significantly
+      kellyMult = 0.3;
+    } else if (trend.direction === direction) {
+      // Trend agrees → boost
+      kellyMult = 1.2;
+    }
   }
 
-  logModelChange("АРЕНА", `${asset.toUpperCase()} ${direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8)+':'+m.direction).join(' ')}`);
+  logModelChange("АРЕНА", `${asset.toUpperCase()} ${arena.direction} edge=${(arena.edge*100).toFixed(1)}% kelly=${(arena.kellyFraction*100).toFixed(1)}% trend=${trend.direction}(${(trend.confidence*100).toFixed(0)}%) ${arena.blocked ? 'БЛОК:'+arena.blockReason : ''} | ${arena.models.map(m => m.modelName.substring(0,8)+':'+m.direction).join(' ')}`);
 
   return {
-    direction,
+    direction: arena.direction,
     confidence: arena.confidence,
     reasoning: arena.reasoning,
     strategy: "arena",
     blocked: arena.blocked,
-    kellyFraction,
+    kellyFraction: arena.kellyFraction * kellyMult,
     modelTag: "A",
   };
 }
@@ -755,30 +780,18 @@ function engineBayesian(asset: string, market: MicroMarket): EngineResult {
   const edgeDown = (1 - trueProb) - downPrice;
   let direction: "Up" | "Down" = edgeUp >= edgeDown ? "Up" : "Down";
   let edge = direction === "Up" ? edgeUp : edgeDown;
-  // If no edge in chosen direction, try the other; if both negative, block
-  if (edge < 0) {
-    direction = direction === "Up" ? "Down" : "Up";
-    edge = direction === "Up" ? edgeUp : edgeDown;
-  }
-
-  // Direction override: strongly favor Down when base rate < 40% (data: NO trades ~70% WR)
-  const currentBaseRate = getRollingBaseRate();
-  if (direction === "Up" && currentBaseRate < 0.40 && edge < 0.03) {
-    direction = "Down";
-    edge = edgeDown > 0 ? edgeDown : 0.005;
-  }
+  if (edge < 0) { direction = "Up"; edge = Math.max(0, edgeUp); }
 
   // Blocking
   let blocked = false;
-  if (deviation > 0.15) blocked = true;
+  if (deviation > 0.15) blocked = true; // only extreme (>65/35)
   if (market.liquidity < 500) blocked = true;
-  if (edge < 0.005) blocked = true;
+  if (edge < 0.005) blocked = true; // don't trade with no real edge
 
-  // Kelly — asymmetric: Down gets more because NO trades historically 72% WR
+  // Kelly
   const price = direction === "Up" ? upPrice : downPrice;
   const kellyFull = edge > 0 ? edge / (1/price - 1) : 0;
-  const dirMultiplier = direction === "Down" ? 0.30 : 0.15; // Down = 2x Kelly vs Up
-  const kellyFraction = kellyFull * dirMultiplier;
+  const kellyFraction = kellyFull * 0.25; // Conservative Kelly — limit downside risk
   const confidence = blocked ? 0 : Math.min(0.60, 0.50 + edge);
 
   const reasoning = `P(Up)=${(trueProb*100).toFixed(1)}% edge=${direction}${(edge*100).toFixed(1)}% kelly=${(kellyFraction*100).toFixed(1)}% ${reasons.join(' ')}`;
@@ -1038,6 +1051,9 @@ async function runMicroCycle(): Promise<void> {
     // Update effective bankroll (reads real balance in live mode)
     await updateEffectiveBankroll();
 
+    // Clear trend cache for fresh analysis each cycle
+    Object.keys(trendResults).forEach(k => delete trendResults[k]);
+
     // Settle expired trades
     const settled = await settleMicroTrades();
     if (settled > 0) {
@@ -1093,26 +1109,10 @@ async function runMicroCycle(): Promise<void> {
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "whale_copy", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "E" };
         }});
 
-        // Hourly performance filter: reduce exposure during historically bad hours
-        const currentHour = new Date().getUTCHours();
-        let hourlyMultiplier = 1.0;
-        const hourKey = `hour_${currentHour}`;
-        const hourPerf = learningMatrix[hourKey];
-        // If we have data showing this hour has < 45% WR, reduce bets
-        // Check via aggregated hourly data from learning matrix
-        const hourEntries = Object.entries(learningMatrix).filter(([k]) => k.includes(`|${currentHour}`));
-        if (hourEntries.length > 0) {
-          const totalHourTrades = hourEntries.reduce((s, [, lw]) => s + lw.trades, 0);
-          const totalHourWins = hourEntries.reduce((s, [, lw]) => s + lw.wins, 0);
-          if (totalHourTrades >= 10) {
-            const hourWR = totalHourWins / totalHourTrades;
-            if (hourWR < 0.42) {
-              hourlyMultiplier = 0.3; // Heavily reduce in bad hours
-              logModelChange("ЧАС_ФИЛЬТР", `${currentHour}:00 UTC WR=${(hourWR*100).toFixed(0)}% → mult=0.3x`);
-            } else if (hourWR < 0.48) {
-              hourlyMultiplier = 0.6;
-            }
-          }
+        // Fetch multi-timeframe trend for this asset (cached per cycle)
+        const assetTrend = await getMultiTimeframeTrend(asset);
+        if (assetTrend.direction !== "neutral") {
+          logModelChange("ТРЕНД", `[${tf}] ${asset.toUpperCase()} ${assetTrend.direction} conf=${(assetTrend.confidence*100).toFixed(0)}% | ${assetTrend.reasoning}`);
         }
 
         for (const eng of engineConfigs) {
@@ -1125,8 +1125,16 @@ async function runMicroCycle(): Promise<void> {
             if (result.blocked) {
               // Skip blocked silently
             } else {
-              // Apply hourly multiplier to kelly
-              const kelly = Math.max(0.01, result.kellyFraction * hourlyMultiplier);
+              // Apply trend-based multiplier
+              let trendMult = 1.0;
+              if (assetTrend.direction !== "neutral" && assetTrend.confidence > 0.5) {
+                if (assetTrend.direction === result.direction) {
+                  trendMult = 1.3; // Trend agrees → boost
+                } else {
+                  trendMult = 0.4; // Trend disagrees → reduce heavily
+                }
+              }
+              const kelly = Math.max(0.01, result.kellyFraction * trendMult);
               executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, eng.tag, tf);
             }
           } catch (err) {
