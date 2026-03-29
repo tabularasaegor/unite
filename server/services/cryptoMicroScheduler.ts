@@ -13,8 +13,9 @@ import { log } from "../index";
 import { storage } from "../storage";
 import { fetchPrice, getPolymarketBalance, getEffectiveBankroll } from "./polymarket";
 import { runLatencyArbitrage } from "./engineLatencyArb";
-import { runARIMAPredict } from "./engineARIMA";
-import { runWhaleCopyTrading } from "./engineWhaleCopy";
+import { runMomentumPredict } from "./engineMomentum";
+import { runWhaleCopyTrading, refreshWhaleList } from "./engineWhaleCopy";
+import { runMLPredict, addMLTrainingSample, loadMLTrainingData } from "./engineXGBoost";
 import { analyzeTrend, type TrendSignal } from "./trendAnalysis";
 import { fetchMarket, type MarketData, getAllAssets, getTimeframes } from "./marketFetcher";
 import { runModelArena, updateArenaResults, loadArenaRatings, getArenaStatus, setBaseRateProvider, type ModelPrediction } from "./modelArena";
@@ -334,6 +335,79 @@ let schedulerInterval: NodeJS.Timeout | null = null;
 let isRunning = false;
 let lastCycleAt: string | null = null;
 let totalCycles = 0;
+
+// === PER-ENGINE ADAPTIVE KELLY ===
+// Each engine tracks its own rolling WR and adjusts Kelly independently
+interface EnginePerf {
+  wins: number;
+  losses: number;
+  recentResults: boolean[]; // last 20
+  kellyMultiplier: number;  // 0.3 to 1.5
+}
+const enginePerf: Record<string, EnginePerf> = {};
+
+function getEnginePerf(tag: string): EnginePerf {
+  if (!enginePerf[tag]) enginePerf[tag] = { wins: 0, losses: 0, recentResults: [], kellyMultiplier: 1.0 };
+  return enginePerf[tag];
+}
+
+function updateEnginePerf(tag: string, won: boolean) {
+  const ep = getEnginePerf(tag);
+  if (won) ep.wins++; else ep.losses++;
+  ep.recentResults.push(won);
+  if (ep.recentResults.length > 20) ep.recentResults.shift();
+  // Adaptive Kelly: based on rolling WR of last 20 trades
+  if (ep.recentResults.length >= 5) {
+    const recentWR = ep.recentResults.filter(w => w).length / ep.recentResults.length;
+    if (recentWR >= 0.65) ep.kellyMultiplier = 1.5;       // Hot streak → boost
+    else if (recentWR >= 0.55) ep.kellyMultiplier = 1.2;
+    else if (recentWR >= 0.45) ep.kellyMultiplier = 1.0;   // Normal
+    else if (recentWR >= 0.35) ep.kellyMultiplier = 0.6;   // Cold → reduce
+    else ep.kellyMultiplier = 0.3;                          // Very cold → minimal
+  }
+}
+
+export function getEngineStats() {
+  return Object.entries(enginePerf).map(([tag, ep]) => {
+    const wr = ep.recentResults.length > 0 ? Math.round(ep.recentResults.filter(w => w).length / ep.recentResults.length * 100) : 0;
+    return { engine: tag, wins: ep.wins, losses: ep.losses, recentWR: wr, kellyMult: Math.round(ep.kellyMultiplier * 100) / 100, recent20: ep.recentResults.slice(-10).map(w => w ? '✓' : '✗').join('') };
+  });
+}
+
+// === THOMPSON SAMPLING FOR ENGINE ALLOCATION ===
+// Each engine has a Beta distribution: Beta(alpha, beta) where alpha = wins+1, beta = losses+1
+// Sample from each, highest sample gets to trade (or all trade but with weighted sizing)
+function thompsonSample(tag: string): number {
+  const ep = getEnginePerf(tag);
+  const alpha = ep.wins + 1;
+  const beta_param = ep.losses + 1;
+  // Simple Beta sampling approximation using normal distribution
+  const mean = alpha / (alpha + beta_param);
+  const variance = (alpha * beta_param) / ((alpha + beta_param) ** 2 * (alpha + beta_param + 1));
+  const std = Math.sqrt(variance);
+  // Box-Muller transform for normal random
+  const u1 = Math.random(), u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return Math.max(0.01, Math.min(0.99, mean + z * std));
+}
+
+/** Get Thompson Sampling allocation weights for all engines */
+function getThompsonWeights(engineTags: string[]): Record<string, number> {
+  const samples: Record<string, number> = {};
+  let total = 0;
+  for (const tag of engineTags) {
+    samples[tag] = thompsonSample(tag);
+    total += samples[tag];
+  }
+  // Normalize to sum to engineTags.length (so average weight = 1.0)
+  const weights: Record<string, number> = {};
+  for (const tag of engineTags) {
+    weights[tag] = total > 0 ? (samples[tag] / total) * engineTags.length : 1.0;
+    // Clamp: no engine gets less than 0.2x or more than 2.5x
+    weights[tag] = Math.max(0.2, Math.min(2.5, weights[tag]));
+  }
+  return weights;
+}
 let totalTrades = 0;
 let totalPnl = 0;
 let stateInitialized = false;
@@ -1013,10 +1087,32 @@ async function settleMicroTrades(): Promise<number> {
       else if (oppDesc.includes("ALTERNATE")) settleStrategy = "alternate";
       updateStrategyPerf(settleStrategy, wasCorrect, realizedPnl);
 
+      // Extract engine tag from title: [5m-A] -> "A"
+      const engineTag = pos.title?.match(/\[5m-([A-F])\]/)?.[1] || "?";
+      
+      // Update per-engine performance (adaptive Kelly)
+      updateEnginePerf(engineTag, wasCorrect);
+      
+      // Feed ML training data (Engine F learning)
+      // Note: features were captured at trade time, but we reconstruct basic ones here
+      const resolvedUp = (pos.side === "YES" && wasCorrect) || (pos.side === "NO" && !wasCorrect);
+      addMLTrainingSample({
+        mom1m: 0, mom3m: 0, mom5m: 0, mom10m: 0, mom15m: 0, // Historical features not available
+        obi: (pos.entryPrice - 0.5) * 100,
+        volSpike: 1, volTrend: 1,
+        vwapDev: 0,
+        utcHour: settleHour / 24,
+        minuteInWindow: 0.5,
+        trendDir: 0, trendConf: 0,
+        consUp: 0, consDown: 0,
+        liquidity: 3,
+      }, resolvedUp);
+
       const icon = wasCorrect ? "✓" : "✗";
       const cal = getCalibration(asset);
       const lw = getLearningWeight(asset, direction, settleHour);
-      logModelChange("СЕТЛМЕНТ", `${icon} ${asset.toUpperCase()} ${direction} [${settleStrategy}] PnL=$${realizedPnl.toFixed(2)} WR=${(cal.wins/cal.totalTrades*100).toFixed(0)}%(${cal.wins}/${cal.totalTrades}) w=${lw.toFixed(2)}`);
+      const ep = getEnginePerf(engineTag);
+      logModelChange("СЕТЛМЕНТ", `${icon} ${asset.toUpperCase()} ${direction} [${engineTag}] PnL=$${realizedPnl.toFixed(2)} WR=${(cal.wins/cal.totalTrades*100).toFixed(0)}% kelly_mult=${ep.kellyMultiplier.toFixed(2)}`);
 
     } catch {}
   }
@@ -1069,7 +1165,20 @@ async function runMicroCycle(): Promise<void> {
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
       E: storage.getConfig("engine_e_enabled") !== "false",
+      F: storage.getConfig("engine_f_enabled") !== "false",
     };
+
+    // Thompson Sampling: compute allocation weights for this cycle
+    const enabledTags = Object.entries(engines).filter(([, v]) => v).map(([k]) => k);
+    const tsWeights = getThompsonWeights(enabledTags);
+    if (totalCycles % 10 === 0) {
+      logModelChange("THOMPSON", enabledTags.map(t => `${t}:${tsWeights[t].toFixed(2)}x`).join(" "));
+    }
+
+    // Refresh whale list periodically (every 30 cycles = ~30 minutes)
+    if (totalCycles % 30 === 0 && engines.E) {
+      refreshWhaleList().catch(() => {});
+    }
 
     for (const tf of enabledTimeframes) {
       for (const asset of enabledAssets) {
@@ -1099,14 +1208,19 @@ async function runMicroCycle(): Promise<void> {
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "latency", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "C" };
         }});
         if (engines.D) engineConfigs.push({ tag: "D", run: async () => {
-          const r = await runARIMAPredict(asset, market.upPrice, market.liquidity);
-          logModelChange("ARIMA", `[${tf}] ${asset.toUpperCase()} ${r.direction} Δ=${r.predictedChange.toFixed(3)}%`);
-          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "arima", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "D" };
+          const r = await runMomentumPredict(asset, market.upPrice, market.liquidity);
+          logModelChange("VWAP/MOM", `[${tf}] ${asset.toUpperCase()} ${r.direction} vwap=${r.vwapDeviation.toFixed(3)}% roc=${r.roc3m.toFixed(3)}%`);
+          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "momentum", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "D" };
         }});
         if (engines.E) engineConfigs.push({ tag: "E", run: async () => {
           const r = await runWhaleCopyTrading(asset, market.conditionId, market.upPrice, market.liquidity);
           logModelChange("КИТЫ", `[${tf}] ${asset.toUpperCase()} ${r.direction} whale_vol=$${r.whaleVolume.toFixed(0)} ratio=${(r.whaleRatio*100).toFixed(0)}%`);
           return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "whale_copy", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "E" };
+        }});
+        if (engines.F) engineConfigs.push({ tag: "F", run: async () => {
+          const r = await runMLPredict(asset, market.upPrice, market.liquidity);
+          logModelChange("ML/RF", `[${tf}] ${asset.toUpperCase()} ${r.direction} ${r.modelTrained ? 'TRAINED' : 'HEURISTIC'} | ${r.reasoning}`);
+          return { direction: r.direction, confidence: r.confidence, reasoning: r.reasoning, strategy: "ml_ensemble", blocked: r.blocked, kellyFraction: r.kellyFraction, modelTag: "F" };
         }});
 
         // Fetch multi-timeframe trend for this asset (cached per cycle)
@@ -1125,16 +1239,19 @@ async function runMicroCycle(): Promise<void> {
             if (result.blocked) {
               // Skip blocked silently
             } else {
-              // Apply trend-based multiplier
+              // 3-layer Kelly adjustment:
+              // 1. Trend filter (10/15 min)
               let trendMult = 1.0;
               if (assetTrend.direction !== "neutral" && assetTrend.confidence > 0.5) {
-                if (assetTrend.direction === result.direction) {
-                  trendMult = 1.3; // Trend agrees → boost
-                } else {
-                  trendMult = 0.4; // Trend disagrees → reduce heavily
-                }
+                if (assetTrend.direction === result.direction) trendMult = 1.3;
+                else trendMult = 0.4;
               }
-              const kelly = Math.max(0.01, result.kellyFraction * trendMult);
+              // 2. Per-engine adaptive Kelly (rolling WR)
+              const epMult = getEnginePerf(eng.tag).kellyMultiplier;
+              // 3. Thompson Sampling allocation weight
+              const tsWeight = tsWeights[eng.tag] || 1.0;
+              
+              const kelly = Math.max(0.01, result.kellyFraction * trendMult * epMult * tsWeight);
               executeMicroTrade(market, result.direction, result.confidence, result.reasoning, kelly, eng.tag, tf);
             }
           } catch (err) {
@@ -1160,6 +1277,7 @@ export function startMicroScheduler(): void {
   initStateFromDB();
   loadCalibrationFromMemory();
   loadArenaRatings();
+  loadMLTrainingData(); // Engine F training data
   runMicroCycle();
   schedulerInterval = setInterval(() => runMicroCycle(), 60 * 1000);
   log("⚡ Micro-scheduler started (BTC/ETH/SOL/XRP 5-min markets)", "micro");
@@ -1237,8 +1355,10 @@ export function getMicroStatus() {
       C: storage.getConfig("engine_c_enabled") !== "false",
       D: storage.getConfig("engine_d_enabled") !== "false",
       E: storage.getConfig("engine_e_enabled") !== "false",
+      F: storage.getConfig("engine_f_enabled") !== "false",
     },
     effectiveBankroll: _effectiveBankroll,
+    enginePerf: getEngineStats(),
     regime: {
       betSizeMultiplier: Math.round(betSizeMultiplier * 100) / 100,
       consecutiveLossWindows,

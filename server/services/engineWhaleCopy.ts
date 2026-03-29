@@ -407,6 +407,55 @@ export async function runWhaleCopyTrading(
 // PUBLIC API — for status display
 // ============================================================
 
+/**
+ * Dynamically refresh whale list by scanning recent large trades.
+ * Called periodically (~every 30 minutes) to discover new active bots.
+ */
+export async function refreshWhaleList(): Promise<void> {
+  try {
+    const url = "https://data-api.polymarket.com/trades?limit=500&filterType=CASH&filterAmount=30";
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const trades = await resp.json();
+    if (!Array.isArray(trades)) return;
+
+    // Filter 5m crypto trades
+    const crypto5m = trades.filter((t: any) => (t.title || "").includes("Up or Down"));
+    
+    // Aggregate per wallet
+    const walletStats: Record<string, { trades: number; volume: number }> = {};
+    for (const t of crypto5m) {
+      const w = (t.proxyWallet || "").toLowerCase();
+      if (!walletStats[w]) walletStats[w] = { trades: 0, volume: 0 };
+      walletStats[w].trades++;
+      walletStats[w].volume += Number(t.usdcSize || t.size || 0);
+    }
+
+    // Find new high-frequency traders not yet tracked
+    let added = 0;
+    for (const [addr, stats] of Object.entries(walletStats)) {
+      if (trackedAddresses.has(addr)) continue;
+      if (stats.trades >= 8 && stats.volume >= 200) {
+        // High-frequency trader — add to tracked
+        trackedAddresses.add(addr);
+        SEED_WHALES.push({
+          address: addr,
+          name: `auto_${addr.slice(0, 8)}`,
+          tier: "B",
+          weeklyPnl: stats.volume,
+          trustWeight: 0.6,
+        });
+        added++;
+      }
+    }
+    if (added > 0) {
+      log(`Whale: Refreshed — added ${added} new wallets (total: ${trackedAddresses.size})`, "micro");
+    }
+  } catch (err) {
+    log(`Whale: Refresh error: ${err}`, "micro");
+  }
+}
+
 export function getWhaleStatus() {
   const seedInfo = SEED_WHALES.map(w => ({
     address: w.address.slice(0, 14) + "...",

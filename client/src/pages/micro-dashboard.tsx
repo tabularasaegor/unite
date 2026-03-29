@@ -149,7 +149,7 @@ export default function MicroDashboard({ engine, timeframe }: { engine?: string;
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-xl font-semibold flex items-center gap-2">
-            <Zap className="h-5 w-5 text-amber-500" /> {engine === "A" ? "Арена" : engine === "B" ? "Bayesian" : engine === "C" ? "Latency" : engine === "D" ? "ARIMA" : engine === "E" ? "Киты" : "Все модели"}{timeframe ? ` [${timeframe}]` : ""}
+            <Zap className="h-5 w-5 text-amber-500" /> {engine === "A" ? "Арена" : engine === "B" ? "Bayesian" : engine === "C" ? "Latency" : engine === "D" ? "VWAP/Momentum" : engine === "E" ? "Киты" : engine === "F" ? "ML/RF" : "Все модели"}{timeframe ? ` [${timeframe}]` : ""}
           </h2>
           <p className="text-sm text-muted-foreground">{[engine && `Модель ${engine}`, timeframe || "Все таймфреймы", "BTC/ETH/SOL/XRP"].filter(Boolean).join(" — ")}</p>
         </div>

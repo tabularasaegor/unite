@@ -12,8 +12,9 @@ const ENGINE_META: Record<string, { label: string; color: string }> = {
   A: { label: "Арена", color: "bg-blue-500" },
   B: { label: "Байес", color: "bg-purple-500" },
   C: { label: "Latency", color: "bg-amber-500" },
-  D: { label: "ARIMA", color: "bg-emerald-500" },
+  D: { label: "VWAP/Mom", color: "bg-emerald-500" },
   E: { label: "Киты", color: "bg-cyan-500" },
+  F: { label: "ML/RF", color: "bg-rose-500" },
 };
 
 function EngineToggle({ engineId, enabled, schedulerActive }: { engineId: string; enabled: boolean; schedulerActive: boolean }) {
@@ -52,7 +53,7 @@ function SchedulerBar() {
 
   const s = status as any;
   const active = s?.active;
-  const engines = s?.engines || { A: true, B: true, C: true, D: true, E: true };
+  const engines = s?.engines || { A: true, B: true, C: true, D: true, E: true, F: true };
 
   const start = useMutation({
     mutationFn: () => apiRequest("POST", "/api/micro/start"),
@@ -113,13 +114,14 @@ export default function MicroEngines() {
         </div>
         {/* Row 1: Engine filter */}
         <Tabs value={engineTab} onValueChange={setEngineTab}>
-          <TabsList className="grid w-full max-w-2xl grid-cols-6">
+          <TabsList className="grid w-full max-w-3xl grid-cols-7">
             <TabsTrigger value="all" className="text-xs">Все</TabsTrigger>
             <TabsTrigger value="A" className="text-xs">Арена</TabsTrigger>
             <TabsTrigger value="B" className="text-xs">Байес</TabsTrigger>
             <TabsTrigger value="C" className="text-xs">Latency</TabsTrigger>
-            <TabsTrigger value="D" className="text-xs">ARIMA</TabsTrigger>
+            <TabsTrigger value="D" className="text-xs">VWAP</TabsTrigger>
             <TabsTrigger value="E" className="text-xs">Киты</TabsTrigger>
+            <TabsTrigger value="F" className="text-xs">ML/RF</TabsTrigger>
           </TabsList>
         </Tabs>
         {/* Timeframe: 5m only */}
